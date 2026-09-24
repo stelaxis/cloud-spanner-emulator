@@ -396,7 +396,7 @@ jobs:
     name: Upstream unit and conformance tests
     needs: test-shards
     # A failed/skipped matrix must fail this required check, not skip it.
-    if: ${{ !cancelled() && github.ref_type != 'tag' }}
+    if: ${{ always() && github.ref_type != 'tag' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
