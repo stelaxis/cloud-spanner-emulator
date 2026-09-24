@@ -325,3 +325,230 @@ go run . -schedule testdata/upstream_crash_empty_open_range.jsonl
 `-schedule`.
 
 The generator avoids empty ranges so the rest of the run can proceed.
+
+## L2: persistence protocol and crash conformance
+
+L2 adds specifications and harness code only. It does **not** implement
+`--data_dir`, WALs, checkpoints or other emulator changes. The L1 transaction
+model and its existing proofs are unchanged. The new files are:
+
+| File in `lean/TxnSpec/` | Purpose |
+|---|---|
+| `Persistence.lean` | Physical records, durable disk versus volatile state, staged appends, checkpoints, crashes, recovery and protocol invariants. |
+| `PersistenceSequences.lean` | Range reservation and allocation; refinement of the full storage/allocator product to the no-reissue machine. |
+| `PersistenceComposition.lean` | Target serializability across arbitrary restarts, including durable interrupted commits; physical replay/Target row equivalence. |
+| `PersistenceCounterexamples.lean` | Kernel-checked counterexamples and `#print axioms` audit. |
+| `RestartJson.lean` | Executable crash/restart schedule envelope around the unchanged L1 models. |
+
+### Durable state and crash points
+
+`Image` contains the instance/database catalog, database incarnation IDs and
+allocator position, data, schema descriptors, table/column allocators,
+sequence reservation high-water marks and timestamp high-water mark.
+Schema descriptors are opaque natural-number tokens; this specifies their
+preservation, not SQL schema parsing. Data/index/default/generated/commit-ts
+values are **already resolved physical writes** when a record enters the
+machine. Index entries can use distinct physical table IDs. No default,
+generated expression or backfill is evaluated during replay.
+
+`Effect.ddl` is one record carrying both schema and resolved backfill writes.
+Catalog create/drop and sequence reservation are record variants too.
+`applyRecord` installs an entire record atomically. Replay of transaction
+records is connected to L1's `applyLog` by `replay_target_rows`.
+
+The durable disk has a published checkpoint (image, sequence boundary, clock
+high-water mark), complete WAL tail, covered segments awaiting deletion, and
+separate torn-tail/corruption classifications. `Snapshot.past` and the client
+acknowledgement list are **ghost proof history**, not files to store. Recovery
+uses the checkpoint image plus WAL tail, never the ghost history. A corrupt
+checkpoint or non-tail corruption returns an error; only a torn **final**
+record is ignored. The specification assumes a framing/checksum layer can
+make that distinction; it does not verify a byte parser or cryptographic
+integrity. Storage which lies about fsync or loses already durable bytes is
+outside the crash model; detected corruption fails loudly rather than
+starting empty.
+
+Volatile state includes the live image, pending record, clock, and snapshot
+scratch file. Appending proceeds through `begin → bytes → finish → persist →
+fsync → flush → ack`. `bytes` can repeat or be skipped. A complete record may
+become durable before the fsync returns. Crashing before `persist` loses it;
+crashing after `persist`, including before acknowledgement, retains it. Flush
+installs the whole resolved effect atomically. The commit gate stays held
+through this sequence. Reads that would cross a pending flush must wait;
+this is the same safe-snapshot obligation documented for L1.
+
+Checkpoint capture requires the commit gate to be quiescent. The
+`quiescent_image` theorem proves that the **actual live image** equals the
+captured WAL boundary's state. Scratch-file writes can overlap later
+commits. Publication atomically switches the durable manifest after snapshot
+fsync; the proof permits a WAL tail appended after capture. Only covered
+segments enter garbage collection, and partial deletion never touches the
+active tail. A crash is allowed at every transition, including partial WAL
+append, before/after fsync, mid-DDL, mid-snapshot write, after publication but
+before deletion, and during deletion. Restart discards volatile state and
+starts the clock above the saved clock high-water mark, all recovered record
+timestamps, and the supplied wall time.
+
+The sequence product models every storage transition, not just clean
+restarts. A value can be issued only from an installed, durable reservation.
+The cursor is volatile; a crash abandons the rest of the reserved range and
+restarts at its exclusive upper bound. Issuance is independent of transaction
+commit, so aborted transactions and queries consume values too. Uniqueness is
+per sequence incarnation; sequence IDs and database IDs must not be reused
+for newly created objects. This is a model of the underlying allocation
+counter; a bit-reversal/output encoding must separately be injective, and a
+finite-width implementation must fail on exhaustion rather than wrap.
+
+### L2 theorem map and design fixes
+
+All the following are checked by `lake build`; the axiom printouts are part
+of that build. Only `propext`, `Quot.sound` and (for Target composition)
+`Classical.choice` occur. There are no admitted proofs or `native_decide`.
+
+| Contract | Theorem(s) | Scope |
+|---|---|---|
+| (a) Durability | `durability` | Every acknowledged record, including DDL and drops, remains in the recovered logical history after any number of crashes/checkpoints. Later records may supersede its effects. |
+| (b) Atomicity | `atomicity`, `recovery_prefix` | Recovery is replay of the timestamp-ordered complete durable prefix; a complete unpersisted final record may be lost, and no partial physical transaction/DDL appears. Uses the ordering fix below. |
+| (c) Checkpoint safety | `checkpoint_safety`, `quiescent_image` | (a) and (b) hold after every storage transition, including capture, partial snapshot writes, publication, truncation and crashes. |
+| (d) Restart timestamps | `every_post_restart_timestamp`, `checkpoint_clock_restart`, `clock_move` | Recovery's floor exceeds saved/recovered timestamps and wall time; every subsequent reservation increases the running clock. Clock ordering is proved from the reservation protocol, not supplied as a log-order assumption. |
+| (e) Sequences | `storage_sequences_never_reissue`, `allocator_refines` | Issued values are distinct for every storage/allocator execution, including partial reservation appends and aborted/query allocations. |
+| (f) Drops | `drop_record_survives`, `instance_drop_survives`, `dropped_stays_dropped` | A durable DROP followed by a tail without explicit recreation cannot resurrect the database. Instance DROP removes all owned databases too. |
+| (g) Composition | `target_serializable_across_restarts`, `replay_target_rows`, `open_transactions_lost` | L1 serial equivalence holds across arbitrary restarts for each database's transaction history. Lost open transactions disappear; durable uncertain commits are included. |
+
+Two qualifications to the stated design need to be explicit:
+
+1. **A shared WAL is not timestamp-ordered merely because each database has a
+   commit mutex.** DB1 can reserve timestamp 1 and pause while DB2 reserves 2
+   and appends/fsyncs first. Crash then leaves `[2]`, not a prefix of `[1,2]`;
+   letting DB1 append later would produce `[2,1]`. This is the checked
+   `per_database_locks_not_global_prefix` counterexample. **Fix used here:**
+   a shared WAL gate orders timestamp reservation and append/fsync, inside
+   each database's existing commit critical section. The model conservatively
+   holds this gate through installation/ack. Alternatively use separate WALs
+   and state the prefix theorem per database; a global timestamp-prefix claim
+   would then need a separate argument. This does not require changing Phase
+   1's optimistic validation rules, but Phase 2 must choose one ordering rule.
+2. **Acknowledged-only serial histories are insufficient.** T1 writes 7,
+   fsyncs, crashes before its reply; recovered T2 reads 7 and commits.
+   Removing T1 makes T2's results impossible from the empty database
+   (`acknowledged_only_history_not_serializable`). **Fix:** complete durable
+   uncertain RPCs in the history. A genuinely open/unpersisted transaction
+   is lost. The theorem does not promise exactly-once client retries.
+
+Additional checked negative examples cover deleting WAL before checkpoint
+publication, restoring a sequence's old cursor, restarting from wall time
+alone, and rerunning a backfill. The decided design already avoids these.
+
+The abstract storage proof does not establish filesystem rename/fsync
+semantics, torn-record detection, snapshot serialization, arbitrary
+corruption repair or an emulator implementation's refinement. The Target
+composition theorem covers L1's fixed-schema transaction algebra; DDL/catalog
+records have physical atomicity/durability proofs, not SQL/DDL concurrency or
+schema-validation proofs. Ordinal L1 commit indices are retained as ghost
+history and mapped to increasing physical timestamps; no pre-restart MVCC
+history needs to be stored or served. PostgreSQL dialect, change streams,
+long-running-operation history and backups remain out of scope.
+
+### Crash schedule format
+
+All L1 steps remain valid. Both line and batch modes accept:
+
+```json
+{"txn":0,"op":"crash","args":{}}
+{"txn":0,"op":"restart","args":{}}
+```
+
+`crash` stops the machine; calls while stopped fail with
+`FAILED_PRECONDITION`. `restart` loses old transaction handles. In
+`--persistence no-persistence` (the default), restart empties all data. In
+`--persistence persistent`, it preserves committed data and rejects exact
+read timestamps referring to pre-restart commit indices. Strong reads see
+recovered current data. Commit results are indices of successful explicit `commit` schedule steps.
+A Commit submitted by `crash` never exposes a reply index, but a successful
+reply still forces the durable branch and participates in timestamp checks.
+
+To interrupt a commit already begun by `begin_rw`:
+
+```json
+{"txn":2,"op":"crash","args":{"during_commit":true,"delay_us":500,"mutations":[{"kind":"upsert","table":"A","key":1,"val":7}],"durable":false}}
+{"txn":0,"op":"restart","args":{}}
+```
+
+The driver sends that Commit RPC, waits until gRPC sends its payload (or
+returns), waits `delay_us`, then SIGKILLs its container. `durable` selects a
+Lean replay branch when using `txnmodel` directly. The emulator driver ignores
+that input field: it derives allowed branches from the actual RPC outcome.
+Success requires the durable branch; a terminal abort/constraint error
+requires the lost branch; an interrupted RPC allows either complete outcome.
+The persistent oracle compares the **entire subsequent schedule** against
+one consistent branch, never chooses a different survival result per read.
+Replay supports up to eight uncertain commits (256 branches).
+
+Crash and restart steps return `"ok"`; an interrupted Commit's transport error
+is counted separately, not confused with a transactional `ABORTED`. Valid
+driver schedules alternate crash/restart and use fresh handles afterwards.
+Generated schedules use strong reads around restarts; exact-history rejection
+and repeated restarts are covered by executable model regressions.
+
+### Running the crash driver
+
+```sh
+cd verification/lean
+lake build
+cd ../conformance
+mise exec go@1.25 -- go vet ./...
+mise exec go@1.25 -- go test -v ./...
+mise exec go@1.25 -- gofmt -l *.go       # no output
+mise exec go@1.25 -- go run . -persistence no-persistence -seeds 500
+# Phase 2: same driver, same data directory, recovery becomes must-match.
+mise exec go@1.25 -- go run . -persistence persistent -model target -image YOUR_PHASE2_IMAGE -seeds 500
+```
+
+`-must-match` defaults to true in both modes. For independent shards use
+`-seeds 125 -first-seed 1`, then 126, 251 and 376; the 500 distinct seeds are
+the same coverage as one run. `-print -persistence no-persistence` prints a
+crash schedule; `-schedule file.jsonl` replays one; `-dump file.jsonl` saves
+the first mismatch. Crash schedules are not run through L1's transaction-only
+shrinker because removing lifecycle steps can invalidate the crash schedule.
+
+Each process owns exactly one Docker container and one temporary mounted
+`/data` directory. It restarts the same container/mount/port, always runs
+`emulator_main --abort_current_transaction_probability=0`, binds an ephemeral
+loopback port excluding 9010/9020, and cleans up only its own container and
+directory. External `SPANNER_EMULATOR_HOST` is refused in crash mode. Local
+Unix-socket Docker contexts use the Engine API for low-latency SIGKILL; other
+contexts use `docker kill`. Every kill is checked for exit 137.
+
+No-persistence mode first checks that the **old database is absent**, then
+recreates the schema. Persistent mode requires that same database to recover;
+it never bootstraps over a failed recovery. Both tables are scanned before
+any post-restart writes and after later transactions. Large multi-mutation
+commits increase the chance of interrupting an in-flight RPC; statistics
+separate actual interruptions, completed replies and terminal transaction
+errors. All observed commit timestamps, including replies received just
+before a kill, must increase across restarts.
+
+For Phase 2, `-checkpoint-command 'COMMAND'` runs a user-supplied asynchronous
+checkpoint trigger **inside the owned container** before between-call kills;
+the randomized delay then samples checkpoint execution. Upstream has no such
+trigger, so checkpoint crash coverage is formal only in the L2 run, not a
+claim about an implemented checkpoint engine. Timed SIGKILL cannot identify a
+precise internal instruction; stage-specific coverage requires future
+checkpoint hooks/instrumentation.
+
+
+### L2 conformance results
+
+Upstream emulator 1.5.58 (digest
+`sha256:c6f3402f2599684f295a0fdefb6fbbbfb18a0e43e309ff5456ccb452a4570a79`),
+abort probability 0, seeds **1–500** in four independent shards:
+**14,008 steps, 0 mismatches, 500 SIGKILL/restarts, 96 interrupted commit RPCs**.
+The 254 commit crash attempts also included 53 successful replies and 105
+terminal transaction errors before the kill. Checkpoint attempts: 0 (upstream
+does not implement them).
+
+A separate race-enabled 10-seed run passed with 3 interrupted commits, and
+500 original L1 schedules still matched (8,167 steps). The 3 Go regression
+functions cover 11 leaf cases. `go vet` and `gofmt` are clean.
+See the [L2 report](results/l2-report.md) for exact commands, theorem/axiom
+evidence, counterexamples, limits and per-shard raw logs.

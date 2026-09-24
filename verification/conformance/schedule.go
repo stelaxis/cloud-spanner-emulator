@@ -62,6 +62,10 @@ type Step struct {
 	Val   int64
 	At    *int // begin_ro: exact timestamp of the n-th commit (nil = strong)
 	Muts  []Mut
+
+	DuringCommit bool // crash: send Commit, then SIGKILL
+	Durable      bool // model branch; the driver derives this from the RPC outcome
+	DelayUS      int
 }
 
 func (s Step) MarshalJSON() ([]byte, error) {
@@ -77,6 +81,12 @@ func (s Step) MarshalJSON() ([]byte, error) {
 		args["table"], args["keys"], args["val"] = s.Table, s.Keys, s.Val
 	case "dml_insert":
 		args["table"], args["key"], args["val"] = s.Table, s.Key, s.Val
+	case "crash":
+		args["during_commit"], args["durable"], args["delay_us"] = s.DuringCommit, s.Durable, s.DelayUS
+		args["mutations"] = s.Muts
+		if s.Muts == nil {
+			args["mutations"] = []Mut{}
+		}
 	case "commit":
 		if s.Muts == nil {
 			args["mutations"] = []Mut{}
@@ -204,12 +214,16 @@ func (s *Step) UnmarshalJSON(b []byte) error {
 			Val       int64  `json:"val"`
 			At        *int   `json:"at"`
 			Mutations []Mut  `json:"mutations"`
+
+			DuringCommit bool `json:"during_commit"`
+			Durable      bool `json:"durable"`
+			DelayUS      int  `json:"delay_us"`
 		} `json:"args"`
 	}
 	if err := json.Unmarshal(b, &raw); err != nil {
 		return err
 	}
 	a := raw.Args
-	*s = Step{Txn: raw.Txn, Op: raw.Op, Table: a.Table, Keys: a.Keys, Key: a.Key, Val: a.Val, At: a.At, Muts: a.Mutations}
+	*s = Step{Txn: raw.Txn, Op: raw.Op, Table: a.Table, Keys: a.Keys, Key: a.Key, Val: a.Val, At: a.At, Muts: a.Mutations, DuringCommit: a.DuringCommit, Durable: a.Durable, DelayUS: a.DelayUS}
 	return nil
 }

@@ -1,0 +1,28 @@
+=== RUN   TestRestartModel
+=== RUN   TestRestartModel/upstream/empty_restart
+=== RUN   TestRestartModel/upstream/lost_commit
+=== RUN   TestRestartModel/upstream/durable_commit
+=== RUN   TestRestartModel/upstream/empty_crash_commit
+=== RUN   TestRestartModel/target/empty_restart
+=== RUN   TestRestartModel/target/lost_commit
+=== RUN   TestRestartModel/target/durable_commit
+=== RUN   TestRestartModel/target/empty_crash_commit
+--- PASS: TestRestartModel (6.65s)
+    --- PASS: TestRestartModel/upstream/empty_restart (6.36s)
+    --- PASS: TestRestartModel/upstream/lost_commit (0.04s)
+    --- PASS: TestRestartModel/upstream/durable_commit (0.04s)
+    --- PASS: TestRestartModel/upstream/empty_crash_commit (0.05s)
+    --- PASS: TestRestartModel/target/empty_restart (0.04s)
+    --- PASS: TestRestartModel/target/lost_commit (0.04s)
+    --- PASS: TestRestartModel/target/durable_commit (0.04s)
+    --- PASS: TestRestartModel/target/empty_crash_commit (0.04s)
+=== RUN   TestPersistentOracleRejectsPartialCommit
+--- PASS: TestPersistentOracleRejectsPartialCommit (0.05s)
+=== RUN   TestRestartRejectsOldHistoryAndLosesOpenTransactions
+=== RUN   TestRestartRejectsOldHistoryAndLosesOpenTransactions/upstream
+=== RUN   TestRestartRejectsOldHistoryAndLosesOpenTransactions/target
+--- PASS: TestRestartRejectsOldHistoryAndLosesOpenTransactions (0.09s)
+    --- PASS: TestRestartRejectsOldHistoryAndLosesOpenTransactions/upstream (0.04s)
+    --- PASS: TestRestartRejectsOldHistoryAndLosesOpenTransactions/target (0.04s)
+PASS
+ok  	github.com/stelaxis/cloud-spanner-emulator/verification/conformance	7.373s

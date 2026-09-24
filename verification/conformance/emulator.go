@@ -55,8 +55,9 @@ type emulator struct {
 	database string
 }
 
-func dialEmulator(addr string) (*emulator, error) {
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+func dialEmulator(addr string, options ...grpc.DialOption) (*emulator, error) {
+	options = append(options, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(addr, options...)
 	if err != nil {
 		return nil, err
 	}
