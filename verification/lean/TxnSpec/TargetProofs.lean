@@ -243,7 +243,7 @@ theorem target_ro_snapshot (cfg : Cfg) (hk : cfg.keysOnlyReadSet = false) (σ : 
   obtain ⟨n, hn, _, hm⟩ := hx.2 hk'
   exact ⟨n, hn, by rw [← stateAt_eq_filter h.ts]; exact hm⟩
 
-theorem errors_serial_of_inv (cfg : Cfg) (hv : cfg.validateErrors = true) (s : State)
+theorem errors_latest_of_inv (cfg : Cfg) (hv : cfg.validateErrors = true) (s : State)
     (h : Inv cfg s) (t : Tid) (op : Op) (c : Code) (hs : (s.txns t).status = .active)
     (hkind : (s.txns t).kind = .rw) (hd : op.isData = true)
     (hres : (step cfg s ⟨t, op⟩).1 = .err c) (hc : c ≠ .aborted) :
@@ -278,7 +278,7 @@ theorem errors_serial_of_inv (cfg : Cfg) (hv : cfg.validateErrors = true) (s : S
         · rw [← runProg_congr (cfg := cfg) {} _ hag.left]; exact hrun
         · rw [← step_congr (cfg := cfg) _ _ hag.right]; exact hs₀
 
-theorem commit_errors_serial_of_inv (cfg : Cfg) (s : State) (h : Inv cfg s) (t : Tid)
+theorem commit_errors_latest_of_inv (cfg : Cfg) (s : State) (h : Inv cfg s) (t : Tid)
     (ms : List Mut) (c : Code) (hs : (s.txns t).status = .active) (hkind : (s.txns t).kind = .rw)
     (hres : (step cfg s ⟨t, .commit ms⟩).1 = .err c) (hc : c ≠ .aborted) :
     runTxn (stateAt s.log s.log.length) (s.txns t).prog ms = .error c := by
@@ -306,30 +306,33 @@ theorem commit_errors_serial_of_inv (cfg : Cfg) (s : State) (h : Inv cfg s) (t :
       rw [← runTxn_congr (cfg := cfg) _ ms (by simpa [fp] using hag)]
       simp [runTxn, hrun, hm]
 
-/-- **(v-a) Errors are serial.** With `validateErrors`, a constraint error
-returned to a data operation is the error the serial execution at the latest
-state raises: rerunning the transaction's program plus the failing operation
-there fails the same way. (`validateErrors := false` breaks this; see
-`Counterexamples.lean`.) -/
-theorem target_errors_serial (cfg : Cfg) (hk : cfg.keysOnlyReadSet = false)
+/-- **(v-a) Errors match the latest committed state.** With `validateErrors`,
+a constraint error returned to a data operation is the error raised by
+rerunning the transaction's program plus the failing operation on the *latest*
+committed state. This is stronger than serializability: a stale-snapshot error
+can be serializable (the transaction ordered before newer commits), but
+clients don't retry constraint errors. `validateErrors := false` breaks this
+(`Counterexamples.naive_error_not_latest`). -/
+theorem target_errors_latest (cfg : Cfg) (hk : cfg.keysOnlyReadSet = false)
     (hv : cfg.validateErrors = true) (σ : List Step) (t : Tid) (op : Op) (c : Code) :
     let s := (run cfg {} σ).2
     (s.txns t).status = .active → (s.txns t).kind = .rw → op.isData = true →
     (step cfg s ⟨t, op⟩).1 = .err c → c ≠ .aborted →
       runProg (stateAt s.log s.log.length) {} ((s.txns t).prog ++ [op]) = .error c :=
   fun hs hkind hd hres hc =>
-    errors_serial_of_inv cfg hv _ (run_inv cfg hk {} σ (inv_init cfg)) t op c hs hkind hd hres hc
+    errors_latest_of_inv cfg hv _ (run_inv cfg hk {} σ (inv_init cfg)) t op c hs hkind hd hres hc
 
 /-- **(v-b)** Likewise for `Commit`: a constraint error from the commit's
-mutations is what the serial execution at commit time raises. Holds for every
-configuration, because `Commit` validates before applying mutations. -/
-theorem target_commit_errors_serial (cfg : Cfg) (hk : cfg.keysOnlyReadSet = false) (σ : List Step)
+mutations is what running the transaction on the latest committed state
+raises. Holds for every configuration, because `Commit` validates before
+applying mutations. -/
+theorem target_commit_errors_latest (cfg : Cfg) (hk : cfg.keysOnlyReadSet = false) (σ : List Step)
     (t : Tid) (ms : List Mut) (c : Code) :
     let s := (run cfg {} σ).2
     (s.txns t).status = .active → (s.txns t).kind = .rw →
     (step cfg s ⟨t, .commit ms⟩).1 = .err c → c ≠ .aborted →
       runTxn (stateAt s.log s.log.length) (s.txns t).prog ms = .error c :=
   fun hs hkind hres hc =>
-    commit_errors_serial_of_inv cfg _ (run_inv cfg hk {} σ (inv_init cfg)) t ms c hs hkind hres hc
+    commit_errors_latest_of_inv cfg _ (run_inv cfg hk {} σ (inv_init cfg)) t ms c hs hkind hres hc
 
 end TxnSpec.Target

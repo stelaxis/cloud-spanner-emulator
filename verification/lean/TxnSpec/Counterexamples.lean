@@ -82,22 +82,59 @@ theorem snapAtBegin_rejects :
 
 T1 reads `B{0}` (fixing its snapshot while `A{1}` exists). T2 deletes `A{1}`
 and commits. T1 inserts `A{1}`: against its snapshot the row exists, so a naive
-implementation returns `ALREADY_EXISTS` — an error no serial order produces
-(serially, after T2, the insert succeeds), and one clients do not retry. The
-model validates first and returns `ABORTED`; see `target_errors_serial`. -/
+implementation returns `ALREADY_EXISTS`.
 
-def staleConstraint : List Step :=
+This is still *serializable*: ordering T1 before T2 explains it. But T2's
+delete is already committed and visible to every later transaction, and
+clients treat a constraint error as final rather than retrying. So the error
+reports a row that no longer exists. The model validates first and returns
+`ABORTED` instead. `target_errors_latest` proves the stronger property that
+holds: every non-`ABORTED` constraint error is the error raised by running the
+transaction against the *latest committed state*. The naive variant violates
+exactly that (`naive_error_not_latest`). -/
+
+def staleConstraintPre : List Step :=
   setup [(0, 1, 10)] ++
   [⟨1, .beginRW⟩, ⟨1, .read 1 (.point 0)⟩,
-   ⟨2, .beginRW⟩, ⟨2, .dmlDelete 0 (.point 1)⟩, ⟨2, .commit []⟩,
-   ⟨1, .dmlInsert 0 1 7⟩]
+   ⟨2, .beginRW⟩, ⟨2, .dmlDelete 0 (.point 1)⟩, ⟨2, .commit []⟩]
 
-theorem naive_errors_not_serial :
-    (Target.run { validateErrors := false } {} staleConstraint).1.getLast? =
-      some (.err .alreadyExists) := by
+def staleInsert : Step := ⟨1, .dmlInsert 0 1 7⟩
+
+def staleConstraint : List Step := staleConstraintPre ++ [staleInsert]
+
+def succeeds (r : Except Code (List Res × Local)) : Bool :=
+  match r with
+  | .ok _ => true
+  | .error _ => false
+
+/-- Without `validateErrors`, T1 gets `ALREADY_EXISTS`, although rerunning T1's
+program plus the insert on the latest committed state succeeds. -/
+theorem naive_error_not_latest :
+    let cfg : Cfg := { validateErrors := false }
+    let s := (Target.run cfg {} staleConstraintPre).2
+    (Target.step cfg s staleInsert).1 = .err .alreadyExists ∧
+      succeeds (runProg (stateAt s.log s.log.length) {} ((s.txns 1).prog ++ [staleInsert.op])) = true := by
   decide
 
 example : (Target.run {} {} staleConstraint).1.getLast? = some (.err .aborted) := by decide
+
+/-! ## Regression: repeated deletes, then re-insert
+
+`delete A{1}; delete A{1}; insert A{1}=7; update A{1}=7` in one commit. The
+two deletes record `A{1}` twice. The insert must clear both records, or the
+update fails with `INVALID_ARGUMENT`. The emulator commits, and a later read
+returns `1=7` (`conformance/testdata/regression_repeated_delete_reinsert.jsonl`). -/
+
+def repeatedDelete : List Step :=
+  setup [] ++
+  [⟨1, .beginRW⟩,
+   ⟨1, .commit [⟨.delete, 0, 1, 0⟩, ⟨.delete, 0, 1, 0⟩, ⟨.insert, 0, 1, 7⟩, ⟨.update, 0, 1, 7⟩]⟩,
+   ⟨2, .beginRO none⟩, ⟨2, .read 0 .all⟩]
+
+example : (Upstream.run {} repeatedDelete).1.drop 3 = [.committed 2, .ok, .rows [(1, 7)]] := by
+  decide
+example : (Target.run {} {} repeatedDelete).1.drop 3 = [.committed 2, .ok, .rows [(1, 7)]] := by
+  decide
 
 /-! ## Delete-then-reinsert (ABA) is caught
 

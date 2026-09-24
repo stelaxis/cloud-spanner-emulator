@@ -37,6 +37,13 @@ theorem put_buf (l : Local) (rk : RowKey) (v : Val) (w : RowKey × Option Val) :
   · exact Or.inr rfl
   · exact Or.inl h
 
+theorem reinsert_buf (l : Local) (rk : RowKey) (v : Val) (w : RowKey × Option Val) :
+    w ∈ (l.reinsert rk v).buf → w ∈ l.buf ∨ w.1 = rk := by
+  simp only [Local.reinsert, List.mem_cons]
+  rintro (rfl | h)
+  · exact Or.inr rfl
+  · exact Or.inl h
+
 theorem del_buf (l : Local) (rk : RowKey) (w : RowKey × Option Val) :
     w ∈ (l.del rk).buf → w ∈ l.buf ∨ w.1 = rk := by
   simp only [Local.del, List.mem_cons]
@@ -84,7 +91,7 @@ theorem applyMut_buf {V : View} {l l' : Local} {m : Mut} (h : applyMut V l m = .
   unfold applyMut at h
   cases hk : m.kind <;> simp only [hk] at h
   · by_cases h₁ : (l.view V m.rk).isSome = true <;> simp [h₁] at h
-    subst h; rcases put_buf l _ _ w hw with h' | e
+    subst h; rcases reinsert_buf l _ _ w hw with h' | e
     · exact Or.inl h'
     · exact Or.inr (hc w e)
   · by_cases h₁ : m.rk ∈ l.deleted
@@ -93,7 +100,7 @@ theorem applyMut_buf {V : View} {l l' : Local} {m : Mut} (h : applyMut V l m = .
       subst h; rcases put_buf l _ _ w hw with h' | e
       · exact Or.inl h'
       · exact Or.inr (hc w e)
-  · simp at h; subst h; rcases put_buf l _ _ w hw with h' | e
+  · simp at h; subst h; rcases reinsert_buf l _ _ w hw with h' | e
     · exact Or.inl h'
     · exact Or.inr (hc w e)
   · by_cases h₁ : (l.view V m.rk).isSome = true <;> simp [h₁] at h <;> subst h

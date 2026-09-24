@@ -23,8 +23,15 @@ deriving DecidableEq, Repr
 
 def Local.view (l : Local) (V : View) : View := overlay l.buf V
 
+/-- Write a value; `update` and DML `UPDATE` leave the deleted-key record alone. -/
 def Local.put (l : Local) (rk : RowKey) (v : Val) : Local :=
-  { l with buf := (rk, some v) :: l.buf, deleted := l.deleted.erase rk }
+  { l with buf := (rk, some v) :: l.buf }
+
+/-- `insert` / `insert_or_update`: write a value and clear *every* deletion
+record of the key, as the emulator splits the key out of all deleted ranges
+(`read_write_transaction.cc:550-567`). Repeated deletes add duplicate records. -/
+def Local.reinsert (l : Local) (rk : RowKey) (v : Val) : Local :=
+  { buf := (rk, some v) :: l.buf, deleted := l.deleted.filter (· != rk) }
 
 /-- Delete of a visible row: tombstone plus the deleted-key record. -/
 def Local.del (l : Local) (rk : RowKey) : Local :=
@@ -46,12 +53,12 @@ def matched (V : View) (tbl : Nat) (spec : KeySpec) : List Key :=
 def applyMut (V : View) (l : Local) (m : Mut) : Except Code Local :=
   let W := l.view V
   match m.kind with
-  | .insert => if (W m.rk).isSome then .error .alreadyExists else .ok (l.put m.rk m.val)
+  | .insert => if (W m.rk).isSome then .error .alreadyExists else .ok (l.reinsert m.rk m.val)
   | .update =>
       if m.rk ∈ l.deleted then .error .invalidArgument
       else if (W m.rk).isNone then .error .notFound
       else .ok (l.put m.rk m.val)
-  | .upsert => .ok (l.put m.rk m.val)
+  | .upsert => .ok (l.reinsert m.rk m.val)
   | .delete => if (W m.rk).isSome then .ok (l.del m.rk) else .ok (l.markDeleted m.rk)
 
 def applyMuts (V : View) : Local → List Mut → Except Code Local
@@ -113,7 +120,7 @@ structure Cfg where
   operation (design variant; breaks `target_admits_upstream`). -/
   snapAtBegin : Bool := false
   /-- On a constraint error, validate the read set first and report `ABORTED`
-  if it is stale (design fix; see `target_errors_serial`). -/
+  if it is stale (design fix; see `target_errors_latest`). -/
   validateErrors : Bool := true
   /-- Record only the rows a read returned instead of the key set it scanned
   (design variant; admits phantoms). -/

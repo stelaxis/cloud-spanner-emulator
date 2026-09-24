@@ -123,7 +123,7 @@ hold for every `Cfg` with `keysOnlyReadSet = false`, including both
 | `Target.disjoint_never_abort` | **(iii)** Take two fresh RW transactions, from any state, in any interleaving. Suppose neither's read/validated key sets (`fp`) meet the key sets the other may write (`writeSpans`). Then no call of either returns `ABORTED`, so each commits unless its own operations raise a constraint error. |
 | `Upstream.upstream_serializable` | **(iv-a)** Upstream's committed histories are serializable too, with strictly increasing timestamps. |
 | `target_admits_upstream` | **(iv-b)** Run a schedule through Upstream and keep only the steps of the transactions it committed. Target, run on those steps, commits the same transactions in the same order, with the same reads, row counts, mutations and writes (the commit logs are equal). This needs `snapAtBegin = false`. |
-| `Target.target_errors_serial`, `target_commit_errors_serial` | **(v)** Suppose a non-`ABORTED` error comes back from a DML statement (with `validateErrors`) or from `Commit` (always). Then serial execution at the latest state raises the same error. |
+| `Target.target_errors_latest`, `target_commit_errors_latest` | **(v)** Suppose a non-`ABORTED` constraint error comes back from a DML statement (with `validateErrors`) or from `Commit` (always). Then rerunning the transaction on the *latest committed state* raises the same error. This is stronger than serializability. |
 
 Why (iv-b) filters the schedule: on the same unfiltered schedule, neither
 model is more permissive. `target_differs_unfiltered`: Upstream commits T1
@@ -140,10 +140,12 @@ commits; it just may not pick the same one.
    validation. **Fix (modelled):** take the snapshot at the first data
    operation.
 2. **Constraint errors against a stale snapshot must become `ABORTED`**
-   (`naive_errors_not_serial`). T1 fixes its snapshot while `A{1}` exists. T2
+   (`naive_error_not_latest`). T1 fixes its snapshot while `A{1}` exists. T2
    deletes `A{1}` and commits. T1's `INSERT A{1}` sees the row in its snapshot
-   and fails with `ALREADY_EXISTS`. No serial order produces that error, and
-   clients don't retry it. **Fix (modelled):** on a constraint error from a
+   and fails with `ALREADY_EXISTS`. That outcome is still serializable (T1
+   before T2), but it reports a row that is already gone from the committed
+   state, and clients treat constraint errors as final rather than retrying.
+   Rerunning T1 on the latest committed state succeeds. **Fix (modelled):** on a constraint error from a
    data operation, validate the read set plus the failing operation's
    footprint. If stale, return `ABORTED`. `Commit` validates before applying
    its mutations, for the same reason.
@@ -262,8 +264,13 @@ Each schedule runs from one goroutine, so the interleaving is exactly the
 schedule order:
 
 1. A setup transaction (txn 0) clears both tables and inserts random rows.
-2. Then 2–4 concurrent transactions (20% RO), keys 0–5, up to 4 data
-   operations and 2 mutations each, in a random interleaving.
+2. Then 2–4 concurrent transactions (20% RO), keys 0–5, in a random
+   interleaving. Each RW transaction runs up to 4 data operations and commits
+   up to 6 mutations. Half of the mutations reuse a row from earlier in the
+   commit. One commit in five also churns a row: one or two deletes, a
+   re-insert (`insert` or `upsert`), and sometimes an update.
+3. A final strong RO transaction reads every table in full. Every committed
+   write is observed, including writes after the schedule's last read.
 
 Each transaction gets its own session, because a session closes its earlier
 transactions when a later one is used (`session.cc:171,272`). The harness also
@@ -278,20 +285,28 @@ Emulator `gcr.io/cloud-spanner-emulator/emulator:1.5.58`, `emulator_main
 
 | Model | Schedules | Steps | Mismatching schedules | `ABORTED` (emulator / model) |
 |---|---|---|---|---|
-| `upstream` | 2000 | 26,823 | **0** | 4,673 / 4,673 |
-| `target` | 2000 | 26,823 | 1,103 | 4,673 / 648 |
-| `target --pushdown` | 2000 | 26,823 | 1,103 | 4,673 / 512 |
+| `upstream` | 2000 | 32,854 | **0** | 4,565 / 4,565 |
+| `upstream`, seeds 2001–6000 | 4000 | 65,178 | **0** | 8,815 / 8,815 |
+| `target` | 2000 | 32,854 | 1,104 | 4,565 / 479 |
+| `target --pushdown` | 2000 | 32,854 | 1,104 | 4,565 / 396 |
 
-Upstream matches every step. In every one of the 1,103 Target divergences,
+Upstream matches every step. In every one of the 1,104 Target divergences,
 the first diverging step is the emulator returning `ABORTED` where Target
 proceeds. That is the Phase 1 gap: the emulator aborts transactions because of
 the single lock slot, and Target does not. Sometimes the Target outcome that
-first differs is a real constraint error. For example, seed 1,
-`T3 commit [insert A{1}, delete A{0}]`: the emulator says `ABORTED` because
-another transaction holds the slot, while Target says `ALREADY_EXISTS` because
-`A{1}` exists. By `target_commit_errors_serial`, a serial execution raises
-that same error. Aborts drop from 4,673 to 648 without pushdown and to 512
-with it.
+first differs is a real constraint error. For example, a commit the emulator
+aborts for the lock gets `ALREADY_EXISTS` under Target because the row exists;
+by `target_commit_errors_latest`, rerunning on the latest committed state
+raises that same error.
+
+**Regression caught in review:** repeated deletes of one key recorded it twice
+in the deleted-key list, and re-insert cleared only one record. The emulator
+clears the key from every deleted range. Fixed in `Local.reinsert`, with a
+regression schedule in
+`testdata/regression_repeated_delete_reinsert.jsonl` and a `decide` example in
+`Counterexamples.lean`. The generator now produces the pattern: run against
+the old model, it fails 65 of 2000 schedules and shrinks to
+`delete B{0}; delete B{0}; insert B{0}; update B{0}`.
 
 **Upstream bug found:** a RW `Read` of an empty open range such as `(2,2)`
 crashes the emulator process (SIGSEGV, exit 139), once the transaction has
@@ -305,5 +320,8 @@ with:
 ```sh
 go run . -schedule testdata/upstream_crash_empty_open_range.jsonl
 ```
+
+`testdata/regression_*.jsonl` are schedules that must match; replay each with
+`-schedule`.
 
 The generator avoids empty ranges so the rest of the run can proceed.

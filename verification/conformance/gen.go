@@ -66,9 +66,41 @@ func (g *generator) dataOp(txn int) Step {
 	}
 }
 
+var mutKinds = []string{"insert", "update", "upsert", "delete"}
+
 func (g *generator) mutation() Mut {
-	kinds := []string{"insert", "update", "upsert", "delete"}
-	return Mut{Kind: kinds[g.r.IntN(len(kinds))], Table: g.table(), Key: g.key(), Val: g.val()}
+	return Mut{Kind: mutKinds[g.r.IntN(len(mutKinds))], Table: g.table(), Key: g.key(), Val: g.val()}
+}
+
+// mutations returns up to 6 mutations. Half the time a mutation reuses an
+// earlier row, and sometimes a row is churned: deleted once or twice, then
+// re-inserted and maybe updated. Per-row bookkeeping inside one commit (the
+// deleted-key records) only shows up in such sequences.
+func (g *generator) mutations() []Mut {
+	var ms []Mut
+	for range g.r.IntN(7) {
+		if len(ms) > 0 && g.r.IntN(2) == 0 {
+			prev := ms[g.r.IntN(len(ms))]
+			ms = append(ms, Mut{Kind: mutKinds[g.r.IntN(len(mutKinds))], Table: prev.Table, Key: prev.Key, Val: g.val()})
+		} else {
+			ms = append(ms, g.mutation())
+		}
+	}
+	if g.r.IntN(5) == 0 {
+		t, k := g.table(), g.key()
+		for range 1 + g.r.IntN(2) {
+			ms = append(ms, Mut{Kind: "delete", Table: t, Key: k})
+		}
+		reinsert := "insert"
+		if g.r.IntN(2) == 0 {
+			reinsert = "upsert"
+		}
+		ms = append(ms, Mut{Kind: reinsert, Table: t, Key: k, Val: g.val()})
+		if g.r.IntN(2) == 0 {
+			ms = append(ms, Mut{Kind: "update", Table: t, Key: k, Val: g.val()})
+		}
+	}
+	return ms
 }
 
 func (g *generator) rwProgram(txn int) []Step {
@@ -79,11 +111,7 @@ func (g *generator) rwProgram(txn int) []Step {
 	if g.r.IntN(10) == 0 {
 		return append(steps, Step{Txn: txn, Op: "rollback"})
 	}
-	var muts []Mut
-	for range g.r.IntN(3) {
-		muts = append(muts, g.mutation())
-	}
-	return append(steps, Step{Txn: txn, Op: "commit", Muts: muts})
+	return append(steps, Step{Txn: txn, Op: "commit", Muts: g.mutations()})
 }
 
 func (g *generator) roProgram(txn int) []Step {
@@ -103,8 +131,9 @@ func (g *generator) roProgram(txn int) []Step {
 	return steps
 }
 
-// schedule returns a setup transaction (txn 0) followed by a random
-// interleaving of 2-4 transactions' programs.
+// schedule returns a setup transaction (txn 0), a random interleaving of 2-4
+// transactions' programs, and a final strong RO scan of every table, so every
+// committed write is observed.
 func (g *generator) schedule() []Step {
 	var setup []Mut
 	for _, t := range tables {
@@ -133,6 +162,11 @@ func (g *generator) schedule() []Step {
 			}
 		}
 		if len(live) == 0 {
+			obs := n + 1
+			sched = append(sched, Step{Txn: obs, Op: "begin_ro"})
+			for _, t := range tables {
+				sched = append(sched, Step{Txn: obs, Op: "read", Table: t, Keys: &Keys{All: true}})
+			}
 			return sched
 		}
 		i := live[g.r.IntN(len(live))]
