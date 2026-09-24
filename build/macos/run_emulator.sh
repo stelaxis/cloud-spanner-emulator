@@ -27,7 +27,9 @@
 #   SPANNER_EMULATOR_GRPC_PORT  gRPC port (default: 9010)
 #   SPANNER_EMULATOR_REST_PORT  REST port (default: 9020)
 #   BAZEL_FLAGS                 flags selecting the build configuration
-#                               (default: -c opt, as in the release image)
+#                               (default: -c opt, as in the release image);
+#                               split on whitespace, with no quoting, so a
+#                               value cannot contain spaces
 
 set -euo pipefail
 
@@ -71,12 +73,17 @@ set +m
 
 # shellcheck disable=SC2329 # invoked by the trap below
 stop_group() {
-  kill -TERM -- "-${gateway_pgid}" 2>/dev/null || return 0
-  for _ in $(seq 50); do
-    kill -0 -- "-${gateway_pgid}" 2>/dev/null || return 0
-    sleep 0.1
-  done
-  kill -KILL -- "-${gateway_pgid}" 2>/dev/null || true
+  local status=$?
+  # A further signal must not cut cleanup short before the SIGKILL fallback.
+  trap '' INT TERM HUP
+  if kill -TERM -- "-${gateway_pgid}" 2>/dev/null; then
+    for _ in $(seq 50); do
+      kill -0 -- "-${gateway_pgid}" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -KILL -- "-${gateway_pgid}" 2>/dev/null || true
+  fi
+  exit "${status}"
 }
 trap stop_group EXIT
 trap 'exit 130' INT

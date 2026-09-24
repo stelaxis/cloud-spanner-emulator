@@ -49,7 +49,9 @@ defaults are ports 9010 (gRPC) and 9020 (REST) on `localhost`. Override them
 with `SPANNER_EMULATOR_GRPC_PORT`, `SPANNER_EMULATOR_REST_PORT` and
 `SPANNER_EMULATOR_HOST_NAME`. Extra arguments go to `gateway_main`, e.g.
 `--log_requests`. To use a build configuration other than `-c opt`, set
-`BAZEL_FLAGS`. Stop the emulator with Ctrl-C or `kill` on the script.
+`BAZEL_FLAGS`. It is split on whitespace and quotes are not interpreted, so
+flag values containing spaces (such as a `--disk_cache` path with a space)
+are not supported there. Stop the emulator with Ctrl-C or `kill` on the script.
 Whenever the script exits, including when the gateway fails to start (for
 example, because the REST port is taken), it stops `emulator_main` too. The
 gateway itself never stops it.
