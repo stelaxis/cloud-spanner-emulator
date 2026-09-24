@@ -1,0 +1,170 @@
+name: Emulator image
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+    tags: ['v*-stx.*']
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: emulator-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Free disk for Bazel intermediates
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # Native runners only: do not install QEMU. mode=max retains the build
+      # stage, including Bazel's expensive GoogleSQL compilation and outputs.
+      - name: Build native image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: build/docker/Dockerfile.ubuntu
+          platforms: linux/${{ matrix.arch }}
+          # Some generated GoogleSQL files need over 5 GiB per compiler.
+          build-args: BAZEL_JOBS=2
+          tags: emulator:ci-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/stelaxis/cloud-spanner-emulator
+            org.opencontainers.image.revision=${{ github.sha }}
+          outputs: type=docker,dest=${{ runner.temp }}/emulator-${{ matrix.arch }}.tar
+          cache-from: type=gha,scope=emulator-${{ matrix.arch }},version=2
+          cache-to: type=gha,scope=emulator-${{ matrix.arch }},version=2,mode=max,timeout=30m
+      - name: Smoke-test native image
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          docker load --input "$RUNNER_TEMP/emulator-$ARCH.tar"
+          docker run --detach --name emulator --publish 127.0.0.1:9020:9020 "emulator:ci-$ARCH"
+          trap 'docker logs emulator; docker rm --force emulator' EXIT
+          curl --fail --show-error --retry 30 --retry-delay 2 --retry-connrefused \
+            --retry-all-errors --max-time 10 localhost:9020/v1/projects/test/instances
+      # Only runtime images cross into the publishing job; no registry token is
+      # available to either the Docker build or pull-request code.
+      - name: Upload runtime image
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: emulator-${{ matrix.arch }}
+          path: ${{ runner.temp }}/emulator-${{ matrix.arch }}.tar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  unit-tests:
+    name: Upstream unit and conformance tests
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Free disk for Bazel intermediates
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Add test stage to upstream builder
+        run: |
+          cp build/docker/Dockerfile.ubuntu "$RUNNER_TEMP/Dockerfile.test"
+          cat >> "$RUNNER_TEMP/Dockerfile.test" <<'EOF'
+
+          FROM build AS test
+          # The full suite includes tests/gcloud, unlike the runtime-only build.
+          RUN curl --fail --location --retry 3 \
+                https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-586.0.0-linux-x86_64.tar.gz \
+                --output /tmp/gcloud.tar.gz \
+              && echo '6c774c76793eedd501150b59da653610fbe3eaac169e822965b722de75a2f001  /tmp/gcloud.tar.gz' | sha256sum --check - \
+              && tar -xzf /tmp/gcloud.tar.gz -C /opt \
+              && rm /tmp/gcloud.tar.gz
+          ENV GCLOUD_DIR=/opt/google-cloud-sdk/bin
+          RUN /opt/google-cloud-sdk/bin/gcloud version
+          RUN printf '\nbuild --jobs=2\ntest --test_output=errors\n' >> .bazelrc
+          RUN bazel test -c opt -- ... -third_party/spanner_pg/src/...
+          EOF
+      - name: Run upstream suite inside builder
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ runner.temp }}/Dockerfile.test
+          target: test
+          platforms: linux/amd64
+          build-args: BAZEL_JOBS=2
+          # Reuse the image job's builder without exporting/loading its many GB.
+          cache-from: type=gha,scope=emulator-amd64,version=2
+          no-cache-filters: test
+          outputs: type=cacheonly
+
+  publish:
+    name: Publish multi-arch image
+    if: github.event_name == 'push' && github.repository == 'stelaxis/cloud-spanner-emulator'
+    needs: [build, unit-tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      packages: write # Publish the tested images and multi-arch manifest to GHCR.
+    env:
+      IMAGE: ghcr.io/stelaxis/cloud-spanner-emulator
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: emulator-*
+          path: ${{ runner.temp }}/images
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push architectures and assemble manifest
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          sources=()
+          for arch in amd64 arm64; do
+            docker load --input "$RUNNER_TEMP/images/emulator-$arch.tar"
+            # Unique staging tags avoid collisions between concurrent releases.
+            staging="$IMAGE:build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$arch"
+            docker tag "emulator:ci-$arch" "$staging"
+            docker push "$staging"
+            digest=$(docker image inspect "$staging" --format '{{index .RepoDigests 0}}')
+            sources+=("$digest")
+          done
+          if [[ "$REF_TYPE" == tag ]]; then
+            tags=(--tag "$IMAGE:$REF_NAME")
+          else
+            tags=(--tag "$IMAGE:edge" --tag "$IMAGE:sha-${GITHUB_SHA:0:7}")
+          fi
+          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
+          docker buildx imagetools inspect "${tags[1]}"
+          docker buildx imagetools inspect --raw "${tags[1]}" | jq --exit-status '
+            [.manifests[].platform | .os + "/" + .architecture] | sort == ["linux/amd64", "linux/arm64"]'

@@ -18,7 +18,7 @@
 #                                     BUILD                                    #
 ################################################################################
 
-FROM ubuntu:22.04 as build
+FROM ubuntu:22.04 AS build
 
 # Perform all APT installs in a single layer to reduce image size.
 ENV GCC_VERSION=13
@@ -64,11 +64,14 @@ RUN wget -O /usr/local/bin/bazel https://github.com/bazelbuild/bazelisk/releases
 
 # Build GoogleSQL to cache it for reuse in subsequent Docker builds.
 # GoogleSQL can take 3h+ to build, so caching it saves a lot of time.
+# Large C++ files can exhaust memory if Bazel uses every CPU in a Docker VM.
+# Default to four jobs; override for other CPU/memory budgets.
+ARG BAZEL_JOBS=4
 WORKDIR /src
 COPY build/bazel build/bazel/
 COPY MODULE.bazel MODULE.bazel.lock* .bazelversion .bazelrc BUILD.bazel \
     requirements.txt go.mod go.sum ./
-RUN bazel build -c opt \
+RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
     @com_google_googlesql//googlesql/public:value \
     @com_google_googlesql//googlesql/public:analyzer
 
@@ -82,7 +85,7 @@ RUN find third_party/spanner_pg -name "nodes.h" -exec sed -i 's/enum NodeTag : i
 # Since we are only copying the binaries to the release image, we don't need to
 # build the rest of the targets.
 ENV EXTRA_BAZEL_ARGS="--tool_java_runtime_version=local_jdk"
-RUN bazel build -c opt \
+RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
     //binaries:emulator_main \
     //binaries:gateway_main
 
