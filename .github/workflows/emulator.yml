@@ -9,6 +9,11 @@ on:
 
 permissions: {}
 
+env:
+  # Generated C++ files can exceed 5 GiB each. Four workers can OOM 16 GiB;
+  # leave room for Bazel, linking, and the OS. Keep every cache producer aligned.
+  BAZEL_JOBS: '2'
+
 defaults:
   run:
     shell: bash
@@ -18,8 +23,9 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  build:
-    name: Build (${{ matrix.arch }})
+  rpc-deps:
+    name: RPC dependencies (${{ matrix.arch }})
+    if: github.ref_type != 'tag'
     strategy:
       fail-fast: false
       matrix:
@@ -39,6 +45,87 @@ jobs:
       - name: Free disk for Bazel intermediates
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Checkpoint gRPC and protobuf
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: build/docker/Dockerfile.ubuntu
+          target: rpc-deps
+          platforms: linux/${{ matrix.arch }}
+          build-args: BAZEL_JOBS=${{ env.BAZEL_JOBS }}
+          provenance: false
+          sbom: false
+          outputs: type=cacheonly
+          cache-from: type=gha,scope=emulator-rpc-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
+          cache-to: type=gha,scope=emulator-rpc-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2,mode=max,timeout=30m,ignore-error=true
+
+  deps:
+    name: GoogleSQL dependencies (${{ matrix.arch }})
+    needs: rpc-deps
+    if: github.ref_type != 'tag'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Free disk for Bazel intermediates
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Checkpoint GoogleSQL before compiling the emulator
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: build/docker/Dockerfile.ubuntu
+          target: deps
+          platforms: linux/${{ matrix.arch }}
+          build-args: BAZEL_JOBS=${{ env.BAZEL_JOBS }}
+          provenance: false
+          sbom: false
+          outputs: type=cacheonly
+          cache-from: |
+            type=gha,scope=emulator-deps-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
+            type=gha,scope=emulator-rpc-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
+          cache-to: type=gha,scope=emulator-deps-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2,mode=max,timeout=30m,ignore-error=true
+
+  build:
+    name: Build (${{ matrix.arch }})
+    needs: deps
+    # Required checks must fail, rather than be skipped, if a checkpoint fails.
+    if: ${{ !cancelled() && github.ref_type != 'tag' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    steps:
+      - name: Require successful dependency checkpoints
+        env:
+          DEPS_RESULT: ${{ needs.deps.result }}
+        run: test "$DEPS_RESULT" = success
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Free disk for Bazel intermediates
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       # Native runners only: do not install QEMU. mode=max retains the build
       # stage, including Bazel's expensive GoogleSQL compilation and outputs.
       - name: Build native image
@@ -47,15 +134,19 @@ jobs:
           context: .
           file: build/docker/Dockerfile.ubuntu
           platforms: linux/${{ matrix.arch }}
-          # Some generated GoogleSQL files need over 5 GiB per compiler.
-          build-args: BAZEL_JOBS=2
+          build-args: BAZEL_JOBS=${{ env.BAZEL_JOBS }}
+          provenance: false
+          sbom: false
           tags: emulator:ci-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.source=https://github.com/stelaxis/cloud-spanner-emulator
             org.opencontainers.image.revision=${{ github.sha }}
           outputs: type=docker,dest=${{ runner.temp }}/emulator-${{ matrix.arch }}.tar
-          cache-from: type=gha,scope=emulator-${{ matrix.arch }},version=2
-          cache-to: type=gha,scope=emulator-${{ matrix.arch }},version=2,mode=max,timeout=30m
+          cache-from: |
+            type=gha,scope=emulator-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
+            type=gha,scope=emulator-deps-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
+            type=gha,scope=emulator-rpc-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
+          cache-to: type=gha,scope=emulator-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2,mode=max,timeout=30m,ignore-error=true
       - name: Smoke-test native image
         env:
           ARCH: ${{ matrix.arch }}
@@ -80,23 +171,36 @@ jobs:
   unit-tests:
     name: Upstream unit and conformance tests
     needs: build
+    if: ${{ !cancelled() && github.ref_type != 'tag' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     permissions:
       contents: read
     steps:
+      - name: Require successful native builds
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: test "$BUILD_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Free disk for Bazel intermediates
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Restore compiled test actions
+        id: test-cache
+        timeout-minutes: 5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/bazel-test-cache
+          key: bazel-tests-v1-${{ runner.os }}-${{ runner.arch }}-jobs-${{ env.BAZEL_JOBS }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: bazel-tests-v1-${{ runner.os }}-${{ runner.arch }}-jobs-${{ env.BAZEL_JOBS }}-
       - name: Add test stage to upstream builder
         run: |
           cp build/docker/Dockerfile.ubuntu "$RUNNER_TEMP/Dockerfile.test"
           cat >> "$RUNNER_TEMP/Dockerfile.test" <<'EOF'
 
-          FROM build AS test
+          FROM build AS test-builder
           # The full suite includes tests/gcloud, unlike the runtime-only build.
           RUN curl --fail --location --retry 3 \
                 https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-586.0.0-linux-x86_64.tar.gz \
@@ -106,25 +210,73 @@ jobs:
               && rm /tmp/gcloud.tar.gz
           ENV GCLOUD_DIR=/opt/google-cloud-sdk/bin
           RUN /opt/google-cloud-sdk/bin/gcloud version
-          RUN printf '\nbuild --jobs=2\ntest --test_output=errors\n' >> .bazelrc
-          RUN bazel test -c opt -- ... -third_party/spanner_pg/src/...
           EOF
-      - name: Run upstream suite inside builder
+      - name: Load cached builder with test tools
+        timeout-minutes: 75
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ${{ runner.temp }}/Dockerfile.test
-          target: test
+          target: test-builder
           platforms: linux/amd64
-          build-args: BAZEL_JOBS=2
-          # Reuse the image job's builder without exporting/loading its many GB.
-          cache-from: type=gha,scope=emulator-amd64,version=2
-          no-cache-filters: test
-          outputs: type=cacheonly
+          build-args: BAZEL_JOBS=${{ env.BAZEL_JOBS }}
+          provenance: false
+          sbom: false
+          tags: emulator:tests
+          load: true
+          cache-from: |
+            type=gha,scope=emulator-tests-amd64-jobs-${{ env.BAZEL_JOBS }},version=2
+            type=gha,scope=emulator-amd64-jobs-${{ env.BAZEL_JOBS }},version=2
+            type=gha,scope=emulator-deps-amd64-jobs-${{ env.BAZEL_JOBS }},version=2
+            type=gha,scope=emulator-rpc-amd64-jobs-${{ env.BAZEL_JOBS }},version=2
+          cache-to: type=gha,scope=emulator-tests-amd64-jobs-${{ env.BAZEL_JOBS }},version=2,mode=max,timeout=30m,ignore-error=true
+      - name: Run upstream suite inside builder
+        id: tests
+        # Reserve time to stop the container and save partial compilation/logs.
+        timeout-minutes: 240
+        run: |
+          echo 'started=true' >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/bazel-test-cache"
+          docker run --name emulator-tests \
+            --volume "$RUNNER_TEMP/bazel-test-cache:/bazel-cache" \
+            emulator:tests bazel test -c opt --jobs="$BAZEL_JOBS" \
+              --test_output=errors --nocache_test_results --disk_cache=/bazel-cache \
+              -- ... -third_party/spanner_pg/src/... \
+            2>&1 | tee "$RUNNER_TEMP/bazel-test-console.log"
+      - name: Collect logs and release the test container
+        if: always() && steps.tests.outputs.started == 'true'
+        timeout-minutes: 5
+        run: |
+          mkdir -p "$RUNNER_TEMP/bazel-testlogs"
+          if docker container inspect emulator-tests > /dev/null 2>&1; then
+            docker stop --time 30 emulator-tests || true
+            docker cp -L emulator-tests:/src/bazel-testlogs/. "$RUNNER_TEMP/bazel-testlogs" || true
+            docker rm --force emulator-tests
+          fi
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/bazel-test-cache" "$RUNNER_TEMP/bazel-testlogs"
+      - name: Upload failure logs
+        if: failure() || cancelled()
+        timeout-minutes: 10
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bazel-testlogs
+          path: |
+            ${{ runner.temp }}/bazel-testlogs
+            ${{ runner.temp }}/bazel-test-console.log
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Save compiled test actions even on failure
+        if: always() && steps.tests.outputs.started == 'true'
+        timeout-minutes: 15
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/bazel-test-cache
+          key: ${{ steps.test-cache.outputs.cache-primary-key }}
 
   publish:
     name: Publish multi-arch image
-    if: github.event_name == 'push' && github.repository == 'stelaxis/cloud-spanner-emulator'
+    if: github.event_name == 'push' && github.ref_type == 'branch' && github.repository == 'stelaxis/cloud-spanner-emulator'
     needs: [build, unit-tests]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -145,9 +297,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Push architectures and assemble manifest
-        env:
-          REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
         run: |
           sources=()
           for arch in amd64 arm64; do
@@ -156,15 +305,55 @@ jobs:
             staging="$IMAGE:build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$arch"
             docker tag "emulator:ci-$arch" "$staging"
             docker push "$staging"
-            digest=$(docker image inspect "$staging" --format '{{index .RepoDigests 0}}')
-            sources+=("$digest")
+            digest=$(docker buildx imagetools inspect "$staging" --format '{{.Manifest.Digest}}')
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo '::error::Registry did not return a SHA-256 manifest digest.'
+              exit 1
+            fi
+            sources+=("$IMAGE@$digest")
           done
-          if [[ "$REF_TYPE" == tag ]]; then
-            tags=(--tag "$IMAGE:$REF_NAME")
-          else
-            tags=(--tag "$IMAGE:edge" --tag "$IMAGE:sha-${GITHUB_SHA:0:7}")
+          docker buildx imagetools create --dry-run "${sources[@]}" > "$RUNNER_TEMP/manifest.json"
+          jq --exit-status '
+            [.manifests[].platform | .os + "/" + .architecture] | sort == ["linux/amd64", "linux/arm64"]
+          ' "$RUNNER_TEMP/manifest.json"
+          docker buildx imagetools create \
+            --tag "$IMAGE:edge" --tag "$IMAGE:sha-${GITHUB_SHA:0:7}" "${sources[@]}"
+
+  release:
+    name: Promote tested image to release tag
+    if: github.event_name == 'push' && github.ref_type == 'tag' && github.repository == 'stelaxis/cloud-spanner-emulator'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      packages: write # Retag the already-tested registry manifest without running repository code.
+    env:
+      IMAGE: ghcr.io/stelaxis/cloud-spanner-emulator
+    steps:
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify and promote the tested SHA
+        run: |
+          source="$IMAGE:sha-${GITHUB_SHA:0:7}"
+          if ! digest=$(docker buildx imagetools inspect "$source" --format '{{.Manifest.Digest}}'); then
+            echo '::error::The tested SHA image is missing. Wait for its master build to publish, then rerun this job.'
+            exit 1
           fi
-          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
-          docker buildx imagetools inspect "${tags[1]}"
-          docker buildx imagetools inspect --raw "${tags[1]}" | jq --exit-status '
-            [.manifests[].platform | .os + "/" + .architecture] | sort == ["linux/amd64", "linux/arm64"]'
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo '::error::Registry did not return a SHA-256 manifest digest.'
+            exit 1
+          fi
+          source="$IMAGE@$digest"
+          docker buildx imagetools create --dry-run "$source" > "$RUNNER_TEMP/manifest.json"
+          jq --exit-status '
+            [.manifests[].platform | .os + "/" + .architecture] | sort == ["linux/amd64", "linux/arm64"]
+          ' "$RUNNER_TEMP/manifest.json"
+          # Check the full revision too, rather than trusting a short-SHA match.
+          while read -r platform_digest; do
+            docker buildx imagetools inspect "$IMAGE@$platform_digest" --format '{{json .Image}}' \
+              | jq --exit-status --arg sha "$GITHUB_SHA" '.config.Labels["org.opencontainers.image.revision"] == $sha'
+          done < <(jq -r '.manifests[].digest' "$RUNNER_TEMP/manifest.json")
+          docker buildx imagetools create --tag "$IMAGE:$GITHUB_REF_NAME" "$source"

@@ -1,12 +1,22 @@
 # Stelaxis Cloud Spanner Emulator fork
 
-This fork is for Stelaxis development and tests only, not production. It will add
-parallel read-write transactions and persistence; Phase 0 only establishes image
-builds and an upstream test baseline. Upstream does not accept contributions.
+Stelaxis tests need concurrent read-write transactions and persistence, which
+upstream does not provide. This fork is for development and tests only, not
+production. Phase 0 establishes CI; later phases add those capabilities. Upstream
+does not accept contributions.
 
 ## Updating from upstream
 
-Keep fork changes on `master`. Merge each upstream release; do not rebase:
+`master` is protected: PRs and merge commits are required, with these exact checks:
+
+- `Build (amd64)`
+- `Build (arm64)`
+- `Upstream unit and conformance tests`
+
+**Upstream-merge PRs MUST use a merge commit. Never squash or rebase them, even if
+repository-wide settings offer those options: doing so loses upstream ancestry.**
+
+Merge each upstream release into the fork:
 
 ```sh
 git remote add upstream https://github.com/GoogleCloudPlatform/cloud-spanner-emulator.git # once
@@ -15,47 +25,64 @@ git switch -c merge-vX.Y.Z origin/master
 git fetch upstream --tags && git merge vX.Y.Z
 ```
 
-Resolve conflicts, regenerate any affected generated files with that release's
-build tooling, and run the image and test gates. Open a PR against
-**stelaxis/cloud-spanner-emulator:master**, never the GoogleCloudPlatform parent.
-Merge that PR with a merge commit to preserve upstream ancestry (no squash or
-rebase). Tag the tested master commit `vX.Y.Z-stx.N` and push that tag to
-`origin` (increment `N` for subsequent fork releases of the same upstream version).
+1. Resolve conflicts and regenerate affected files with that release's tooling.
+2. Check incoming `.github/workflows` for Google secrets, publishing destinations,
+   or other assumptions that would misfire on the fork; disable or adapt them.
+   Upstream v1.5.58 has none; Actions does not invoke its internal Kokoro scripts.
+3. Open a PR against **stelaxis/cloud-spanner-emulator:master**, never the parent.
+   Wait for the required checks and merge using a merge commit.
+4. Wait for the resulting master commit's tested `sha-<7-character SHA>` image to
+   publish. Tag that commit `vX.Y.Z-stx.N` and push the tag to `origin`; increment
+   `N` for subsequent fork releases of the same upstream version.
 
 ## Images and CI
 
 `ghcr.io/stelaxis/cloud-spanner-emulator` provides native `linux/amd64` and
 `linux/arm64` images in one manifest:
 
-- `edge` and `sha-<7-character SHA>`: pushes to `master`.
-- `vX.Y.Z-stx.N`: git tags matching `v*-stx.*`.
+- `edge` and `sha-<7-character SHA>`: tested pushes to `master`.
+- `vX.Y.Z-stx.N`: tags matching `v*-stx.*` promote the existing tested SHA manifest
+  by digest, without rebuilding. A missing SHA image or revision mismatch fails
+  promotion; finish the master build and rerun the release job.
 
-PRs to master build both architectures without publishing. Every PR, master push,
-and release tag runs the full upstream unit/conformance command on native amd64
-inside the Dockerfile's `build` stage:
+PRs to master build both architectures without publishing. PRs and master pushes
+run the full upstream unit/conformance selection on native amd64 inside the
+loaded builder image, with explicit job/output flags and test-result reuse off:
 
 ```sh
-bazel test -c opt -- ... -third_party/spanner_pg/src/...
+bazel test -c opt --jobs="$BAZEL_JOBS" --test_output=errors \
+  --nocache_test_results --disk_cache=/bazel-cache -- ... -third_party/spanner_pg/src/...
 ```
 
-The test stage adds a versioned, checksum-verified Google Cloud CLI and sets
-`GCLOUD_DIR` for the upstream `tests/gcloud` cases; the runtime image is unchanged.
+The test image adds a pinned, checksum-verified Google Cloud CLI and `GCLOUD_DIR`
+for `tests/gcloud`. Tests run via `docker run`, so BuildKit cannot clip their logs.
+Failures upload `bazel-testlogs` and the full console log for seven days.
 
-Publication waits for both builds and the tests. Only the publish job receives
-`packages: write` via `GITHUB_TOKEN`; no external registry secrets are needed.
-Temporary `build-<run>-<attempt>-<arch>` tags hold the per-architecture images used
-to assemble the manifest. The upstream v1.5.58 tree has no GitHub workflows to
-disable; its Google-internal Kokoro scripts are not invoked by Actions.
+Separate native jobs checkpoint gRPC/protobuf (`rpc-deps`), GoogleSQL (`deps`),
+and the runtime build, each with a six-hour budget. Each architecture has its own
+GitHub Actions `mode=max` caches, exported after each checkpoint. Later timeouts
+retain earlier checkpoints. Cache-export errors are nonfatal. Tests have a separate
+builder-image cache and a persistent Bazel disk cache saved even on failure.
+Their four-hour step timeout leaves time in the six-hour job for logs and cache
+upload, so a test compilation timeout can still warm the next run.
 
-Build/test jobs have six-hour timeouts and cap Bazel at two jobs for the 16 GiB
-native runners: individual generated C++ files can need over 5 GiB to compile.
-Architecture-specific GitHub Actions
-`mode=max` layer caches retain the builder's Bazel outputs, including the separate
-GoogleSQL dependency layer; tests reuse the amd64 builder and always rerun the
-test stage. Cold compilation can take hours. Monitor cache eviction and runner
-disk use; the two builder caches can exceed the repository's default cache quota.
-Ensure Actions is enabled on the fork, allow its `GITHUB_TOKEN` to publish GHCR
-packages, and set the package visibility to public if anonymous pulls are wanted.
+CI sets `BAZEL_JOBS=2` once for all builds and tests. Observed generated C++ files
+exceed 5 GiB per compiler; two workers leave room for Bazel, linking, and the OS
+on the 4-vCPU/16-GiB runners. Raising this to three or four needs CI peak-memory
+evidence. **Changing `BAZEL_JOBS` invalidates the dependency layers and rebuilds
+GoogleSQL from scratch.** Monitor cache eviction/disk use and raise the repository
+cache quota if necessary: the checkpoint and test caches can exceed the default.
+
+Publication waits for both native smoke tests and the full suite. Only publication
+and release promotion receive `packages: write` via `GITHUB_TOKEN`; they do not
+check out or execute repository code. Both validate a dry-run manifest before
+publishing public tags. No external registry secrets are needed.
+
+The per-run `build-<run>-<attempt>-<arch>` staging tags are disposable and accumulate.
+They may be removed during retention maintenance, but preserve the underlying
+manifests referenced by retained multi-arch images. Keep Actions enabled, permit
+the repository's token to publish GHCR packages, and set package visibility to
+public if anonymous pulls are wanted.
 
 ## Local build on macOS arm64
 
@@ -69,7 +96,6 @@ docker run --rm --name stelaxis-emulator -p 9010:9010 -p 9020:9020 stelaxis-emul
 curl --fail localhost:9020/v1/projects/test/instances
 ```
 
-The default Docker platform on an arm64 engine is arm64. Builds default to four
-Bazel jobs to limit C++ compiler memory use; use `--build-arg BAZEL_JOBS=2` on a
-memory-constrained Docker VM. Allow ample disk space and retain Docker's build
-cache between builds.
+The default Docker platform on an arm64 engine is arm64. The Dockerfile retains
+upstream's `BAZEL_JOBS=auto` default; use `--build-arg BAZEL_JOBS=2` to limit memory
+use on smaller Docker VMs. Allow ample disk space and retain the build cache.
