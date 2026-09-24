@@ -72,12 +72,16 @@ filegroup(
         "quotes.c",
         "snprintf.c",
         "strerror.c",
-        "strlcat.c",
-        "strlcpy.c",
         "tar.c",
         "thread.c",
         "timingsafe_bcmp.c",
     ] + select({
+        "@platforms//os:macos": [],
+        "//conditions:default": [
+            "strlcat.c",
+            "strlcpy.c",
+        ],
+    }) + select({
         "@platforms//cpu:aarch64": [
             "pg_crc32c_armv8.c",
             "pg_crc32c_armv8_choose.c",
