@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 )
 
@@ -16,12 +17,16 @@ type model struct {
 	out *bufio.Reader
 }
 
-func startModel(path, name string, pushdown bool) (*model, error) {
+func startModel(path, name string, pushdown bool, persistence ...string) (*model, error) {
 	args := []string{"--model", name, "--batch"}
 	if pushdown {
 		args = append(args, "--pushdown")
 	}
+	if len(persistence) > 0 {
+		args = append(args, "--persistence", persistence[0])
+	}
 	cmd := exec.Command(path, args...)
+	cmd.Stderr = os.Stderr
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err

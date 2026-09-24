@@ -22,6 +22,10 @@ func main() { os.Exit(run()) }
 // happens on every path.
 func run() int {
 	var (
+		persistence = flag.String("persistence", "", "crash driver: no-persistence | persistent")
+		checkpoint  = flag.String("checkpoint-command", "", "optional asynchronous checkpoint trigger inside owned container")
+	)
+	var (
 		seeds      = flag.Int("seeds", 2000, "number of random schedules")
 		firstSeed  = flag.Uint64("first-seed", 1, "seed of the first schedule")
 		modelName  = flag.String("model", "upstream", "model to compare against: upstream | target")
@@ -44,13 +48,22 @@ func run() int {
 	cfg := genConfig{numKeys: *numKeys, minTxns: *minTxns, maxTxns: *maxTxns, maxOps: *maxOps}
 	if *printOnly {
 		g := &generator{r: rand.New(rand.NewPCG(*firstSeed, 0x5eed)), cfg: cfg}
-		for _, st := range g.schedule() {
+		var sched []Step
+		if *persistence != "" {
+			sched = g.crashSchedule()
+		} else {
+			sched = g.schedule()
+		}
+		for _, st := range sched {
 			line, _ := json.Marshal(st)
 			fmt.Println(string(line))
 		}
 		return 0
 	}
 
+	if *persistence != "" {
+		return runRestarts(*persistence, *image, *checkpoint, *modelPath, *modelName, *pushdown, *mustMatch, *seeds, *firstSeed, cfg, *replay, *dumpFailed)
+	}
 	addr := os.Getenv("SPANNER_EMULATOR_HOST")
 	if addr == "" {
 		a, stop, err := startDocker(*image, *abortProb)

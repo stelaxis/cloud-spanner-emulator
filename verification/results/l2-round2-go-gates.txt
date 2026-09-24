@@ -1,0 +1,12 @@
+Working directory: verification/conformance
+File set: all Go files in this module (./...).
+
+$ mise exec go@1.25 -- go vet ./...
+Exit status: 0; no output.
+
+$ mise exec go@1.25 -- gofmt -l *.go
+Exit status: 0; no output.
+
+$ mise exec go@1.25 -- go test -race -count=1 ./...
+ok  	github.com/stelaxis/cloud-spanner-emulator/verification/conformance	4.822s
+Exit status: 0.

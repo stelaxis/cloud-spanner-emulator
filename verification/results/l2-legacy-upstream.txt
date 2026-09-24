@@ -1,0 +1,2 @@
+started gcr.io/cloud-spanner-emulator/emulator:1.5.58 at 127.0.0.1:32783 (abort probability 0)
+model=upstream pushdown=false schedules=500 steps=8167 mismatched=0 aborted(emulator)=1130 aborted(model)=1130

@@ -1,0 +1,14 @@
+crash driver image=gcr.io/cloud-spanner-emulator/emulator:1.5.58 mode=no-persistence address=127.0.0.1:51593 container=0c9ecf24a95404bf7c41ce1e5b334450d30d828ed35c692fa5ca5ea5c9521bc6
+completed 10/125 seeds; mismatches=0 SIGKILL=10 interrupted-commit=1
+completed 20/125 seeds; mismatches=0 SIGKILL=20 interrupted-commit=3
+completed 30/125 seeds; mismatches=0 SIGKILL=30 interrupted-commit=4
+completed 40/125 seeds; mismatches=0 SIGKILL=40 interrupted-commit=6
+completed 50/125 seeds; mismatches=0 SIGKILL=50 interrupted-commit=8
+completed 60/125 seeds; mismatches=0 SIGKILL=60 interrupted-commit=10
+completed 70/125 seeds; mismatches=0 SIGKILL=70 interrupted-commit=12
+completed 80/125 seeds; mismatches=0 SIGKILL=80 interrupted-commit=12
+completed 90/125 seeds; mismatches=0 SIGKILL=90 interrupted-commit=14
+completed 100/125 seeds; mismatches=0 SIGKILL=100 interrupted-commit=16
+completed 110/125 seeds; mismatches=0 SIGKILL=110 interrupted-commit=18
+completed 120/125 seeds; mismatches=0 SIGKILL=120 interrupted-commit=22
+persistence=no-persistence model=upstream seeds=125 first_seed=1 steps=3491 mismatches=0 sigkills=125 commit_attempts=62 interrupted_commits=23 completed_before_kill=10 checkpoint_attempts=0

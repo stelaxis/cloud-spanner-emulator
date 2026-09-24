@@ -1,0 +1,49 @@
+✔ [2/31] Built TxnSpec.Basic (6.0s)
+✔ [3/31] Built TxnSpec.Local (1.1s)
+✔ [4/31] Built TxnSpec.Basic:c.o (1.5s)
+✔ [5/31] Built TxnSpec.Local:c.o (509ms)
+✔ [6/31] Built TxnSpec.Mvcc (1.0s)
+✔ [7/31] Built TxnSpec.Mvcc:c.o (409ms)
+✔ [8/31] Built TxnSpec.Upstream (1.2s)
+✔ [9/31] Built TxnSpec.Target (1.4s)
+✔ [10/31] Built TxnSpec.Frame (1.4s)
+✔ [11/31] Built TxnSpec.Upstream:c.o (221ms)
+✔ [12/31] Built TxnSpec.Target:c.o (306ms)
+✔ [13/31] Built TxnSpec.Serial (1.0s)
+✔ [14/31] Built TxnSpec.Json (2.3s)
+✔ [15/31] Built TxnSpec.Counterexamples (2.5s)
+✔ [16/31] Built TxnSpec.Json:c.o (1.4s)
+✔ [17/31] Built TxnSpec.TargetProofs (2.8s)
+✔ [18/31] Built TxnSpec.UpstreamProofs (2.8s)
+✔ [19/31] Built TxnSpec.RestartJson (1.6s)
+✔ [20/31] Built TxnSpec.RestartJson:c.o (693ms)
+✔ [21/31] Built TxnModel (1.3s)
+✔ [22/31] Built TxnModel:c.o (492ms)
+✔ [23/31] Built TxnSpec.Persistence (2.3s)
+✔ [24/31] Built TxnSpec.PersistenceComposition (959ms)
+✔ [25/31] Built TxnSpec.PersistenceSequences (1.2s)
+ℹ [26/31] Built TxnSpec.PersistenceCounterexamples (771ms)
+info: TxnSpec/PersistenceCounterexamples.lean:46:0: 'TxnSpec.Persistence.durability' depends on axioms: [propext, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:47:0: 'TxnSpec.Persistence.atomicity' depends on axioms: [propext, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:48:0: 'TxnSpec.Persistence.recovery_prefix' depends on axioms: [propext]
+info: TxnSpec/PersistenceCounterexamples.lean:49:0: 'TxnSpec.Persistence.checkpoint_safety' depends on axioms: [propext, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:50:0: 'TxnSpec.Persistence.timestamp_restart' depends on axioms: [propext, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:51:0: 'TxnSpec.Persistence.sequences_never_reissue' depends on axioms: [propext, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:52:0: 'TxnSpec.Persistence.storage_sequences_never_reissue' depends on axioms: [propext, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:53:0: 'TxnSpec.Persistence.checkpoint_clock_restart' depends on axioms: [propext, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:54:0: 'TxnSpec.Persistence.every_post_restart_timestamp' depends on axioms: [propext, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:55:0: 'TxnSpec.Persistence.instance_drop_survives' depends on axioms: [propext]
+info: TxnSpec/PersistenceCounterexamples.lean:56:0: 'TxnSpec.Persistence.drop_record_survives' depends on axioms: [propext]
+info: TxnSpec/PersistenceCounterexamples.lean:57:0: 'TxnSpec.Persistence.quiescent_image' depends on axioms: [propext, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:58:0: 'TxnSpec.Persistence.dropped_stays_dropped' depends on axioms: [propext]
+info: TxnSpec/PersistenceCounterexamples.lean:59:0: 'TxnSpec.Persistence.target_serializable_across_restarts' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:60:0: 'TxnSpec.Persistence.replay_target_rows' depends on axioms: [propext]
+info: TxnSpec/PersistenceCounterexamples.lean:61:0: 'TxnSpec.Persistence.corruption_fails' depends on axioms: [propext]
+info: TxnSpec/PersistenceCounterexamples.lean:62:0: 'TxnSpec.Persistence.pre_restart_read_rejected' depends on axioms: [propext]
+info: TxnSpec/PersistenceCounterexamples.lean:63:0: 'TxnSpec.Persistence.per_database_locks_not_global_prefix' depends on axioms: [propext, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:64:0: 'TxnSpec.Persistence.acknowledged_only_history_not_serializable' depends on axioms: [propext]
+✔ [27/31] Built TxnSpec.Refinement (4.9s)
+✔ [28/31] Built TxnSpec.Parallel (7.7s)
+✔ [29/31] Built TxnSpec (1.3s)
+✔ [31/31] Built txnmodel:exe (4.8s)
+Build completed successfully (31 jobs).
