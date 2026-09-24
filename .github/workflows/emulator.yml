@@ -13,9 +13,6 @@ env:
   # Generated C++ files can exceed 5 GiB each. Four workers can OOM 16 GiB;
   # leave room for Bazel, linking, and the OS. Keep every cache producer aligned.
   BAZEL_JOBS: '2'
-  # Limit each test snapshot to 512 MiB and all cache writes by tests to 8 GiB.
-  TEST_CACHE_BYTES: '536870912'
-  CACHE_BUDGET_BYTES: '8589934592'
 
 defaults:
   run:
@@ -47,6 +44,9 @@ jobs:
           persist-credentials: false
       - name: Free disk for Bazel intermediates
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Record disk space before build
+        run: |
+          { echo '### Before build'; echo '```text'; df -h; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Checkpoint gRPC and protobuf
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -61,6 +61,11 @@ jobs:
           outputs: type=cacheonly
           cache-from: type=gha,scope=emulator-rpc-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
           cache-to: type=gha,scope=emulator-rpc-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2,mode=max,timeout=30m,ignore-error=true
+      - name: Record disk space after build
+        if: always()
+        timeout-minutes: 2
+        run: |
+          { echo '### After build'; echo '```text'; df -h; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
   deps:
     name: GoogleSQL dependencies (${{ matrix.arch }})
@@ -84,6 +89,9 @@ jobs:
           persist-credentials: false
       - name: Free disk for Bazel intermediates
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Record disk space before build
+        run: |
+          { echo '### Before build'; echo '```text'; df -h; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Checkpoint GoogleSQL value before compiling analyzer
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -100,6 +108,51 @@ jobs:
             type=gha,scope=emulator-value-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
             type=gha,scope=emulator-rpc-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
           cache-to: type=gha,scope=emulator-value-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2,mode=max,timeout=30m,ignore-error=true
+      - name: Checkpoint GoogleSQL parser
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: build/docker/Dockerfile.ubuntu
+          target: deps-parser
+          platforms: linux/${{ matrix.arch }}
+          build-args: BAZEL_JOBS=${{ env.BAZEL_JOBS }}
+          provenance: false
+          sbom: false
+          outputs: type=cacheonly
+          cache-from: |
+            type=gha,scope=emulator-parser-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
+            type=gha,scope=emulator-value-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
+          cache-to: type=gha,scope=emulator-parser-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2,mode=max,timeout=30m,ignore-error=true
+      - name: Checkpoint GoogleSQL resolved AST
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: build/docker/Dockerfile.ubuntu
+          target: deps-resolved-ast
+          platforms: linux/${{ matrix.arch }}
+          build-args: BAZEL_JOBS=${{ env.BAZEL_JOBS }}
+          provenance: false
+          sbom: false
+          outputs: type=cacheonly
+          cache-from: |
+            type=gha,scope=emulator-resolved-ast-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
+            type=gha,scope=emulator-parser-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
+          cache-to: type=gha,scope=emulator-resolved-ast-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2,mode=max,timeout=30m,ignore-error=true
+      - name: Checkpoint GoogleSQL resolver
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: build/docker/Dockerfile.ubuntu
+          target: deps-resolver
+          platforms: linux/${{ matrix.arch }}
+          build-args: BAZEL_JOBS=${{ env.BAZEL_JOBS }}
+          provenance: false
+          sbom: false
+          outputs: type=cacheonly
+          cache-from: |
+            type=gha,scope=emulator-resolver-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
+            type=gha,scope=emulator-resolved-ast-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
+          cache-to: type=gha,scope=emulator-resolver-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2,mode=max,timeout=30m,ignore-error=true
       - name: Checkpoint GoogleSQL before compiling the emulator
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -113,9 +166,17 @@ jobs:
           outputs: type=cacheonly
           cache-from: |
             type=gha,scope=emulator-deps-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
+            type=gha,scope=emulator-resolver-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
+            type=gha,scope=emulator-resolved-ast-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
+            type=gha,scope=emulator-parser-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
             type=gha,scope=emulator-value-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
             type=gha,scope=emulator-rpc-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
           cache-to: type=gha,scope=emulator-deps-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2,mode=max,timeout=30m,ignore-error=true
+      - name: Record disk space after build
+        if: always()
+        timeout-minutes: 2
+        run: |
+          { echo '### After build'; echo '```text'; df -h; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
   build:
     name: Build (${{ matrix.arch }})
@@ -144,6 +205,9 @@ jobs:
           persist-credentials: false
       - name: Free disk for Bazel intermediates
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Record disk space before build
+        run: |
+          { echo '### Before build'; echo '```text'; df -h; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       # Native runners only: do not install QEMU. mode=max retains the build
       # stage, including Bazel's expensive GoogleSQL compilation and outputs.
@@ -164,6 +228,9 @@ jobs:
           cache-from: |
             type=gha,scope=emulator-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
             type=gha,scope=emulator-deps-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
+            type=gha,scope=emulator-resolver-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
+            type=gha,scope=emulator-resolved-ast-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
+            type=gha,scope=emulator-parser-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
             type=gha,scope=emulator-value-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
             type=gha,scope=emulator-rpc-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
           cache-to: type=gha,scope=emulator-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2,mode=max,timeout=30m,ignore-error=true
@@ -187,36 +254,57 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 1
+      - name: Record disk space after build
+        if: always()
+        timeout-minutes: 2
+        run: |
+          { echo '### After build'; echo '```text'; df -h; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
-  unit-tests:
-    name: Upstream unit and conformance tests
+  test-shards:
+    name: Tests (${{ matrix.area }})
     needs: build
-    if: ${{ !cancelled() && github.ref_type != 'tag' }}
+    if: github.ref_type != 'tag'
+    strategy:
+      fail-fast: false
+      # Disjoint areas plus a complement preserve the upstream suite, including
+      # tests added in new packages. Keep the PostgreSQL src exclusion.
+      matrix:
+        include:
+          - area: backend-query
+            targets: //backend/query/...
+          - area: backend-schema
+            targets: //backend/schema/...
+          - area: backend-other
+            targets: //backend/... -//backend/query/... -//backend/schema/...
+          - area: frontend
+            targets: //frontend/...
+          - area: conformance
+            targets: //tests/conformance/...
+          - area: postgres-functions
+            targets: //third_party/spanner_pg/function_evaluators/...
+          - area: postgres-other
+            targets: >-
+              //third_party/spanner_pg/...
+              -//third_party/spanner_pg/src/...
+              -//third_party/spanner_pg/function_evaluators/...
+          - area: remaining
+            targets: >-
+              //... -//backend/... -//frontend/...
+              -//tests/conformance/... -//third_party/spanner_pg/...
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     permissions:
       contents: read
-      actions: read # Check available cache space before saving a test snapshot.
     steps:
-      - name: Require successful native builds
-        env:
-          BUILD_RESULT: ${{ needs.build.result }}
-        run: test "$BUILD_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Free disk for Bazel intermediates
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Record disk space before build
+        run: |
+          { echo '### Before build'; echo '```text'; df -h; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - name: Restore compiled test actions
-        id: test-cache
-        timeout-minutes: 5
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/bazel-test-cache
-          # PR retries share one immutable snapshot; master refreshes on each run.
-          key: bazel-tests-v2-${{ runner.os }}-${{ runner.arch }}-jobs-${{ env.BAZEL_JOBS }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.number) || format('master-{0}-{1}', github.run_id, github.run_attempt) }}
-          restore-keys: bazel-tests-v2-${{ runner.os }}-${{ runner.arch }}-jobs-${{ env.BAZEL_JOBS }}-master-
       - name: Add test stage to upstream builder
         run: |
           cp build/docker/Dockerfile.ubuntu "$RUNNER_TEMP/Dockerfile.test"
@@ -248,30 +336,39 @@ jobs:
           tags: emulator:tests
           load: true
           cache-from: |
-            type=gha,scope=emulator-tests-amd64-jobs-${{ env.BAZEL_JOBS }},version=2
             type=gha,scope=emulator-amd64-jobs-${{ env.BAZEL_JOBS }},version=2
             type=gha,scope=emulator-deps-amd64-jobs-${{ env.BAZEL_JOBS }},version=2
+            type=gha,scope=emulator-resolver-amd64-jobs-${{ env.BAZEL_JOBS }},version=2
+            type=gha,scope=emulator-resolved-ast-amd64-jobs-${{ env.BAZEL_JOBS }},version=2
+            type=gha,scope=emulator-parser-amd64-jobs-${{ env.BAZEL_JOBS }},version=2
             type=gha,scope=emulator-value-amd64-jobs-${{ env.BAZEL_JOBS }},version=2
             type=gha,scope=emulator-rpc-amd64-jobs-${{ env.BAZEL_JOBS }},version=2
-          cache-to: type=gha,scope=emulator-tests-amd64-jobs-${{ env.BAZEL_JOBS }},version=2,mode=max,timeout=30m,ignore-error=true
       - name: Explain a failed builder cache load
         if: failure() && steps.test-builder.outcome == 'failure'
         run: |
           echo '::error::Could not load the test builder. The build-stage cache may be missing or evicted; the 75-minute load budget cannot cover a cold rebuild. Check the preceding BuildKit log for cache misses or another build error, then rerun the native build to restore its cache.'
-      - name: Run upstream suite inside builder
+      - name: Record disk space after loading builder
+        run: |
+          { echo '### After loading test builder'; echo '```text'; df -h; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Run upstream shard inside builder
         id: tests
-        # Reserve time to stop the container and save partial compilation/logs.
-        timeout-minutes: 225
+        # 75 min for loading + 255 for tests leaves 30 min for setup and logs.
+        timeout-minutes: 255
+        env:
+          TEST_TARGETS: ${{ matrix.targets }}
         run: |
           echo 'started=true' >> "$GITHUB_OUTPUT"
-          mkdir -p "$RUNNER_TEMP/bazel-test-cache"
-          touch "$RUNNER_TEMP/bazel-test-cache.marker"
+          read -r -a targets <<< "$TEST_TARGETS"
           docker run --name emulator-tests \
-            --volume "$RUNNER_TEMP/bazel-test-cache:/bazel-cache" \
             emulator:tests bazel test -c opt --jobs="$BAZEL_JOBS" \
-              --test_output=errors --nocache_test_results --disk_cache=/bazel-cache \
-              -- ... -third_party/spanner_pg/src/... \
+              --test_output=errors --nocache_test_results \
+              -- "${targets[@]}" \
             2>&1 | tee "$RUNNER_TEMP/bazel-test-console.log"
+      - name: Record disk space after tests
+        if: always()
+        timeout-minutes: 2
+        run: |
+          { echo '### After tests (before cleanup)'; echo '```text'; df -h; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Collect logs and release the test container
         if: always() && steps.tests.outputs.started == 'true'
         timeout-minutes: 5
@@ -282,107 +379,32 @@ jobs:
             docker cp -L emulator-tests:/src/bazel-testlogs/. "$RUNNER_TEMP/bazel-testlogs" || true
             docker rm --force emulator-tests
           fi
-          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/bazel-test-cache" "$RUNNER_TEMP/bazel-testlogs"
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/bazel-testlogs"
       - name: Upload failure logs
         if: failure() || cancelled()
         timeout-minutes: 10
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: bazel-testlogs
+          name: bazel-testlogs-${{ matrix.area }}
           path: |
             ${{ runner.temp }}/bazel-testlogs
             ${{ runner.temp }}/bazel-test-console.log
           if-no-files-found: warn
           retention-days: 7
-      - name: Prune test cache to this run and its size budget
-        id: prune-test-cache
-        if: always() && steps.tests.outputs.started == 'true' && steps.test-cache.outputs.cache-hit != 'true'
-        timeout-minutes: 5
-        run: |
-          # Bazel 7.6.1 DiskCacheClient.refresh() updates mtime on hits.
-          marker="$RUNNER_TEMP/bazel-test-cache.marker"
-          test -f "$marker"
-          find "$RUNNER_TEMP/bazel-test-cache" -type f ! -newer "$marker" -delete
-          find "$RUNNER_TEMP/bazel-test-cache" -type l -delete
-          python3 - <<'PYTHON'
-          import os
-          from pathlib import Path
 
-          root = Path(os.environ["RUNNER_TEMP"]) / "bazel-test-cache"
-          budget = int(os.environ["TEST_CACHE_BYTES"])
-          files = sorted(
-              ((p.stat().st_mtime_ns, p) for p in root.rglob("*") if p.is_file()),
-              reverse=True,
-          )
-          kept = 0
-          for _, path in files:
-              # Charge metadata too, so many tiny entries cannot evade the cap.
-              size = path.stat().st_size + 4096
-              if kept + size <= budget:
-                  kept += size
-              else:
-                  path.unlink()
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              print(f"bytes={kept}", file=output)
-          print(f"Test cache after pruning: {kept} bytes (limit {budget}).")
-          PYTHON
-          find "$RUNNER_TEMP/bazel-test-cache" -depth -type d -empty -delete
-      - name: Check repository cache headroom
-        id: cache-headroom
-        if: always() && steps.prune-test-cache.outcome == 'success' && steps.prune-test-cache.outputs.bytes != '0'
-        timeout-minutes: 2
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          used=$(gh api "repos/$GITHUB_REPOSITORY/actions/cache/usage" --jq .active_caches_size_in_bytes)
-          if [[ ! "$used" =~ ^[0-9]+$ ]]; then
-            echo '::error::GitHub did not return a valid repository cache size.'
-            exit 1
-          fi
-          # Allow a full snapshot plus archive overhead; failures skip the save.
-          if (( used + TEST_CACHE_BYTES + 16777216 <= CACHE_BUDGET_BYTES )); then
-            echo 'save=true' >> "$GITHUB_OUTPUT"
-          else
-            echo '::warning::Skipping the test snapshot to protect checkpoint caches: repository cache usage would exceed the 8-GiB budget.'
-          fi
-          echo "Repository cache usage before test save: $used bytes." >> "$GITHUB_STEP_SUMMARY"
-      - name: Save bounded compiled test actions even on failure
-        if: always() && steps.cache-headroom.outputs.save == 'true'
-        timeout-minutes: 15
-        continue-on-error: true
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/bazel-test-cache
-          key: ${{ steps.test-cache.outputs.cache-primary-key }}
-
-  retire-test-caches:
-    name: Retire superseded test caches
-    needs: unit-tests
-    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/master' && github.repository == 'stelaxis/cloud-spanner-emulator' }}
+  unit-tests:
+    name: Upstream unit and conformance tests
+    needs: test-shards
+    # A failed/skipped matrix must fail this required check, not skip it.
+    if: ${{ !cancelled() && github.ref_type != 'tag' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      actions: write # Only this isolated master-only job can delete cache entries.
+    timeout-minutes: 5
+    permissions: {}
     steps:
-      # No checkout, cache restore, or execution of repository code with this token.
-      - name: Keep only the newest master test snapshot
+      - name: Require every test shard to succeed
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?key=bazel-tests-&per_page=100" \
-            --jq '.actions_caches[]' | jq --slurp '
-              map(select(.key | startswith("bazel-tests-"))) | sort_by(.created_at) | reverse |
-              (map(select(.ref == "refs/heads/master" and (.key | startswith("bazel-tests-v2-")))) | .[0].id) as $keep |
-              .[] | select(.id != $keep) | .id
-            ' > "$RUNNER_TEMP/obsolete-test-caches"
-          while read -r cache_id; do
-            if [[ ! "$cache_id" =~ ^[0-9]+$ ]]; then
-              echo '::error::Invalid cache ID returned by GitHub.'
-              exit 1
-            fi
-            gh cache delete "$cache_id" --repo "$GITHUB_REPOSITORY"
-          done < "$RUNNER_TEMP/obsolete-test-caches"
+          SHARDS_RESULT: ${{ needs.test-shards.result }}
+        run: test "$SHARDS_RESULT" = success
 
   publish:
     name: Publish multi-arch image

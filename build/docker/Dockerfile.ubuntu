@@ -78,8 +78,20 @@ FROM rpc-deps AS deps-value
 RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
     @com_google_googlesql//googlesql/public:value
 
-FROM deps-value AS deps
-# GoogleSQL can take 3h+ to build, so caching it saves a lot of time.
+FROM deps-value AS deps-parser
+RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
+    @com_google_googlesql//googlesql/parser:parser
+
+FROM deps-parser AS deps-resolved-ast
+RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
+    @com_google_googlesql//googlesql/resolved_ast:resolved_ast
+
+FROM deps-resolved-ast AS deps-resolver
+RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
+    @com_google_googlesql//googlesql/analyzer:resolver
+
+FROM deps-resolver AS deps
+# Each expensive dependency above can be exported before building the analyzer.
 RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
     @com_google_googlesql//googlesql/public:analyzer
 
