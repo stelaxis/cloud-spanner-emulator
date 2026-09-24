@@ -27,7 +27,9 @@ adjustment sits behind `build:macos` in `.bazelrc`, a
 bazel build -c opt //binaries:emulator_main //binaries:gateway_main
 ```
 
-`-c opt` matches the release image. The default `fastbuild` mode also works.
+`-c opt` matches the release image and is the only mode the binaries and
+tests were verified in. In the default `fastbuild` mode, only ICU (the target
+that needed `--strip=never`) was verified to build.
 
 A cold build compiles about 13,000 actions. With Bazel limited to 6 CPUs on
 an M-series machine that was also running other work, it took about 40
@@ -47,8 +49,10 @@ defaults are ports 9010 (gRPC) and 9020 (REST) on `localhost`. Override them
 with `SPANNER_EMULATOR_GRPC_PORT`, `SPANNER_EMULATOR_REST_PORT` and
 `SPANNER_EMULATOR_HOST_NAME`. Extra arguments go to `gateway_main`, e.g.
 `--log_requests`. To use a build configuration other than `-c opt`, set
-`BAZEL_FLAGS`. Stop the emulator with Ctrl-C or `kill` on the script. The
-script then stops `emulator_main` too, which the gateway does not do.
+`BAZEL_FLAGS`. Stop the emulator with Ctrl-C or `kill` on the script.
+Whenever the script exits, including when the gateway fails to start (for
+example, because the REST port is taken), it stops `emulator_main` too. The
+gateway itself never stops it.
 
 Point clients at it as usual:
 
@@ -74,7 +78,7 @@ Of the 237 test targets, 227 pass. The rest fail on macOS as follows:
 |---|---|
 | `//third_party/spanner_pg/src/backend/nodes:serializer_deserializer_test`, `…/parser:parser_test`, `…/utils/cache:lsyscache_test` | Do not compile from this source tree on any platform (stray statement at file scope, a nonexistent `IndexElem::hash_partition`, an include of a nonexistent `third_party/googletest` path). |
 | `//third_party/spanner_pg/datatypes/common/jsonb:jsonb_parse_test`, `…/datatypes/extended:pg_jsonb_conversion_functions_test`, `…/catalog:emulator_functions_test`, and `PGFunctionsTest.ToJsonB` in `//tests/conformance/endpoints:emulator_conformance_test` | PostgreSQL JSONB range, below. |
-| `//tests/gcloud:instance_admin_test` | Timestamps have microsecond precision, below; the test expects nine fractional digits. |
+| `//tests/gcloud:instance_admin_test` | Instance and instance-partition timestamps have microsecond precision, below; the test expects nine fractional digits. |
 | `//third_party/spanner_pg/src/backend/utils/adt:pg_locale_test` | macOS's `en_US` locale reports numeric grouping `"\3"`; glibc's reports the equivalent `"\3\3"`. |
 | `//backend/schema/backfills:change_stream_backfill_test` | The partition-token generator reseeds `rand()` with the current microsecond on every call, so tokens generated within one microsecond can repeat. The test generates them in a tight loop, which a fast machine does within one microsecond. |
 
@@ -113,9 +117,11 @@ Of the 237 test targets, 227 pass. The rest fail on macOS as follows:
   up to 4,932 whole digits on Linux. On Apple silicon `long double` is the
   same as `double`, so JSONB numbers beyond about ±1.8e308 are rejected with
   `number overflow`.
-- **Timestamps have microsecond precision.** The macOS realtime clock ticks in
-  microseconds, so commit and other server-generated timestamps carry six
-  fractional digits, not nine.
+- **Instance metadata timestamps have microsecond precision.** `createTime`
+  and `updateTime` of instances and instance partitions come straight from the
+  system clock, which ticks in microseconds on macOS, so they carry six
+  fractional digits, not nine. Commit timestamps are unaffected: the emulator
+  truncates them to microseconds on every platform.
 - **PostgreSQL's standalone programs and loadable modules do not link**
   (`postgres`, `psql`, `libpq.so`, `dict_snowball.so`, `pgoutput.so` and the
   encoding conversion modules under `utils/mb/conversion_procs`). They use

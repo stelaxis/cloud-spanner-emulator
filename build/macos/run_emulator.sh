@@ -38,16 +38,14 @@ fi
 
 cd "$(dirname "$0")/../.."
 
-bazel_flags="${BAZEL_FLAGS:--c opt}"
+read -r -a bazel_flags <<< "${BAZEL_FLAGS:--c opt}"
 
 if [[ "${1:-}" == "--build" ]]; then
   shift
-  # shellcheck disable=SC2086
-  bazel build ${bazel_flags} //binaries:emulator_main //binaries:gateway_main
+  bazel build "${bazel_flags[@]}" //binaries:emulator_main //binaries:gateway_main
 fi
 
-# shellcheck disable=SC2086
-bin_dir="$(bazel info ${bazel_flags} bazel-bin 2>/dev/null)/binaries"
+bin_dir="$(bazel info "${bazel_flags[@]}" bazel-bin 2>/dev/null)/binaries"
 gateway="${bin_dir}/gateway_main_/gateway_main"
 emulator="${bin_dir}/emulator_main"
 for f in "${gateway}" "${emulator}"; do
@@ -57,26 +55,34 @@ for f in "${gateway}" "${emulator}"; do
   fi
 done
 
-# Stop emulator_main ourselves: the gateway exits on SIGINT but never kills its
-# child (it releases the process before killing it), so a `kill` of the gateway
-# alone leaves emulator_main running. Once the child exits, so does the gateway.
+# The gateway never stops its emulator_main child: it releases the process
+# before killing it on SIGINT, and a log.Fatal (e.g. the REST port is taken)
+# exits without touching it. So start the gateway in its own process group,
+# which emulator_main inherits, and on any exit of this script stop the group.
+set -m
 "${gateway}" \
   --hostname "${SPANNER_EMULATOR_HOST_NAME:-localhost}" \
   --grpc_port "${SPANNER_EMULATOR_GRPC_PORT:-9010}" \
   --http_port "${SPANNER_EMULATOR_REST_PORT:-9020}" \
   --grpc_binary "${emulator}" \
   "$@" &
-gateway_pid=$!
+gateway_pgid=$!
+set +m
+
 # shellcheck disable=SC2329 # invoked by the trap below
-stop() {
-  pkill -TERM -P "${gateway_pid}" 2>/dev/null || true
-  kill -INT "${gateway_pid}" 2>/dev/null || true
+stop_group() {
+  kill -TERM -- "-${gateway_pgid}" 2>/dev/null || return 0
+  for _ in $(seq 50); do
+    kill -0 -- "-${gateway_pgid}" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  kill -KILL -- "-${gateway_pgid}" 2>/dev/null || true
 }
-trap stop INT TERM HUP
+trap stop_group EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 status=0
-# wait returns early when a trapped signal arrives; keep waiting for shutdown.
-while kill -0 "${gateway_pid}" 2>/dev/null; do
-  wait "${gateway_pid}" || status=$?
-done
+wait "${gateway_pgid}" || status=$?
 exit "${status}"
