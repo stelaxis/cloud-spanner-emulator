@@ -59,19 +59,52 @@ for `tests/gcloud`. Tests run via `docker run`, so BuildKit cannot clip their lo
 Failures upload `bazel-testlogs` and the full console log for seven days.
 
 Separate native jobs checkpoint gRPC/protobuf (`rpc-deps`), GoogleSQL (`deps`),
-and the runtime build, each with a six-hour budget. Each architecture has its own
-GitHub Actions `mode=max` caches, exported after each checkpoint. Later timeouts
-retain earlier checkpoints. Cache-export errors are nonfatal. Tests have a separate
-builder-image cache and a persistent Bazel disk cache saved even on failure.
-Their four-hour step timeout leaves time in the six-hour job for logs and cache
-upload, so a test compilation timeout can still warm the next run.
+and the runtime build, each with a six-hour budget. The GoogleSQL job first exports
+`deps-value`, then builds/exports the analyzer in `deps`; an analyzer timeout keeps
+the value checkpoint. Each architecture has its own GitHub Actions `mode=max`
+cache scopes, with nonfatal exports after every checkpoint. Tests load the cached
+builder in at most 75 minutes; a missing/evicted build-stage cache needs a native
+build rerun. Their 225-minute test timeout reserves 55 minutes beyond cache restore
+and builder loading for setup, cleanup, logs and bounded cache upload.
+
+The test disk cache keeps only files touched since a marker created immediately
+before the test container starts. [Bazel 7.6.1 refreshes mtimes on cache reads and
+hits](https://github.com/bazelbuild/bazel/blob/7.6.1/src/main/java/com/google/devtools/build/lib/remote/disk/DiskCacheClient.java#L124-L157),
+including referenced output blobs; pruning does not depend on filesystem atime.
+Then the oldest files are discarded to cap the snapshot at **512 MiB before
+compression**. Missing blobs are cache misses, not test failures. Saves still run
+after test failures/timeouts. PRs use one immutable snapshot per PR (retries do not
+add snapshots); master creates a replacement each run. A separate master-only job
+with `actions: write`, without checkout or cache restore, deletes all superseded
+test snapshots, including old PR/v1 entries, retaining the newest master snapshot.
+PRs can restore that master snapshot. Delete a PR's snapshot in Actions caches if
+a partial first snapshot needs refreshing; do not delete the checkpoint blobs.
+
+Cache sizing targets for the default 10-GiB repository quota:
+
+| Cache data | Estimated stored size / enforced limit |
+| --- | --- |
+| RPC + value + analyzer + runtime/test-builder layers, both architectures | 5–6 GiB compressed planning estimate, **not measured in CI yet** |
+| Latest master test snapshot | At most 512 MiB before compression |
+| Each PR snapshot or in-flight master replacement | At most 512 MiB before compression; one stable key per PR |
+| Total target with one active PR and a master replacement | About 6.5–7.5 GiB, leaving at least 2 GiB headroom |
+
+BuildKit's GHA backend [keys layer blobs by digest across cache
+scopes](https://github.com/moby/buildkit/blob/master/cache/remotecache/gha/gha.go),
+so shared checkpoint layers are not a full image copy per scope. Before each test
+save, CI checks repository usage and skips the save if a full snapshot plus archive
+overhead would exceed **8 GiB**; an unavailable usage API also skips the save.
+This prevents growing test archives from consuming the checkpoint reserve. Cache
+usage is recorded in the job summary. Confirm the layer estimate on the first CI
+run; simultaneous PRs, upstream dependency changes and old layer generations can
+increase it. If layers alone approach 8 GiB, move checkpoint storage to a registry
+cache before relying on further cold runs; do not increase the test snapshot cap.
 
 CI sets `BAZEL_JOBS=2` once for all builds and tests. Observed generated C++ files
 exceed 5 GiB per compiler; two workers leave room for Bazel, linking, and the OS
 on the 4-vCPU/16-GiB runners. Raising this to three or four needs CI peak-memory
 evidence. **Changing `BAZEL_JOBS` invalidates the dependency layers and rebuilds
-GoogleSQL from scratch.** Monitor cache eviction/disk use and raise the repository
-cache quota if necessary: the checkpoint and test caches can exceed the default.
+GoogleSQL from scratch.**
 
 Publication waits for both native smoke tests and the full suite. Only publication
 and release promotion receive `packages: write` via `GITHUB_TOKEN`; they do not
@@ -96,6 +129,7 @@ docker run --rm --name stelaxis-emulator -p 9010:9010 -p 9020:9020 stelaxis-emul
 curl --fail localhost:9020/v1/projects/test/instances
 ```
 
-The default Docker platform on an arm64 engine is arm64. The Dockerfile retains
-upstream's `BAZEL_JOBS=auto` default; use `--build-arg BAZEL_JOBS=2` to limit memory
-use on smaller Docker VMs. Allow ample disk space and retain the build cache.
+The default Docker platform on an arm64 engine is arm64. Upstream selects
+`build --jobs=auto` in `.bazelrc`; this fork's `ARG BAZEL_JOBS=auto` preserves that
+local default. Use `--build-arg BAZEL_JOBS=2` to limit memory use on smaller Docker
+VMs. Allow ample disk space and retain the build cache.

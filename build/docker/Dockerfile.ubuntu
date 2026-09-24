@@ -73,10 +73,14 @@ RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
     @com_github_grpc_grpc//:grpc++ \
     @com_google_protobuf//:protobuf
 
-FROM rpc-deps AS deps
+FROM rpc-deps AS deps-value
+# Preserve value even if the much larger analyzer build times out.
+RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
+    @com_google_googlesql//googlesql/public:value
+
+FROM deps-value AS deps
 # GoogleSQL can take 3h+ to build, so caching it saves a lot of time.
 RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
-    @com_google_googlesql//googlesql/public:value \
     @com_google_googlesql//googlesql/public:analyzer
 
 FROM deps AS build
