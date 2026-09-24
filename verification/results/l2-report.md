@@ -1,20 +1,26 @@
-# L2 review response — 2026-09-24
+# L2 round-2 review response — 2026-09-24
 
 Branch: `lean-persistence-model`, stacked on `lean-txn-model` for integration
 into [PR #1](https://github.com/stelaxis/cloud-spanner-emulator/pull/1).
-This revision responds to the review of `f38776c`. All changes are under
-`verification/`; there are no emulator implementation changes or separate PR.
+This revision responds to the round-2 review of `4bbabb73`, following the
+first review of `f38776c`. All changes are under `verification/`; there are no
+emulator implementation changes or separate PR.
 
 ## Gates on the revised code
 
-The no-persistence gate uses the existing image
+**Round 2 reruns Lean and Go gates only.** The Go driver and executable oracle
+behavior are unchanged; the only Go edit documents the existing unsupported
+single-use case. Per the task instruction, no emulator/Docker gate is rerun.
+
+The retained no-persistence result was collected at `4bbabb73` using the existing image
 `gcr.io/cloud-spanner-emulator/emulator:1.5.58`, digest
 `sha256:c6f3402f2599684f295a0fdefb6fbbbfb18a0e43e309ff5456ccb452a4570a79`.
-One task-owned container runs at a time, capped with `--cpus=2`. No Docker image
-builds are used. Each seed SIGKILLs and restarts that same container/mount/port;
-only owned resources are removed. Unrelated development containers are untouched.
+That run used one task-owned container at a time, capped with `--cpus=2`, and
+built no Docker images. Each seed SIGKILLed and restarted that same
+container/mount/port; only owned resources were removed. Unrelated development
+containers were untouched.
 
-**Final result: 500 distinct seeds (1–500), 15,508 steps,
+**Retained result at `4bbabb73`: 500 distinct seeds (1–500), 15,508 steps,
 0 mismatches, 500 SIGKILL/restarts; exit status 0.** Of the 254
 crash-commit attempts, 116 were interrupted, 33 returned success before
 SIGKILL, and 105 returned terminal errors that matched the model. Checkpoint
@@ -23,9 +29,10 @@ attempts: 0. The task-owned container was removed after completion.
 Raw log: [serial seeds 1–500](l2-review-no-persistence.txt).
 The preceding [10-seed smoke run](l2-review-smoke.txt) passed (315 steps,
 0 mismatches, 10 SIGKILL/restarts); its overlapping seeds are not counted again.
-Historical four-shard/legacy logs belong to `f38776c`, not this revised gate.
+Historical four-shard/legacy logs belong to `f38776c`; neither set of Docker
+logs is represented as a new round-2 run.
 
-Exact conformance command, from `verification/conformance`:
+Recorded conformance command (not rerun), from `verification/conformance`:
 
 ```sh
 mise exec go@1.25 -- go run . -persistence no-persistence -model upstream -seeds 500 -first-seed 1 -dump ../results/l2-review-failure.jsonl
@@ -35,12 +42,11 @@ Lean commands, **from `verification/lean`** so the pinned Lean 4.34.0 toolchain
 is selected (file set: the entire Lake project, both `TxnSpec` and `txnmodel`):
 
 ```sh
-lake clean
-lake build
+lake clean && lake build
 rg -n '\bsorry\b|\bnative_decide\b|^axiom\b' . --glob '*.lean'
 ```
 
-[Build/axiom log](l2-review-lake-build.txt): clean build passed with no warnings.
+[Round-2 build/axiom log](l2-round2-lake-build.txt): clean build passed with no warnings.
 The source scan has no matches;
 all audited theorem dependencies are subsets of `propext`, `Quot.sound`,
 `Classical.choice`. There are no additional axioms or admitted proofs.
@@ -48,23 +54,82 @@ all audited theorem dependencies are subsets of `propext`, `Quot.sound`,
 Go commands, from `verification/conformance`:
 
 ```sh
-mise exec go@1.25 -- go test -race -count=1 -v ./...
+mise exec go@1.25 -- go test -race -count=1 ./...
 mise exec go@1.25 -- go vet ./...
 mise exec go@1.25 -- gofmt -l *.go
 ```
 
 File set: `emulator.go`, `gen.go`, `main.go`, `model.go`, `restart.go`,
 `restart_timestamps.go`, `restart_driver_test.go`, `restart_test.go`,
-`schedule.go`. [Go test log](l2-review-go-tests.txt): 5 test functions,
+`schedule.go`. [Round-2 Go gate log](l2-round2-go-gates.txt). The unchanged suite has 5 test functions,
 23 leaf cases (8 fake persistent-driver cases, 8 oracle mode/model cases,
 4 terminal-error mode/model cases, 2 history/handle cases, 1 partial-oracle case).
-All 23 cases passed under the race detector. `go vet ./...` exited 0 and
+The complete suite passed under the race detector. The 23 leaf cases are
+listed in the [existing verbose test log](l2-review-go-tests.txt); round 2 uses
+the exact non-verbose command above. `go vet ./...` exited 0 and
 `gofmt -l *.go` produced no output. The fake driver tests exercise the actual
 production gRPC/candidate code, with
 only lifecycle commands substituted. No live persistent-emulator or implemented
 checkpoint conformance is claimed; upstream has neither feature.
 
-## Point-by-point response
+## Round-2 point-by-point response
+
+### Blocking B3′ — exclude correct-protocol witnesses
+
+The earlier three theorem statements could be satisfied during valid execution
+of `Move`. Their replacements state actual invariant violations, and companion
+lemmas prove the correct reachable machine excludes them:
+
+| Faulty-machine witness | New violation | Correct-machine exclusion |
+|---|---|---|
+| `early_truncate_loses_recovery` | Running after restart, with an acknowledged boot record, but `disk.restore ≠ replay {} disk.log`. | `correct_recovery_excludes_early_truncate`, using `restore_eq`. |
+| `wall_restart_regresses` | A correct reachable pre-restart state takes the faulty restart; its live epoch permits a timestamp at/below a previously served read. | `correct_restart_excludes_regression`, using `every_post_restart_timestamp`. |
+| `rerun_backfill_changes_rows` | Running with an idle gate, but `visible ≠ replay {} disk.log` (concrete row values 8 versus 7). | `correct_quiescence_excludes_rerun`, using `quiescent_image`. |
+
+The clock witness and its exclusion share `PostRestartRegression before start`:
+there exist a state in the new live epoch, a timestamp above its reservation
+clock, and a pre-restart served read at/above that timestamp. The witness pins
+`start` to the result of the faulty wall-only restart of `before`; the exclusion
+substitutes `restartState before wall`. Thus a commit at 3 followed later by a
+read at 7 cannot satisfy this witness. A stopped process cannot satisfy the
+recovery witness, and a durable-before-flush window cannot satisfy the idle
+backfill witness. The three exclusion lemmas are included in `#print axioms`.
+The other four counterexamples are unchanged.
+
+### Non-blocking 1 — premature truncation fault
+
+`BrokenMove.earlyTruncate` now requires an existing scratch snapshot and a
+cutoff with `checkpoint.boundary < upto ≤ scratch.boundary`. It removes only
+physical entries below that cutoff, exactly like the correct truncate operation
+except for using an unpublished boundary. The trace captures a snapshot and
+uses cutoff 1 while the published boundary is still 0; it no longer deletes
+an arbitrary whole WAL without a precondition.
+
+### Non-blocking 2 — product read scope
+
+README explicitly states that product reads use ordinary Target calls, bypass
+`serveRead`/the clock lease, and admit old exact ordinal reads after restart.
+This more permissive serializability product does not prove the serving policy
+of the storage clock model or executable restart oracle. After boot, its log
+contains transaction records only: no DDL/catalog/sequence interleaving is
+claimed in the Target composition (also addressing optional note 5).
+
+### Non-blocking 3 — instrumented workload
+
+README now says every commit receives a `RestartAudit` write and the first
+commit also deletes all audit rows. The retained conformance numbers are for
+that modified workload; they do not establish the uninstrumented L1 workload's
+lock/conflict behavior.
+
+### Non-blocking 4 — empty transaction-ID audit key
+
+The wrapper comment and README now document that single-use commits are not
+generated or supported: `GetTransactionId()` would be empty, causing such
+commits to overwrite the same audit row. Adding support requires a distinct
+key strategy. This follows the review's explicit option to document the
+limitation; runtime behavior is unchanged, so no Docker rerun is needed.
+
+## Earlier review responses (with corrected counterexample claims)
 
 ### B1 — storage/Target composition
 
@@ -109,8 +174,10 @@ restore yields allocator 1, while the faulty recovered live image has 2.
 ### B3 — real counterexamples and corrected claims
 
 All seven listed faults below have reachable traces in faulty transition
-systems, using normal protocol transitions plus the changed operation. They
-are not standalone arithmetic comparisons. `checkpointBytes` is documented as
+systems, using normal protocol transitions plus the changed operation.
+The three round-2 corrections now state violations of `restore_eq`,
+`every_post_restart_timestamp` and `quiescent_image`, with companion
+correct-machine exclusion lemmas listed above. `checkpointBytes` is documented as
 stuttering because scratch is volatile and publication is atomic; partial
 snapshot byte writes are not claimed to have been implemented or verified.
 The tautological `recovery_prefix` was removed. The substantive claims now use
@@ -233,9 +300,9 @@ Oracle theorems are in `TxnSpec.Json`.
 | Reachable faulty transition trace | Theorem | Fix |
 |---|---|---|
 | Acknowledge complete, unpersisted bytes; crash | `early_ack_loses_durability` | Fsync/install before ack. |
-| Truncate acknowledged WAL before publishing; crash/restart | `early_truncate_loses_recovery` | Truncate only below published boundary. |
+| Capture, truncate to unpublished boundary, crash/restart; running recovery differs from logical replay | `early_truncate_loses_recovery` refutes `restore_eq`/`physical_recovery` | Truncate only below published boundary. |
 | Publish; crash; replay covered WAL atop image | `covered_wal_replay_is_wrong` | Sequence-filter physical WAL. |
-| Lease 10; read 7; crash; wall-only restart; commit 3 | `wall_restart_regresses` | Durable lease/recovered-clock restart floor. |
+| Lease 10; read 7; crash; wall-only restarted epoch permits reservation 3 ≤ 7 | `wall_restart_regresses` refutes `every_post_restart_timestamp` | Durable lease/recovered-clock restart floor. |
 | Reserve; issue 0; reset cursor; issue 0 again | `cursor_reset_reissues` | Abandon range; restart at durable upper bound. |
-| Backfill result 7; crash; replay then re-run SQL | `rerun_backfill_changes_rows` | Resolved physical replay, never re-execute. |
+| Backfill result 7; crash; replay then re-run SQL; live idle image is 8 rather than 7 | `rerun_backfill_changes_rows` refutes `quiescent_image` | Resolved physical replay, never re-execute. |
 | DB0 reserves 2; DB1 appends 3; DB0 appends 2 | `per_database_gate_reorders_wal` | Shared gate for the global-order strengthening. |

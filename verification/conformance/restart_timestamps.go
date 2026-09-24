@@ -23,6 +23,10 @@ type restartClient struct {
 	clear   bool
 }
 
+// Crash schedules use explicit transactions begun by BeginTransaction. Single-use
+// commits are unsupported here: GetTransactionId would be empty and every such
+// commit would overwrite the same audit row. Supporting them requires distinct
+// audit keys before their timestamps can be checked independently.
 func (c *restartClient) Commit(ctx context.Context, req *spannerpb.CommitRequest, opts ...grpc.CallOption) (*spannerpb.CommitResponse, error) {
 	req = proto.Clone(req).(*spannerpb.CommitRequest)
 	if c.clear {

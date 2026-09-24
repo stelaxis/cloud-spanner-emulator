@@ -425,13 +425,19 @@ and `Classical.choice`.
 | Executable oracle | `modelStep_target_across`, `runRestartState_target_across`, `runRestartModel_target_inv` | Every executable schedule prefix preserves `AcrossRestarts`/`Target.Inv` for the Target model. |
 
 The composition is for **one fixed-schema Target instance** (database 0).
-The storage model also handles catalogs/DDL, but there is no proof of concurrent
+After boot, the product appends transaction records only; DDL, catalog and
+sequence records are covered by the separate storage/allocator proofs, with
+no such interleaving in the Target composition. There is no proof of concurrent
 SQL schema validation or a multi-database Target composition. During the
 persisted-before-flush window the live Target remains unchanged; recovery uses
 the staged durable candidate. `ProductMove.crash` performs `Move.crash` and
 selects that candidate only when the storage phase is durable. After crash,
 restart or any idle state, `product_recovered_target_rows` equates recovery
 with the ordinary Target log. No open transaction survives recovery.
+Product Target reads are plain `call`s that bypass `serveRead`/the clock lease
+and allow old exact ordinal reads after restart: this deliberately more
+permissive serializability product does not prove the serving policy enforced
+by the storage clock model and executable restart oracle.
 
 `product_timestamp_mapping` proves ordinal timestamps `1..n`, the correspondence
 to each physical record, and strictly increasing physical timestamps.
@@ -444,17 +450,27 @@ and service of old MVCC snapshots are not promised.
 
 These are traces in `BrokenMove`/`BrokenReachable`, with normal `Move` transitions
 plus the named faulty transition; the cursor case uses `BrokenSequenceMove`.
-They replace the earlier arithmetic-only illustrations.
+The three strengthened witnesses below explicitly contradict the named
+invariant; each also has a lemma excluding the same violation in the correct
+reachable machine. A stopped process, a read served after a commit, or a
+pending flush cannot stand in for a recovery violation.
 
 | Fault and reachable trace | Refutation | Required fix |
 |---|---|---|
 | Finish bytes, acknowledge, crash without persistence | `early_ack_loses_durability` | Fsync/install before acknowledgement. |
-| Acknowledge WAL, delete before publication, crash/restart | `early_truncate_loses_recovery` | Delete only below the published boundary. |
+| Capture snapshot, truncate to its unpublished boundary, crash/restart with `restore ≠ replay log` | `early_truncate_loses_recovery` (violates `restore_eq`/`physical_recovery`) | Delete only below the published boundary. |
 | Publish, crash, replay all retained physical WAL atop image | `covered_wal_replay_is_wrong` | Filter by sequence boundary; catalog allocator would otherwise advance twice. |
-| Lease 10, serve read 7, crash, wall-only restart, commit 3 | `wall_restart_regresses` | Restore floor from durable lease and recovered clock. |
+| Lease 10, serve read 7, crash; the wall-only restarted epoch permits reservation 3 ≤ 7 | `wall_restart_regresses` (violates the served-read clause of `every_post_restart_timestamp`) | Restore floor from durable lease and recovered clock. |
 | Reserve, issue 0, reset cursor, issue 0 again | `cursor_reset_reissues` | Restart at durable reservation end. |
-| Persist resolved backfill 7, crash, replay then re-execute SQL | `rerun_backfill_changes_rows` | Replay resolved writes only; re-execution produces 8. |
+| Persist resolved backfill 7, crash, replay then re-execute SQL; live idle image differs from replay (8 versus 7) | `rerun_backfill_changes_rows` (violates `quiescent_image`) | Replay resolved writes only. |
 | Reserve 2, another database appends 3, first appends 2 | `per_database_gate_reorders_wal` | Hold the shared gate for the global-order theorem; this example does not refute all per-database protocols. |
+
+`correct_recovery_excludes_early_truncate`,
+`correct_restart_excludes_regression` and `correct_quiescence_excludes_rerun`
+prove that the respective violations cannot occur with the correct protocol.
+The clock witness and its exclusion use the same `PostRestartRegression`
+predicate, relating pre-restart served reads to reservations in the new live
+epoch; the witness changes only the recovery clock rule.
 
 Witness `example`s exhibit nonempty acknowledgements, a published boundary
 above zero, a crash/restart, and a nonempty Target product history surviving
@@ -492,7 +508,13 @@ transactions use strong reads. The additive `RestartAudit` table stores a
 commit-timestamp column in the **same commit** as user mutations. After restart,
 the driver reads it so a durable lost-ack commit raises the floor for later
 commit timestamps. Served read timestamps and successful commit replies also
-raise that floor.
+raise that floor. This modifies the workload: every Commit receives an audit
+write, and the first Commit of each schedule also deletes all audit rows.
+Consequently these conformance numbers describe the audit-modified crash
+workload, not the uninstrumented L1 workload or its lock/conflict behavior.
+Audit keys are hex-encoded explicit transaction IDs. Single-use commits are
+not generated or supported by this wrapper: their empty transaction IDs would
+share one audit row, so support would require distinct audit keys first.
 
 `TestPersistentCrashDriver` runs the real `runCrashSchedule` against a fake gRPC
 emulator; only Docker lifecycle commands are substituted. Its eight cases check
@@ -536,12 +558,13 @@ and backups remain out of scope.
 
 ### L2 conformance results
 
-The final serial run against upstream 1.5.58 passed **500 distinct seeds,
+The recorded serial run at `4bbabb73` against upstream 1.5.58 passed **500 distinct seeds,
 15,508 steps, 0 mismatches and 500 SIGKILL/restarts**. Its 254 crash-commit
 attempts included 116 interrupted RPCs, 33 successful replies and 105 matching
 terminal errors. There were no checkpoint attempts. The clean Lean build and
-core-axiom audit pass; Go vet/formatting and 23 race-enabled leaf test cases
-across five test functions pass.
+core-axiom audit and Go vet/formatting/race tests passed again for this revision.
+Driver behavior and the executable oracle are unchanged (the only Go edit is
+a comment), so the 500-seed Docker gate is not rerun for round 2.
 
 See the [review-response report](results/l2-report.md) for exact commands, raw
 logs, theorem dependencies and point-by-point review responses. The earlier four-shard logs are historical evidence for
