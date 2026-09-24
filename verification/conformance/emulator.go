@@ -65,7 +65,7 @@ func dialEmulator(addr string, options ...grpc.DialOption) (*emulator, error) {
 }
 
 // setup creates a fresh instance and database with the conformance schema.
-func (e *emulator) setup(ctx context.Context) error {
+func (e *emulator) setup(ctx context.Context, additionalDDL ...string) error {
 	const project = "projects/conformance"
 	inst := project + "/instances/txn"
 	ia := instancepb.NewInstanceAdminClient(e.conn)
@@ -94,7 +94,7 @@ func (e *emulator) setup(ctx context.Context) error {
 	da := databasepb.NewDatabaseAdminClient(e.conn)
 	dbID := fmt.Sprintf("db%d", time.Now().UnixNano()%1_000_000_000)
 	if _, err := da.CreateDatabase(ctx, &databasepb.CreateDatabaseRequest{
-		Parent: inst, CreateStatement: "CREATE DATABASE `" + dbID + "`", ExtraStatements: schemaDDL,
+		Parent: inst, CreateStatement: "CREATE DATABASE `" + dbID + "`", ExtraStatements: append(append([]string{}, schemaDDL...), additionalDDL...),
 	}); err != nil {
 		return fmt.Errorf("create database: %w", err)
 	}

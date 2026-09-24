@@ -111,3 +111,23 @@ func TestRestartRejectsOldHistoryAndLosesOpenTransactions(t *testing.T) {
 		})
 	}
 }
+
+func TestTerminalCrashCommitIsExecuted(t *testing.T) {
+	for _, name := range []string{"upstream", "target"} {
+		for _, mode := range []string{"no-persistence", "persistent"} {
+			t.Run(name+"/"+mode, func(t *testing.T) {
+				m := testModel(t, name, mode)
+				sched := restartFixture(false, false)
+				sched[3].Terminal = true
+				sched[3].Muts = []Mut{{Kind: "insert", Table: "A", Key: 0, Val: 70}}
+				out, err := m.run(sched)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if out[3] != errorOutcome("ALREADY_EXISTS") {
+					t.Fatalf("terminal commit was not checked: %s", out[3])
+				}
+			})
+		}
+	}
+}

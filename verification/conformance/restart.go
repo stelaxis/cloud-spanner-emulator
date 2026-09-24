@@ -46,10 +46,18 @@ func (p *commitProbe) HandleConn(context.Context, stats.ConnStats)              
 // discovers or kills containers by image/name patterns. A restart starts the
 // same container, mount, command, and host port, after a real SIGKILL.
 type restartDriver struct {
+	command                                                           func(...string) (string, error) // test lifecycle; RPC path is unchanged
 	engine                                                            *http.Client
 	probe                                                             *commitProbe
 	id, addr, dir, mode, checkpointCommand                            string
 	kills, commitAttempts, interrupted, completed, checkpointAttempts int
+}
+
+func (d *restartDriver) docker(args ...string) (string, error) {
+	if d.command != nil {
+		return d.command(args...)
+	}
+	return dockerCommand(args...)
 }
 
 func dockerCommand(args ...string) (string, error) {
@@ -82,7 +90,7 @@ func newRestartDriver(image, mode, checkpoint string) (*restartDriver, error) {
 	// Direct local Engine API avoids CLI startup latency on the kill path.
 	host := os.Getenv("DOCKER_HOST")
 	if host == "" {
-		host, err = dockerCommand("context", "inspect", "--format", "{{.Endpoints.docker.Host}}")
+		host, err = d.docker("context", "inspect", "--format", "{{.Endpoints.docker.Host}}")
 		if err != nil {
 			_ = os.RemoveAll(dir)
 			return nil, err
@@ -94,17 +102,17 @@ func newRestartDriver(image, mode, checkpoint string) (*restartDriver, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", socket)
 		}}}
 	}
-	args := []string{"create", "-p", d.addr + ":9010", "--mount", "type=bind,src=" + dir + ",dst=/data", "--entrypoint", "./emulator_main", image,
+	args := []string{"create", "--cpus=2", "-p", d.addr + ":9010", "--mount", "type=bind,src=" + dir + ",dst=/data", "--entrypoint", "./emulator_main", image,
 		"--host_port", "0.0.0.0:9010", "--abort_current_transaction_probability=0"}
 	if mode == "persistent" {
 		args = append(args, "--data_dir=/data")
 	}
-	d.id, err = dockerCommand(args...)
+	d.id, err = d.docker(args...)
 	if err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
-	if _, err = dockerCommand("start", d.id); err != nil {
+	if _, err = d.docker("start", d.id); err != nil {
 		d.close()
 		return nil, err
 	}
@@ -116,7 +124,7 @@ func (d *restartDriver) close() {
 		d.engine.CloseIdleConnections()
 	}
 	if d.id != "" {
-		_, _ = dockerCommand("rm", "-f", d.id)
+		_, _ = d.docker("rm", "-f", d.id)
 	}
 	_ = os.RemoveAll(d.dir)
 }
@@ -132,10 +140,10 @@ func (d *restartDriver) kill() error {
 		if resp.StatusCode != http.StatusNoContent {
 			return fmt.Errorf("docker kill HTTP %d: %s", resp.StatusCode, body)
 		}
-	} else if _, err := dockerCommand("kill", "--signal=KILL", d.id); err != nil {
+	} else if _, err := d.docker("kill", "--signal=KILL", d.id); err != nil {
 		return err
 	}
-	state, err := dockerCommand("inspect", "--format", "{{.State.ExitCode}} {{.State.Running}}", d.id)
+	state, err := d.docker("inspect", "--format", "{{.State.ExitCode}} {{.State.Running}}", d.id)
 	if err != nil {
 		return err
 	}
@@ -149,7 +157,7 @@ func (d *restartDriver) kill() error {
 func (d *restartDriver) restart(ctx context.Context, e *emulator) error {
 	oldDB := e.database
 	_ = e.conn.Close()
-	if _, err := dockerCommand("start", d.id); err != nil {
+	if _, err := d.docker("start", d.id); err != nil {
 		return err
 	}
 	fresh, err := dialEmulator(d.addr, grpc.WithStatsHandler(d.probe))
@@ -174,7 +182,7 @@ func (d *restartDriver) restart(ctx context.Context, e *emulator) error {
 			if status.Code(err) != codes.NotFound {
 				return fmt.Errorf("restart must lose old database %s: got %v, %v", oldDB, db, err)
 			}
-			return e.setup(ctx)
+			return e.setup(ctx, restartAuditDDL)
 		}
 		if err != nil {
 			return fmt.Errorf("persistent recovery of %s: %w", oldDB, err)
@@ -184,8 +192,8 @@ func (d *restartDriver) restart(ctx context.Context, e *emulator) error {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	state, _ := dockerCommand("inspect", "--format", "{{.State.Status}} exit={{.State.ExitCode}}", d.id)
-	logs, _ := dockerCommand("logs", "--tail", "12", d.id)
+	state, _ := d.docker("inspect", "--format", "{{.State.Status}} exit={{.State.ExitCode}}", d.id)
+	logs, _ := d.docker("logs", "--tail", "12", d.id)
 	return fmt.Errorf("restart did not become ready: %s; last RPC: %v; logs: %s", state, lastErr, logs)
 }
 
@@ -195,9 +203,6 @@ func (d *restartDriver) restart(ctx context.Context, e *emulator) error {
 // torn commits can hide behind a setup transaction clearing the database.
 func (g *generator) crashSchedule() []Step {
 	before := g.schedule()
-	for i := range before {
-		before[i].At = nil
-	}
 	cut := 2 + g.r.IntN(len(before)-2)
 	out := slices.Clone(before[:cut])
 	crash := Step{Op: "crash", DelayUS: g.r.IntN(3001)}
@@ -222,7 +227,9 @@ func (g *generator) crashSchedule() []Step {
 			crash.Muts = append(crash.Muts, Mut{Kind: "upsert", Table: "A", Key: i % g.cfg.numKeys, Val: int64(i)})
 		}
 	}
-	out = append(out, crash, Step{Op: "restart"}, Step{Txn: 100, Op: "begin_ro"})
+	at := 1
+	out = append(out, Step{Txn: 98, Op: "begin_ro", At: &at}, Step{Txn: 98, Op: "read", Table: "A", Keys: &Keys{All: true}})
+	out = append(out, crash, Step{Op: "restart"}, Step{Txn: 99, Op: "begin_ro", At: &at, Old: true}, Step{Txn: 100, Op: "begin_ro"})
 	for _, table := range tables {
 		out = append(out, Step{Txn: 100, Op: "read", Table: table, Keys: &Keys{All: true}})
 	}
@@ -237,11 +244,18 @@ func (g *generator) crashSchedule() []Step {
 
 // runCrashSchedule records which in-flight commits are ambiguous. The oracle
 // explores BOTH durable/lost outcomes only for interrupted RPCs. Successful
-// commit replies force durability; terminal constraint/abort errors force loss.
+// commit replies force durability; terminal constraint/abort errors are executed and compared in the model.
 func (e *emulator) runCrashSchedule(ctx context.Context, d *restartDriver, steps []Step) ([]Outcome, [][]Step, error) {
 	txns := map[int]*txnState{}
 	var times []*timestamppb.Timestamp
 	var lastObserved *timestamppb.Timestamp
+	var oldTimes []*timestamppb.Timestamp
+	observe := func(ts *timestamppb.Timestamp) {
+		if ts != nil && (lastObserved == nil || lastObserved.AsTime().Before(ts.AsTime())) {
+			lastObserved = ts
+		}
+	}
+	e.client = &restartClient{SpannerClient: spannerpb.NewSpannerClient(e.conn), observe: observe, clear: true}
 	checkTimestamp := func() error {
 		ts := times[len(times)-1]
 		if lastObserved != nil && !lastObserved.AsTime().Before(ts.AsTime()) {
@@ -253,6 +267,7 @@ func (e *emulator) runCrashSchedule(ctx context.Context, d *restartDriver, steps
 	candidates := [][]Step{slices.Clone(steps)}
 	for i := range candidates[0] {
 		candidates[0][i].Durable = false
+		candidates[0][i].Terminal = false
 	}
 	out := make([]Outcome, 0, len(steps))
 	running := true
@@ -273,6 +288,10 @@ func (e *emulator) runCrashSchedule(ctx context.Context, d *restartDriver, steps
 			if err := d.restart(ctx, e); err != nil {
 				return nil, nil, err
 			}
+			e.client = &restartClient{SpannerClient: spannerpb.NewSpannerClient(e.conn), observe: observe}
+			if err := e.readRestartAudit(ctx, observe); err != nil {
+				return nil, nil, err
+			}
 			running = true
 			txns = map[int]*txnState{}
 			if d.mode == "no-persistence" {
@@ -285,6 +304,8 @@ func (e *emulator) runCrashSchedule(ctx context.Context, d *restartDriver, steps
 			if !running {
 				return nil, nil, fmt.Errorf("double crash at step %d", i)
 			}
+			oldTimes = slices.Clone(times)
+			crashResult := okOutcome()
 			var response Outcome
 			var callErr error
 			done := make(chan struct{})
@@ -318,7 +339,7 @@ func (e *emulator) runCrashSchedule(ctx context.Context, d *restartDriver, steps
 			if d.checkpointCommand != "" && !st.DuringCommit {
 				// Future Phase 2 checkpoint trigger; must return after requesting a
 				// checkpoint. Kill delay spans its asynchronous write/publication stages.
-				if _, err := dockerCommand("exec", d.id, "sh", "-c", d.checkpointCommand); err != nil {
+				if _, err := d.docker("exec", d.id, "sh", "-c", d.checkpointCommand); err != nil {
 					<-done
 					return nil, nil, err
 				}
@@ -347,6 +368,10 @@ func (e *emulator) runCrashSchedule(ctx context.Context, d *restartDriver, steps
 				} else {
 					switch response {
 					case errorOutcome("ABORTED"), errorOutcome("ALREADY_EXISTS"), errorOutcome("NOT_FOUND"), errorOutcome("INVALID_ARGUMENT"), errorOutcome("FAILED_PRECONDITION"):
+						crashResult = response
+						for _, c := range candidates {
+							c[i].Terminal = true
+						}
 					default:
 						return nil, nil, fmt.Errorf("unexpected crash commit result %s", response)
 					}
@@ -374,7 +399,7 @@ func (e *emulator) runCrashSchedule(ctx context.Context, d *restartDriver, steps
 					}
 				}
 			}
-			out = append(out, okOutcome())
+			out = append(out, crashResult)
 			continue
 		}
 		if !running {
@@ -393,7 +418,11 @@ func (e *emulator) runCrashSchedule(ctx context.Context, d *restartDriver, steps
 			txns[st.Txn] = t
 		}
 		cctx, cancel := context.WithTimeout(ctx, callTimeout)
-		r, err := e.exec(cctx, st, t, &times)
+		readTimes := &times
+		if st.Old {
+			readTimes = &oldTimes
+		}
+		r, err := e.exec(cctx, st, t, readTimes)
 		cancel()
 		if err != nil {
 			return nil, nil, err
@@ -431,7 +460,7 @@ func runRestarts(mode, image, checkpoint, modelPath, modelName string, pushdown,
 	}
 	defer func() { _ = e.conn.Close() }()
 	ctx := context.Background()
-	if err = e.setup(ctx); err != nil {
+	if err = e.setup(ctx, restartAuditDDL); err != nil {
 		log.Print(err)
 		return 2
 	}

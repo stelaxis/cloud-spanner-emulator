@@ -86,7 +86,10 @@ theorem storage_high_monotone {s t : State} (m : Move s t) (q : Nat) :
   | persist r hp =>
       simp only [durableHigh, Disk.log, ← List.append_assoc, replay_append]
       exact replay_sequence_monotone _ [r] q
-  | publish snap tail hs hp => simp only [durableHigh, Disk.log, ← hp, Nat.le_refl]
+  | fsync r hp =>
+      simp only [durableHigh, Disk.log, ← List.append_assoc, replay_append]
+      exact replay_sequence_monotone _ [r] q
+  | publish snap tail hs hp hb => simp only [durableHigh, Disk.log, ← hp, Nat.le_refl]
   | _ => exact Nat.le_refl _
 
 structure Allocator where
