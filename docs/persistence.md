@@ -64,7 +64,11 @@ another emulator process`.
   The emulator never hands out a timestamp past a synced lease, which it
   extends about 250 ms ahead at a time; it restarts above that lease, so its
   clock can run up to that much ahead of the system clock right after a
-  restart, and the first reads wait that out.
+  restart, and the first reads wait that out. A read timestamp the client
+  chooses (`read_timestamp`, `min_read_timestamp`), which `BeginTransaction`
+  can return, is covered by the lease too: a read-only transaction at a
+  future timestamp moves the lease there, and after a crash the clock resumes
+  above it.
 * **Sequences** never hand out a value twice. The emulator reserves 1000
   counter values at a time and syncs the reservation before handing out any of
   them. After a crash, a sequence continues after its last reservation, so up
@@ -78,8 +82,10 @@ another emulator process`.
 
 If a write or sync of the log fails, the operation fails with `UNAVAILABLE`,
 and so does every later durable operation: the emulator must be restarted.
-If the failed record belongs to a schema change, which is already applied in
-memory by then, or extends the clock lease, the emulator exits instead.
+If the failed record belongs to a schema change, whose backfill writes are
+already in memory (though not yet visible), or extends the clock lease, the
+emulator exits instead. A schema change becomes visible, to `GetDatabaseDdl`
+as to queries and transactions, only after its record is synced.
 
 ## Files
 

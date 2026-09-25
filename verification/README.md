@@ -731,11 +731,11 @@ before.
 | No `ack` without `fsync` (`early_ack_loses_durability`) | a failed write or sync fails the commit before its writes are applied, and marks the log broken so every later record fails (`Log::Append`) |
 | Torn final bytes are never replayed, and are truncated before the next append | `ScanSegment`: a damaged record with no intact record after it, in the last segment, is dropped and the file truncated in `Log::Open` |
 | Detected non-tail corruption fails recovery (`Disk.recover`) | any other damaged record, a damaged file header or checkpoint, or a missing segment is `DATA_LOSS`; an unknown format version is `FAILED_PRECONDITION` |
-| `checkpointStart` needs an idle gate; `quiescent_image` | `PersistenceManager::Checkpoint` holds the gate while it starts a segment (boundary = next LSN) and copies instances, schemas (owned, `GetPersistedSchema`), rows and sequence reservations |
+| `checkpointStart` needs an idle gate; `quiescent_image` | `PersistenceManager::Checkpoint` holds the gate while it starts a segment (boundary = next LSN) and copies instances, schemas (owned, `GetPersistedSchema`), rows and sequence reservations; a database it cannot reach fails the checkpoint rather than being left out, and `ServerEnv` stops the checkpoint thread before it destroys the databases |
 | `publish` is atomic and durable | `Log::PublishCheckpoint`: temporary file, sync, rename, directory sync |
 | `truncate upto ≤ checkpoint.boundary` (`early_truncate_loses_recovery`) | `Log::RemoveSegmentsBelow` removes whole segments below the published boundary, never past it |
 | `restore` = checkpoint image + records with sequence ≥ boundary (`covered_wal_replay_is_wrong`) | `PersistenceManager::Recover` skips records below the boundary; recreating a database uses a fresh incarnation, so replaying a covered CREATE would not be idempotent either |
-| Clock lease: `serveRead` and `ack` stay within the durable lease; restart above `max(clockHigh, lease, recovered clock, wall)` (`wall_restart_regresses`) | `Clock::SetLease`: no timestamp past the lease is handed out before a lease record is synced; the checkpoint stores `max(clock, lease)`; `Recover` calls `Clock::AdvanceTo` |
+| Clock lease: `serveRead` and `ack` stay within the durable lease; restart above `max(clockHigh, lease, recovered clock, wall)` (`wall_restart_regresses`) | `Clock::SetLease`: no timestamp past the lease is handed out before a lease record is synced; a caller-chosen read timestamp is covered before a read-only transaction exists (`Clock::CoverWithLease` in `Database::CreateReadOnlyTransaction`); the checkpoint stores `max(clock, lease)`; `Recover` calls `Clock::AdvanceTo` |
 | `readAllowed boundary ts`; pre-restart exact reads rejected | `Database::SetRestartFloor`; `Database::CreateReadOnlyTransaction` returns `FAILED_PRECONDITION` below it; bounded staleness never picks a timestamp below it (`LockManager::AdvanceLastCommitTimestamp`) |
 | Sequence allocator issues only below durable reservations; a crash resumes at the durable end (`cursor_reset_reissues`) | `Sequence::GetNextSequenceValue` calls the reservation hook, which syncs a reservation record, before handing out a value past the reserved end; `Sequence::RestoreReservation` |
 | Drops: a dropped incarnation is never recreated | databases and instances have incarnation numbers; records of a dropped incarnation are ignored on replay |
@@ -767,11 +767,15 @@ Beyond the model:
 2. **Leases are log records.** The model's `Disk.lease` is a separate durable
    field. Truncating the log can drop old lease records, so each checkpoint
    stores `max(clock, lease)` as its clock high-water mark.
-3. **A schema change is applied before its record is synced**, because
-   backfills read their own writes. It stays invisible until it is marked
-   committed (reads at or after its timestamp wait), as in the model's
-   `flush` after `fsync`. A schema change is refused if the log is already
-   broken, but if its own record fails the change cannot be undone, so the
+3. **A schema change's backfill writes reach storage before its record is
+   synced**, because backfills read their own writes. They stay invisible
+   until the change is marked committed (reads at or after its timestamp
+   wait). The new schema itself is published to the versioned catalog, which
+   every reader of the latest schema (`GetDatabaseDdl`, queries, new
+   transactions) goes through, only after the record is synced, as in the
+   model's `flush` after `fsync`; a dropped sequence's counter is forgotten
+   only then too. A schema change is refused if the log is already broken,
+   but if its own record fails the backfill writes cannot be undone, so the
    emulator exits instead (`std::abort`); a restart recovers what the log
    holds. Commits are logged before they are applied and need no such rule.
 4. **The gate is taken after validation.** Validation reads only its own
@@ -800,7 +804,13 @@ Beyond the model:
   never reissuing across four crashes; pre-restart reads refused; timestamps
   above everything before a crash even when the system clock steps back an
   hour; drops staying dropped; PostgreSQL refused; failed sync; a crash at
-  every checkpoint stage; concurrent commits with checkpoints; a corrupt log.
+  every checkpoint stage (each fault targeted by file and checked to fire);
+  concurrent commits with checkpoints; a corrupt log. From review: a failed
+  `DROP SEQUENCE` keeps the sequence's state; a checkpoint fails rather than
+  skip an unreachable database, and teardown never checkpoints one away; a
+  future read timestamp returned to the client is covered across a crash; a
+  schema change is invisible while its record's sync is blocked; recovery
+  from the log alone ignores values of dropped proto and enum columns.
 * The crash driver runs `emulator_main` natively with `-emulator-binary`
   (below). `-checkpoint-command 'kill -USR1 $EMULATOR_PID'` requests a
   checkpoint before a between-call kill.
@@ -844,6 +854,16 @@ against the `emulator_main` built from the same tree.
 | Stress `crash` workload, 16 workers, 30 s, SIGKILL at 15 s | killed with 74,469 acknowledged transfers; restarted and verified exact in 0.6 s; exact again at the end, 143,646 transfers committed. Two more runs killed at 7 s and 23 s: exact too |
 | Stelaxis smoke, `apps/stelaxis/priv/repo/structure.sql` | 158 statements (FKs last), 51 tables, 47 filled with 137 rows; after SIGKILL and restart the 136-statement DDL and every row are identical, and both sequence-keyed tables take new rows without reissuing a value |
 | `lake build`; `grep -rn sorry`; Go vet, gofmt and `go test -race` under `verification/` | pass; no `sorry`; Lean files unchanged |
+
+After the review fixes (the regression tests in `persistence_test` each
+failed before their fix): the upstream suite again passes 132 of 134 targets
+with the same two known macOS failures; `//frontend/persistence:all` and
+`//common:clock_test` pass 20/20; ThreadSanitizer is clean on the same 7
+targets × 10 runs; the crash driver passes seeds 1–500 with 0 mismatches
+(129 interrupted commits, 43 successful replies, 246 checkpoint requests);
+the stress `crash` workload is exact after SIGKILL (53,598 acknowledged at the
+kill); the Stelaxis smoke test is identical after SIGKILL; `lake build` and
+the Go checks pass.
 
 Throughput, `stress -workers 16 -duration 15s`, native `emulator_main`,
 committed transactions per second:
