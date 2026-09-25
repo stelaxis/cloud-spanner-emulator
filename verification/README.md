@@ -715,3 +715,146 @@ a comment), so the 500-seed Docker gate is not rerun for round 2.
 See the [review-response report](results/l2-report.md) for exact commands, raw
 logs, theorem dependencies and point-by-point review responses. The earlier four-shard logs are historical evidence for
 `f38776c` and are not counted toward the revised-code gate.
+
+## Persistence implementation
+
+The fork implements the L2 protocol behind `--data_dir`
+([docs/persistence.md](../docs/persistence.md)). Without the flag none of it
+runs: no gate is taken, no file is touched, and commits flush to storage as
+before.
+
+| Model (`Persistence.lean`, `PersistenceSequences.lean`) | C++ |
+|---|---|
+| One physical WAL of `(sequence, record)` entries (`Disk.physical`) | `frontend/persistence/log.cc`: segment files `wal-<first LSN>.log`; every frame holds its LSN, length and CRC32C; `Log::Open` rejects a gap in LSNs |
+| Records hold resolved physical effects; replay evaluates no SQL | `backend::StorageOp` (table/column IDs, keys, values after defaults, generated columns and commit timestamps are resolved), recorded by `RecordingStorage`; a schema change's record holds its schema and its backfill writes (`Database::ApplySchemaChangeLocked`); recovery writes them straight into storage (`LoadRows` in `frontend/persistence/manager.cc`) |
+| `begin → finish → fsync → flush → ack` under one global gate; records in commit-timestamp order across databases | `LockHandle::Commit` (`backend/locking/handle.cc`) takes the emulator-wide gate after validation and holds it from `ReserveCommitTimestamp` to `MarkCommitted`; inside, `ReadWriteTransaction::Commit` records the writes, `LogCommit` appends and syncs them, and only then are they applied. Catalog records take the gate and a clock timestamp (`PersistenceManager::Log*`) |
+| No `ack` without `fsync` (`early_ack_loses_durability`) | a failed write or sync fails the commit before its writes are applied, and marks the log broken so every later record fails (`Log::Append`) |
+| Torn final bytes are never replayed, and are truncated before the next append | `ScanSegment`: a damaged record with no intact record after it, in the last segment, is dropped and the file truncated in `Log::Open` |
+| Detected non-tail corruption fails recovery (`Disk.recover`) | any other damaged record, a damaged file header or checkpoint, or a missing segment is `DATA_LOSS`; an unknown format version is `FAILED_PRECONDITION` |
+| `checkpointStart` needs an idle gate; `quiescent_image` | `PersistenceManager::Checkpoint` holds the gate while it starts a segment (boundary = next LSN) and copies instances, schemas (owned, `GetPersistedSchema`), rows and sequence reservations |
+| `publish` is atomic and durable | `Log::PublishCheckpoint`: temporary file, sync, rename, directory sync |
+| `truncate upto ≤ checkpoint.boundary` (`early_truncate_loses_recovery`) | `Log::RemoveSegmentsBelow` removes whole segments below the published boundary, never past it |
+| `restore` = checkpoint image + records with sequence ≥ boundary (`covered_wal_replay_is_wrong`) | `PersistenceManager::Recover` skips records below the boundary; recreating a database uses a fresh incarnation, so replaying a covered CREATE would not be idempotent either |
+| Clock lease: `serveRead` and `ack` stay within the durable lease; restart above `max(clockHigh, lease, recovered clock, wall)` (`wall_restart_regresses`) | `Clock::SetLease`: no timestamp past the lease is handed out before a lease record is synced; the checkpoint stores `max(clock, lease)`; `Recover` calls `Clock::AdvanceTo` |
+| `readAllowed boundary ts`; pre-restart exact reads rejected | `Database::SetRestartFloor`; `Database::CreateReadOnlyTransaction` returns `FAILED_PRECONDITION` below it; bounded staleness never picks a timestamp below it (`LockManager::AdvanceLastCommitTimestamp`) |
+| Sequence allocator issues only below durable reservations; a crash resumes at the durable end (`cursor_reset_reissues`) | `Sequence::GetNextSequenceValue` calls the reservation hook, which syncs a reservation record, before handing out a value past the reserved end; `Sequence::RestoreReservation` |
+| Drops: a dropped incarnation is never recreated | databases and instances have incarnation numbers; records of a dropped incarnation are ignored on replay |
+| Backfills are not re-run (`rerun_backfill_changes_rows`) | recovery rebuilds each schema from its DDL against empty storage, then loads rows; no default, generated column or backfill is evaluated |
+
+Beyond the model:
+
+* **Schemas are stored as DDL** plus the storage IDs of their tables,
+  columns and sequences. Recovery rebuilds the schema through the normal
+  `Database::Create` path with those IDs preassigned
+  (`UniqueIdGenerator::Preassign`, `SchemaChangeContext::sequence_ids`) and
+  fails if the rebuilt IDs differ. The DDL is printed with foreign keys added
+  after every table (`PrintDDLStatements(schema, /*foreign_keys_last=*/true)`),
+  because a parent can reference its interleaved child, a cycle the
+  inline form cannot recreate. The Stelaxis smoke test found this.
+* **Only GoogleSQL databases** are persisted; PostgreSQL-dialect creation is
+  refused with `--data_dir`.
+* **Values** use the client wire encoding with their own type, so a value
+  decodes without its column's current schema.
+
+### Deviations from the model
+
+1. **Sequence reservations and clock leases have no timestamp and do not take
+   the gate.** Their effect is a maximum, which commutes with every other
+   record, so their position in the log does not matter. Taking the gate
+   would deadlock: a schema change holds it while its backfill draws
+   sequence values. The model appends every record under the gate with a
+   timestamp.
+2. **Leases are log records.** The model's `Disk.lease` is a separate durable
+   field. Truncating the log can drop old lease records, so each checkpoint
+   stores `max(clock, lease)` as its clock high-water mark.
+3. **A schema change is applied before its record is synced**, because
+   backfills read their own writes. It stays invisible until it is marked
+   committed (reads at or after its timestamp wait), as in the model's
+   `flush` after `fsync`. A schema change is refused if the log is already
+   broken, but if its own record fails the change cannot be undone, so the
+   emulator exits instead (`std::abort`); a restart recovers what the log
+   holds. Commits are logged before they are applied and need no such rule.
+4. **The gate is taken after validation.** Validation reads only its own
+   database, and that database's commit mutex already orders it with that
+   database's commits and schema changes. The model takes the gate before
+   validation.
+5. **Segments.** The one physical WAL is split into files so that truncation
+   removes whole files below the published boundary.
+6. **No group commit.** Each commit syncs its own record, holding the gate.
+7. **Multiple databases.** The composition proof covers one fixed-schema
+   database; the implementation relies on one global timestamp order for all
+   databases and the catalog.
+
+### Tests and tools
+
+* `frontend/persistence/log_test.cc`: the log on a simulated file system
+  (`MemFileSystem`) that loses unsynced bytes and directory entries on a
+  crash: a torn tail at every byte offset of a record, failed write and sync
+  (not acknowledged, log broken), an unacknowledged record that reached the
+  disk, corruption mid-log and in an earlier segment, a missing segment,
+  unknown format versions, the lock, and crashes between checkpoint write,
+  rename, directory sync and truncation.
+* `frontend/persistence/persistence_test.cc`: the managers and recovery on the
+  same file system: schemas and rows (storage dumps and storage IDs) across a
+  crash, including an interleaved parent referencing its child; sequences
+  never reissuing across four crashes; pre-restart reads refused; timestamps
+  above everything before a crash even when the system clock steps back an
+  hour; drops staying dropped; PostgreSQL refused; failed sync; a crash at
+  every checkpoint stage; concurrent commits with checkpoints; a corrupt log.
+* The crash driver runs `emulator_main` natively with `-emulator-binary`
+  (below). `-checkpoint-command 'kill -USR1 $EMULATOR_PID'` requests a
+  checkpoint before a between-call kill.
+* `stress -workloads crash -emulator-binary ... -data-dir DIR` kills the
+  emulator with SIGKILL in the middle of the transfer workload and restarts
+  it. Every transfer also inserts a `Transfers` row, so in-flight commits can
+  be resolved: in one snapshot right after the restart, and again at the end,
+  every balance must equal its initial value plus the transfers present,
+  every transfer acknowledged before the kill must be present, and no
+  transfer may be present that was never attempted.
+* `stress/smoke` applies a schema file one statement at a time (foreign keys
+  last), fills every table it can with type-driven DML, kills the emulator
+  with SIGKILL, restarts it, and compares `GetDatabaseDdl` and every row, then
+  checks that sequences continue without reissuing.
+
+```sh
+cd verification/conformance
+go run . -persistence persistent -model target -pushdown \
+  -emulator-binary ../../bazel-bin/binaries/emulator_main -port 19210 \
+  -seeds 500 -checkpoint-command 'kill -USR1 $EMULATOR_PID'
+cd ../stress
+go run . -emulator-binary ../../bazel-bin/binaries/emulator_main \
+  -data-dir /tmp/stress-data -port 19220 -workloads crash -duration 20s
+go run ./smoke -emulator-binary ../../bazel-bin/binaries/emulator_main \
+  -schema .../apps/stelaxis/priv/repo/structure.sql
+```
+
+### Persistence results
+
+All on macOS arm64, native builds of this branch with `-c opt --jobs=6
+--local_resources=cpu=6 --local_resources=memory=16384`; the Go gates ran
+against the `emulator_main` built from the same tree.
+
+| Gate | Result |
+|---|---|
+| Upstream suite: `//backend/... //common/... //frontend/... //gateway/... //binaries/... //tests/conformance/...` | 134 test targets: 132 pass. The 2 failures are on #2's known macOS list: `change_stream_backfill_test` and `PGFunctionsTest.ToJsonB` (1 of 32 `emulator_conformance_test` shards) |
+| New and changed tests, `--runs_per_test=20` | `log_test` (18 cases), `persistence_test` (10 cases), `instance_manager_test`, `database_manager_test`: 20/20 each |
+| ThreadSanitizer, `--output_base=/private/var/tmp/_bazel_persistence_tsan`, flags as in Phase 1, `--runs_per_test=10` | `frontend/persistence:{log_test,persistence_test}`, `transaction:concurrency_test`, `database:{database_concurrency_test,schema_lifetime_test}`, `locking:manager_test`, `common:clock_test`: 7 targets × 10 runs, no reports (the test binaries link `libclang_rt.tsan`) |
+| Crash driver, persistent, `-model target -pushdown`, seeds 1–500, `-checkpoint-command 'kill -USR1 $EMULATOR_PID'` | 500 schedules, 15,508 steps, **0 mismatches**, 500 SIGKILL/restarts; 254 kills during a Commit: 128 interrupted RPCs, 44 successful replies, 82 matching terminal errors; 246 checkpoint requests |
+| Target conformance, `--data_dir`, `-pushdown`, seeds 1–3000 | 3000 schedules, 49,332 steps, **0 mismatches**, `ABORTED` 607 / 607 (the same as without `--data_dir`) |
+| Stress `crash` workload, 16 workers, 30 s, SIGKILL at 15 s | killed with 74,469 acknowledged transfers; restarted and verified exact in 0.6 s; exact again at the end, 143,646 transfers committed. Two more runs killed at 7 s and 23 s: exact too |
+| Stelaxis smoke, `apps/stelaxis/priv/repo/structure.sql` | 158 statements (FKs last), 51 tables, 47 filled with 137 rows; after SIGKILL and restart the 136-statement DDL and every row are identical, and both sequence-keyed tables take new rows without reissuing a value |
+| `lake build`; `grep -rn sorry`; Go vet, gofmt and `go test -race` under `verification/` | pass; no `sorry`; Lean files unchanged |
+
+Throughput, `stress -workers 16 -duration 15s`, native `emulator_main`,
+committed transactions per second:
+
+| Workload | In memory | `--data_dir` |
+|---|---|---|
+| contended | 1,148 | 1,331 |
+| disjoint | 6,296 | 6,131 |
+| mux282 | 15,125 | 11,669 |
+| crash (32 accounts, SIGKILL mid-run) | | 4,784 |
+
+On macOS `fsync` does not flush the drive's cache, so a sync costs little and
+persistence costs little. On Linux, `fdatasync` bounds commits by the disk's
+sync latency: every commit syncs its own record under the gate.
