@@ -31,6 +31,7 @@
 #include "backend/actions/manager.h"
 #include "backend/common/case.h"
 #include "backend/common/ids.h"
+#include "backend/database/database_log.h"
 #include "backend/datamodel/key.h"
 #include "backend/datamodel/key_range.h"
 #include "backend/locking/handle.h"
@@ -84,7 +85,8 @@ class ReadWriteTransaction : public RowReader, public RowWriter {
                        TransactionID transaction_id, Clock* clock,
                        Storage* storage, LockManager* lock_manager,
                        const VersionedCatalog* const versioned_catalog,
-                       ActionManager* action_manager);
+                       ActionManager* action_manager,
+                       DatabaseLog* log = nullptr);
 
   absl::Status Read(const ReadArg& read_arg,
                     std::unique_ptr<RowCursor>* cursor) override
@@ -223,6 +225,9 @@ class ReadWriteTransaction : public RowReader, public RowWriter {
 
   // Action Manager for the transaction.
   ActionManager* action_manager_;
+
+  // With --data_dir, commits are logged here before they are applied.
+  DatabaseLog* const log_;
   // Shared with the action manager, which replaces it on a schema change.
   std::shared_ptr<ActionRegistry> action_registry_;
   std::unique_ptr<ActionContext> action_context_;

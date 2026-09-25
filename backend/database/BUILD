@@ -24,6 +24,19 @@ package(
 licenses(["notice"])
 
 cc_library(
+    name = "database_log",
+    hdrs = ["database_log.h"],
+    deps = [
+        "//backend/schema/catalog:schema",
+        "//backend/storage:recording_storage",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+cc_library(
     name = "database",
     srcs = [
         "database.cc",
@@ -32,6 +45,10 @@ cc_library(
         "database.h",
     ],
     deps = [
+        ":database_log",
+        "//backend/storage:recording_storage",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/synchronization",
         "//backend/actions:manager",
         "//backend/common:ids",

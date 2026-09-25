@@ -84,6 +84,17 @@ class LockManager {
   // before `read_time` is still pending.
   void WaitForSafeRead(absl::Time read_time) ABSL_LOCKS_EXCLUDED(mu_);
 
+  // With --data_dir: the emulator-wide commit gate (DatabaseLog). Commits hold
+  // it, after validation, from reserving a timestamp until they are marked
+  // committed. Set before the database is used.
+  void set_commit_gate(absl::Mutex* gate) { commit_gate_ = gate; }
+  absl::Mutex* commit_gate() const { return commit_gate_; }
+
+  // Raises the last commit timestamp to `timestamp`, the floor of a recovered
+  // database: bounded-staleness reads never pick an earlier timestamp.
+  void AdvanceLastCommitTimestamp(absl::Time timestamp)
+      ABSL_LOCKS_EXCLUDED(mu_);
+
  private:
   friend class LockHandle;
 
@@ -102,6 +113,8 @@ class LockManager {
 
   // Storage read by commit validation.
   const Storage* storage_;
+
+  absl::Mutex* commit_gate_ = nullptr;
 
   // Timestamp at which last schema update or commit completed.
   absl::Time last_commit_timestamp_ ABSL_GUARDED_BY(mu_) = absl::InfinitePast();

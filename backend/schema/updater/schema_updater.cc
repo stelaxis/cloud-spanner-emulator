@@ -240,6 +240,11 @@ class SchemaUpdaterImpl {
     return std::move(intermediate_schemas_);
   }
 
+  void set_sequence_ids(
+      const absl::flat_hash_map<std::string, std::string>* sequence_ids) {
+    sequence_ids_ = sequence_ids;
+  }
+
  private:
   SchemaUpdaterImpl(googlesql::TypeFactory* type_factory,
                     TableIDGenerator* table_id_generator,
@@ -755,6 +760,9 @@ class SchemaUpdaterImpl {
   // Assigns OIDs to database objects when dialect is POSTGRESQL. The assigner
   // is owned by the database and is shared across all schema changes.
   PgOidAssigner* pg_oid_assigner_;
+
+  // See SchemaChangeContext::sequence_ids.
+  const absl::flat_hash_map<std::string, std::string>* sequence_ids_ = nullptr;
 
   // Holds the database id for this schema updater.
   std::string database_id_;
@@ -4966,11 +4974,14 @@ absl::StatusOr<const Sequence*> SchemaUpdaterImpl::CreateSequence(
             << create_sequence.sequence_name();
   }
   builder.set_name(create_sequence.sequence_name());
-  absl::BitGen bitgen;
-  builder.set_id(absl::StrCat(
-      "seq_",
-      googlesql::functions::GenerateUuid(bitgen)
-      ));
+  if (sequence_ids_ != nullptr &&
+      sequence_ids_->contains(create_sequence.sequence_name())) {
+    builder.set_id(sequence_ids_->at(create_sequence.sequence_name()));
+  } else {
+    absl::BitGen bitgen;
+    builder.set_id(
+        absl::StrCat("seq_", googlesql::functions::GenerateUuid(bitgen)));
+  }
   ::google::protobuf::RepeatedPtrField<ddl::SetOption> clause_options;
   if (dialect == database_api::DatabaseDialect::GOOGLE_STANDARD_SQL) {
     bool created_from_syntax = create_sequence.has_type() ||
@@ -6947,6 +6958,7 @@ SchemaUpdater::ValidateSchemaFromDDL(
                        context.column_id_generator, context.storage,
                        context.schema_change_timestamp, context.pg_oid_assigner,
                        existing_schema, context.database_id));
+  updater.set_sequence_ids(context.sequence_ids);
   context.pg_oid_assigner->BeginAssignment();
   GOOGLESQL_ASSIGN_OR_RETURN(pending_work_,
                    updater.ApplyDDLStatements(schema_change_operation));
@@ -6982,6 +6994,7 @@ absl::StatusOr<SchemaChangeResult> SchemaUpdater::UpdateSchemaFromDDL(
                        context.column_id_generator, context.storage,
                        context.schema_change_timestamp, context.pg_oid_assigner,
                        existing_schema, context.database_id));
+  updater.set_sequence_ids(context.sequence_ids);
   context.pg_oid_assigner->BeginAssignment();
   GOOGLESQL_ASSIGN_OR_RETURN(pending_work_,
                    updater.ApplyDDLStatements(schema_change_operation));

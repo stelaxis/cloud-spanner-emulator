@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 
 #include "googlesql/public/options.pb.h"
 #include "googlesql/public/type.pb.h"
@@ -68,6 +69,29 @@ absl::Status Sequence::DeepClone(SchemaGraphEditor* editor,
   return absl::OkStatus();
 }
 
+namespace {
+
+// Counter values reserved at a time with --data_dir.
+constexpr int64_t kSequenceReservation = 1000;
+
+}  // namespace
+
+void Sequence::SetReservationHook(ReservationHook hook) {
+  absl::MutexLock lock(SequenceMutex);
+  reservation_hook_ = std::move(hook);
+}
+
+void Sequence::RestoreReservation(const std::string& sequence_id, int64_t end) {
+  absl::MutexLock lock(SequenceMutex);
+  reservation_ends_[sequence_id] = end;
+  Sequence::SequenceLastValues[sequence_id] = end;
+}
+
+absl::flat_hash_map<std::string, int64_t> Sequence::ReservationEnds() {
+  absl::MutexLock lock(SequenceMutex);
+  return reservation_ends_;
+}
+
 absl::StatusOr<googlesql::Value> Sequence::GetNextSequenceValue() const {
   absl::MutexLock lock(SequenceMutex);
   if (!Sequence::SequenceLastValues.contains(id_)) {
@@ -98,6 +122,18 @@ absl::StatusOr<googlesql::Value> Sequence::GetNextSequenceValue() const {
       ABSL_LOG(INFO) << "No additional value can be obtained. The current sequence "
                 << "counter is already at int64max.";
       return error::SequenceExhausted(name_);
+    }
+    if (reservation_hook_) {
+      int64_t counter = Sequence::SequenceLastValues[id_];
+      auto end = reservation_ends_.find(id_);
+      if (end == reservation_ends_.end() || counter >= end->second) {
+        int64_t new_end = counter > kInt64Max - kSequenceReservation
+                              ? kInt64Max
+                              : counter + kSequenceReservation;
+        absl::Status status = reservation_hook_(id_, new_end);
+        if (!status.ok()) return status;
+        reservation_ends_[id_] = new_end;
+      }
     }
     // In a bit-reversed-positive sequence, we bit-reverse the counter and
     // preserve its sign.
@@ -141,6 +177,7 @@ void Sequence::RemoveSequenceFromLastValuesMap() const {
   if (it != Sequence::SequenceLastValues.end()) {
     Sequence::SequenceLastValues.erase(it);
   }
+  reservation_ends_.erase(id_);
 }
 
 }  // namespace backend

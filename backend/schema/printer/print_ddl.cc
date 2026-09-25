@@ -609,13 +609,16 @@ std::string PrintPropertyGraph(const PropertyGraph* property_graph) {
   return statement;
 }
 
-std::string PrintTable(const Table* table) {
+namespace {
+
+std::string PrintTable(const Table* table, bool with_foreign_keys) {
   std::string table_string =
       absl::Substitute("CREATE TABLE $0 (\n", PrintName(table->Name()));
   for (const Column* column : table->columns()) {
     absl::StrAppend(&table_string, "  ", PrintColumn(column), ",\n");
   }
   for (const ForeignKey* foreign_key : table->foreign_keys()) {
+    if (!with_foreign_keys) break;
     absl::StrAppend(&table_string, "  ", PrintForeignKey(foreign_key), ",\n");
   }
   for (const CheckConstraint* check_constraint : table->check_constraints()) {
@@ -658,10 +661,16 @@ std::string PrintTable(const Table* table) {
   return table_string;
 }
 
+}  // namespace
+
+std::string PrintTable(const Table* table) {
+  return PrintTable(table, /*with_foreign_keys=*/true);
+}
+
 // Moves the nodes with no dependencies to the front of the list.
 void TopologicalOrderSchemaNodes(
     const SchemaNode* node, absl::flat_hash_set<const SchemaNode*>* visited,
-    std::vector<std::string>* statements) {
+    std::vector<std::string>* statements, bool foreign_keys_inline = true) {
   if (visited->find(node) != visited->end()) {
     return;
   }
@@ -669,7 +678,8 @@ void TopologicalOrderSchemaNodes(
 
   if (const View* view = node->As<const View>(); view != nullptr) {
     for (auto dependency : view->dependencies()) {
-      TopologicalOrderSchemaNodes(dependency, visited, statements);
+      TopologicalOrderSchemaNodes(dependency, visited, statements,
+                                  foreign_keys_inline);
     }
     statements->push_back(PrintView(view));
   }
@@ -677,23 +687,27 @@ void TopologicalOrderSchemaNodes(
   if (const Table* table = node->As<const Table>(); table != nullptr) {
     for (const Column* column : table->columns()) {
       for (const Column* column_dep : column->dependent_columns()) {
-        TopologicalOrderSchemaNodes(column_dep->table(), visited, statements);
+        TopologicalOrderSchemaNodes(column_dep->table(), visited, statements,
+                                    foreign_keys_inline);
       }
       for (const SchemaNode* sequence_dep : column->sequences_used()) {
-        TopologicalOrderSchemaNodes(sequence_dep, visited, statements);
+        TopologicalOrderSchemaNodes(sequence_dep, visited, statements,
+                                    foreign_keys_inline);
       }
       for (const SchemaNode* udf_dep : column->udf_dependencies()) {
-        TopologicalOrderSchemaNodes(udf_dep, visited, statements);
+        TopologicalOrderSchemaNodes(udf_dep, visited, statements,
+                                    foreign_keys_inline);
       }
       // Omitting indexes since their dependencies to UDFs are through columns.
     }
     for (const CheckConstraint* check_constraint : table->check_constraints()) {
       for (const SchemaNode* udf_dep : check_constraint->udf_dependencies()) {
-        TopologicalOrderSchemaNodes(udf_dep, visited, statements);
+        TopologicalOrderSchemaNodes(udf_dep, visited, statements,
+                                    foreign_keys_inline);
       }
     }
 
-    statements->push_back(PrintTable(table));
+    statements->push_back(PrintTable(table, foreign_keys_inline));
     std::vector<const Index*> indexes{table->indexes().begin(),
                                       table->indexes().end()};
     std::sort(indexes.begin(), indexes.end(),
@@ -709,7 +723,8 @@ void TopologicalOrderSchemaNodes(
 
   if (const Udf* udf = node->As<const Udf>(); udf != nullptr) {
     for (const SchemaNode* udf_dep : udf->dependencies()) {
-      TopologicalOrderSchemaNodes(udf_dep, visited, statements);
+      TopologicalOrderSchemaNodes(udf_dep, visited, statements,
+                                  foreign_keys_inline);
     }
 
     statements->push_back(PrintUdf(udf));
@@ -943,6 +958,11 @@ std::string PrintLocalityGroupOptions(
 
 absl::StatusOr<std::vector<std::string>> PrintDDLStatements(
     const Schema* schema) {
+  return PrintDDLStatements(schema, /*foreign_keys_last=*/false);
+}
+
+absl::StatusOr<std::vector<std::string>> PrintDDLStatements(
+    const Schema* schema, bool foreign_keys_last) {
   std::vector<std::string> statements;
   if (schema->dialect() == database_api::DatabaseDialect::POSTGRESQL) {
     absl::StatusOr<std::unique_ptr<SpangresSchemaPrinter>> printer =
@@ -979,31 +999,49 @@ absl::StatusOr<std::vector<std::string>> PrintDDLStatements(
   // Print schema nodes while ensuring that dependencies are printed first.
   absl::flat_hash_set<const SchemaNode*> visited;
   for (const NamedSchema* named_schema : schema->named_schemas()) {
-    TopologicalOrderSchemaNodes(named_schema, &visited, &statements);
+    TopologicalOrderSchemaNodes(named_schema, &visited, &statements,
+                                !foreign_keys_last);
   }
   for (const Placement* placement : schema->placements()) {
-    TopologicalOrderSchemaNodes(placement, &visited, &statements);
+    TopologicalOrderSchemaNodes(placement, &visited, &statements,
+                                !foreign_keys_last);
   }
   for (const Sequence* sequence : schema->user_visible_sequences()) {
-    TopologicalOrderSchemaNodes(sequence, &visited, &statements);
+    TopologicalOrderSchemaNodes(sequence, &visited, &statements,
+                                !foreign_keys_last);
   }
   for (const Table* table : schema->tables()) {
-    TopologicalOrderSchemaNodes(table, &visited, &statements);
+    TopologicalOrderSchemaNodes(table, &visited, &statements,
+                                !foreign_keys_last);
   }
   for (const ChangeStream* change_stream : schema->change_streams()) {
-    TopologicalOrderSchemaNodes(change_stream, &visited, &statements);
+    TopologicalOrderSchemaNodes(change_stream, &visited, &statements,
+                                !foreign_keys_last);
   }
   for (const Model* model : schema->models()) {
-    TopologicalOrderSchemaNodes(model, &visited, &statements);
+    TopologicalOrderSchemaNodes(model, &visited, &statements,
+                                !foreign_keys_last);
   }
   for (const View* view : schema->views()) {
-    TopologicalOrderSchemaNodes(view, &visited, &statements);
+    TopologicalOrderSchemaNodes(view, &visited, &statements,
+                                !foreign_keys_last);
   }
   for (const Udf* udf : schema->udfs()) {
-    TopologicalOrderSchemaNodes(udf, &visited, &statements);
+    TopologicalOrderSchemaNodes(udf, &visited, &statements, !foreign_keys_last);
   }
   for (const PropertyGraph* property_graph : schema->property_graphs()) {
-    TopologicalOrderSchemaNodes(property_graph, &visited, &statements);
+    TopologicalOrderSchemaNodes(property_graph, &visited, &statements,
+                                !foreign_keys_last);
+  }
+
+  if (foreign_keys_last) {
+    for (const Table* table : schema->tables()) {
+      for (const ForeignKey* foreign_key : table->foreign_keys()) {
+        statements.push_back(absl::StrCat("ALTER TABLE ",
+                                          PrintName(table->Name()), " ADD ",
+                                          PrintForeignKey(foreign_key)));
+      }
+    }
   }
 
   for (auto locality_group : schema->locality_groups()) {

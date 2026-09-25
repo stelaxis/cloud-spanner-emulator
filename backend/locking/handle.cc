@@ -132,6 +132,12 @@ absl::StatusOr<absl::Time> LockHandle::Commit(
       return error::AbortReadSetConflict(tid_);
     }
   }
+  // With --data_dir, `flush` logs the commit; the gate keeps the log in
+  // commit-timestamp order across databases.
+  std::optional<absl::MutexLock> gate;
+  if (manager_->commit_gate() != nullptr) {
+    gate.emplace(*manager_->commit_gate());
+  }
   absl::Time commit_timestamp = manager_->ReserveCommitTimestamp();
   absl::Status flush_status = flush(commit_timestamp);
   manager_->MarkCommitted(commit_timestamp);

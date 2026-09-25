@@ -52,6 +52,22 @@ cc_library(
 )
 
 cc_library(
+    name = "recording_storage",
+    srcs = ["recording_storage.cc"],
+    hdrs = ["recording_storage.h"],
+    deps = [
+        ":iterator",
+        ":storage",
+        "//backend/common:ids",
+        "//backend/datamodel:key",
+        "//backend/datamodel:key_range",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/time",
+        "@com_google_googlesql//googlesql/public:value",
+    ],
+)
+
+cc_library(
     name = "in_memory_storage",
     srcs = ["in_memory_storage.cc"],
     hdrs = [

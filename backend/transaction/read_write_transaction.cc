@@ -57,6 +57,7 @@
 #include "backend/schema/catalog/table.h"
 #include "backend/schema/catalog/versioned_catalog.h"
 #include "backend/storage/iterator.h"
+#include "backend/storage/recording_storage.h"
 #include "backend/storage/storage.h"
 #include "backend/transaction/actions.h"
 #include "backend/transaction/commit_timestamp.h"
@@ -257,7 +258,7 @@ ReadWriteTransaction::ReadWriteTransaction(
     const ReadWriteOptions& options, const RetryState& retry_state,
     TransactionID transaction_id, Clock* clock, Storage* storage,
     LockManager* lock_manager, const VersionedCatalog* const versioned_catalog,
-    ActionManager* action_manager)
+    ActionManager* action_manager, DatabaseLog* log)
     : options_(options),
       retry_state_(MakeRetryState(retry_state, clock)),
       id_(transaction_id),
@@ -271,6 +272,7 @@ ReadWriteTransaction::ReadWriteTransaction(
       transaction_store_(std::make_unique<TransactionStore>(
           base_storage_, lock_handle_.get(), commit_timestamp_tracker_.get())),
       action_manager_(action_manager),
+      log_(log),
       action_context_(std::make_unique<ActionContext>(
           std::make_unique<TransactionReadOnlyStore>(transaction_store_.get()),
           std::make_unique<TransactionEffectsBuffer>(&write_ops_queue_),
@@ -795,9 +797,24 @@ absl::Status ReadWriteTransaction::Commit() {
               return absl::OkStatus();
             },
             [&](absl::Time commit_timestamp) -> absl::Status {
-              GOOGLESQL_RETURN_IF_ERROR(FlushWriteOpsToStorage(
-                  transaction_store_->GetBufferedOps(), base_storage_,
-                  commit_timestamp));
+              if (log_ != nullptr) {
+                // Durable first, then visible; a failed record changes
+                // nothing.
+                RecordingStorage recorded(base_storage_, /*forward=*/false);
+                GOOGLESQL_RETURN_IF_ERROR(
+                    FlushWriteOpsToStorage(transaction_store_->GetBufferedOps(),
+                                           &recorded, commit_timestamp));
+                if (!recorded.ops().empty()) {
+                  GOOGLESQL_RETURN_IF_ERROR(
+                      log_->LogCommit(commit_timestamp, recorded.ops()));
+                }
+                GOOGLESQL_RETURN_IF_ERROR(ApplyStorageOps(
+                    commit_timestamp, recorded.ops(), base_storage_));
+              } else {
+                GOOGLESQL_RETURN_IF_ERROR(
+                    FlushWriteOpsToStorage(transaction_store_->GetBufferedOps(),
+                                           base_storage_, commit_timestamp));
+              }
               for (const auto& [table, key] :
                    transaction_store_->GetCancelledWrites()) {
                 GOOGLESQL_RETURN_IF_ERROR(base_storage_->MarkWritten(

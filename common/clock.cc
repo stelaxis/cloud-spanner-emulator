@@ -17,9 +17,12 @@
 #include "common/clock.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <utility>
 
+#include "absl/status/statusor.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 
@@ -56,7 +59,32 @@ absl::Time Clock::Now() {
   }
   last_system_time_ = now;
 
+  if (last_dispensed_time_ > lease_) {
+    absl::StatusOr<absl::Time> lease = extend_lease_(last_dispensed_time_);
+    if (!lease.ok() || *lease < last_dispensed_time_) {
+      std::fprintf(stderr, "Cannot extend the durable clock lease: %s\n",
+                   lease.status().ToString().c_str());
+      std::abort();
+    }
+    lease_ = *lease;
+  }
   return last_dispensed_time_;
+}
+
+void Clock::AdvanceTo(absl::Time floor) {
+  absl::MutexLock lock(mu_);
+  if (last_dispensed_time_ < floor) last_dispensed_time_ = floor;
+}
+
+void Clock::SetLease(absl::Time lease, LeaseExtender extend) {
+  absl::MutexLock lock(mu_);
+  lease_ = lease;
+  extend_lease_ = std::move(extend);
+}
+
+absl::Time Clock::lease() {
+  absl::MutexLock lock(mu_);
+  return lease_;
 }
 
 }  // namespace emulator

@@ -24,6 +24,7 @@
 
 #include "google/spanner/admin/database/v1/common.pb.h"
 #include "googlesql/public/type.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/status/statusor.h"
@@ -32,6 +33,7 @@
 #include "absl/types/variant.h"
 #include "backend/actions/manager.h"
 #include "backend/common/ids.h"
+#include "backend/database/database_log.h"
 #include "backend/database/change_stream/change_stream_partition_churner.h"
 #include "backend/database/pg_oid_assigner/pg_oid_assigner.h"
 #include "backend/locking/manager.h"
@@ -59,14 +61,54 @@ namespace database_api = ::google::spanner::admin::database::v1;
 // schemas, queries, storage etc. and acts as a container for these subsystems.
 class ScopedSchemaChangeLock;
 
+// The storage IDs of a schema's tables (including index and change stream
+// tables), columns and sequences, keyed by the names the schema updater
+// generates them from: table name, "table.column" and sequence name.
+struct SchemaIds {
+  absl::flat_hash_map<std::string, TableID> tables;
+  absl::flat_hash_map<std::string, ColumnID> columns;
+  absl::flat_hash_map<std::string, std::string> sequences;
+
+  bool operator==(const SchemaIds& other) const = default;
+};
+
+SchemaIds CollectSchemaIds(const Schema* schema);
+
+// A database being rebuilt from the persisted DDL of its schema: its objects
+// get their persisted IDs back, so that its stored rows map onto them.
+struct DatabaseRestore {
+  SchemaIds ids;
+  int64_t next_table_seq = 0;
+  int64_t next_column_seq = 0;
+};
+
 class Database {
  public:
   // Constructs a fully initialized database with schema created using
   // create_statements. Returns an error if create_statements are invalid, or if
   // failed to create the database.
+  //
+  // With `log` (--data_dir), commits and schema changes are logged there.
+  // With `restore`, the schema is rebuilt with the given IDs; it fails if the
+  // rebuilt schema's IDs differ.
   static absl::StatusOr<std::unique_ptr<Database>> Create(
       Clock* clock, std::string_view database_id,
-      const SchemaChangeOperation& schema_change_operation);
+      const SchemaChangeOperation& schema_change_operation,
+      std::unique_ptr<DatabaseLog> log = nullptr,
+      const DatabaseRestore* restore = nullptr);
+
+  // Where commits and schema changes are logged, or null without --data_dir.
+  DatabaseLog* log() const { return log_.get(); }
+
+  // The latest schema and the ID allocator positions (--data_dir).
+  PersistedSchema GetPersistedSchema();
+
+  // The storage, for loading recovered rows and capturing checkpoints.
+  Storage* storage() { return storage_.get(); }
+
+  // Refuses reads before `floor`: data from before a restart is not
+  // retained. Set before the database is used.
+  void SetRestartFloor(absl::Time floor);
 
   // Creates a read only transaction attached to this database.
   absl::StatusOr<std::unique_ptr<ReadOnlyTransaction>>
@@ -159,6 +201,12 @@ class Database {
 
   // Clock to provide commit timestamps.
   Clock* clock_;
+
+  // With --data_dir, where commits and schema changes are logged.
+  std::unique_ptr<DatabaseLog> log_;
+
+  // Reads before this timestamp are refused (see SetRestartFloor).
+  absl::Time restart_floor_ = absl::InfinitePast();
 
   // Holds the database id.
   std::string database_id_;

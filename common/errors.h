@@ -178,6 +178,9 @@ absl::Status CannotRollbackAfterCommit();
 absl::Status CannotReadOrQueryAfterCommitOrRollback();
 absl::Status CannotUseTransactionAfterConstraintError();
 absl::Status ReadTimestampPastVersionGCLimit(absl::Time timestamp);
+absl::Status ReadTimestampBeforeRestart(absl::Time timestamp,
+                                        absl::Time restart);
+absl::Status PostgreSQLDatabaseNotPersisted();
 absl::Status ReadTimestampTooFarInFuture(absl::Time timestamp);
 absl::Status AbortDueToConcurrentSchemaChange(backend::TransactionID id);
 absl::Status AbortReadWriteTransactionOnFirstCommit(backend::TransactionID id);

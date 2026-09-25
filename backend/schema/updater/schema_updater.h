@@ -23,6 +23,7 @@
 
 #include "google/spanner/admin/database/v1/common.pb.h"
 #include "googlesql/public/type.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
@@ -73,6 +74,10 @@ struct SchemaChangeContext {
 
   // The database id for the schema change.
   std::string database_id;
+
+  // Sequence IDs by sequence name, used instead of fresh ones when a schema
+  // is rebuilt from its DDL on recovery (--data_dir).
+  const absl::flat_hash_map<std::string, std::string>* sequence_ids = nullptr;
 };
 
 // The result of processing a set of DDL statements for a schema change request.
