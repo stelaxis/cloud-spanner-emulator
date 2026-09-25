@@ -245,10 +245,20 @@ Beyond the model:
 * **Pending commits** are a set; a read waits while its minimum is at or
   before the read timestamp. Commits run one at a time under the commit
   mutex, so it holds at most one entry.
-* **Schema changes vs transactions**: a read-write transaction holds shared
-  ownership of its schema and action registry, so a concurrent schema change
-  cannot free them mid-operation. Whole schema changes are serialized by
-  their own mutex, which also orders change stream churner updates.
+* **Schema changes vs transactions**: a schema change can publish newer
+  schemas and garbage-collect old ones while transactions still use them, so
+  everything that uses a schema owns it:
+  * A read-write transaction owns its schema and action registry. Before its
+    first data operation it hands out the latest schema and keeps it; that
+    operation runs on it, or aborts if a schema change replaced it after it
+    was handed out.
+  * A read-only transaction owns the schema at its read timestamp.
+  * Read cursors own the schema their columns belong to.
+  * Sequence and time zone functions evaluate against the latest schema, as
+    upstream does, and hold the one they loaded until they are done.
+
+  Whole schema changes are serialized by their own mutex, which also orders
+  change stream churner updates.
 
 One deviation from the model (the model has no such columns):
 
