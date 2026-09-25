@@ -79,10 +79,20 @@ class FunctionCatalog {
   std::shared_ptr<const backend::Schema> GetLatestSchema() const
       ABSL_LOCKS_EXCLUDED(latest_schema_mu_);
 
-  // Runs `hook` each time a sequence or identity function has loaded the
-  // latest schema to evaluate against. For tests.
-  void set_schema_loaded_hook_for_testing(std::function<void()> hook) {
-    schema_loaded_hook_ = std::move(hook);
+  // The latest schema if this catalog owns it, else null. Only an owned
+  // schema may be handed to a catalog that outlives the caller (the
+  // PostgreSQL system catalog singleton): a borrowed one, such as a schema
+  // change's intermediate schema, is gone once the borrower returns.
+  std::shared_ptr<const backend::Schema> GetOwnedLatestSchema() const
+      ABSL_LOCKS_EXCLUDED(latest_schema_mu_);
+
+  // Hooks that every sequence or identity function evaluation, in any catalog,
+  // runs just before and just after loading the latest schema. For tests; set
+  // before concurrent use.
+  static void SetEvaluationHooksForTesting(std::function<void()> before_load,
+                                           std::function<void()> after_load) {
+    before_schema_load_hook_ = std::move(before_load);
+    after_schema_load_hook_ = std::move(after_load);
   }
 
  private:
@@ -124,8 +134,8 @@ class FunctionCatalog {
   CaseInsensitiveStringMap<std::unique_ptr<googlesql::TableValuedFunction>>
       table_valued_functions_;
   const std::string catalog_name_;
-  // Returns the latest schema for a function evaluation, after running the
-  // test hook.
+  // Returns the latest schema for a function evaluation, running the test
+  // hooks around the load.
   std::shared_ptr<const backend::Schema> LoadLatestSchemaForEvaluation() const;
 
   // The latest schema, since some functions need to access it (e.g. sequence
@@ -134,8 +144,9 @@ class FunctionCatalog {
   std::shared_ptr<const backend::Schema> latest_schema_
       ABSL_GUARDED_BY(latest_schema_mu_);
 
-  // See set_schema_loaded_hook_for_testing. Set before concurrent use.
-  std::function<void()> schema_loaded_hook_;
+  // See SetEvaluationHooksForTesting.
+  inline static std::function<void()> before_schema_load_hook_;
+  inline static std::function<void()> after_schema_load_hook_;
 };
 
 }  // namespace backend

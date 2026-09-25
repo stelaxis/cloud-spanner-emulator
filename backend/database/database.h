@@ -114,6 +114,10 @@ class Database {
   // Retrives the current version of the schema.
   const Schema* GetLatestSchema() const;
 
+  // The latest schema, owned: a schema change can publish newer schemas and
+  // garbage-collect this one while the caller still uses it.
+  std::shared_ptr<const Schema> GetLatestSchemaShared() const;
+
   // Used to execute queries against the database.
   QueryEngine* query_engine() { return query_engine_.get(); }
 

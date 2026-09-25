@@ -590,11 +590,21 @@ std::shared_ptr<const backend::Schema> FunctionCatalog::GetLatestSchema()
   return latest_schema_;
 }
 
+std::shared_ptr<const backend::Schema> FunctionCatalog::GetOwnedLatestSchema()
+    const {
+  absl::MutexLock lock(latest_schema_mu_);
+  // A borrowed schema is held by a shared_ptr without an owner.
+  return latest_schema_.use_count() > 0 ? latest_schema_ : nullptr;
+}
+
 std::shared_ptr<const backend::Schema>
 FunctionCatalog::LoadLatestSchemaForEvaluation() const {
+  if (before_schema_load_hook_ != nullptr) {
+    before_schema_load_hook_();
+  }
   std::shared_ptr<const backend::Schema> schema = GetLatestSchema();
-  if (schema_loaded_hook_ != nullptr) {
-    schema_loaded_hook_();
+  if (after_schema_load_hook_ != nullptr) {
+    after_schema_load_hook_();
   }
   return schema;
 }
@@ -838,7 +848,8 @@ std::unique_ptr<googlesql::Function> FunctionCatalog::GetPGToCharFunction(
       postgres_translator::spangres::datatypes::GetPgNumericType();
   // Defines the function as a lambda, so it has access to the schema.
   auto initialize_pg_timezone = [&]() {
-    std::shared_ptr<const backend::Schema> latest_schema = GetLatestSchema();
+    std::shared_ptr<const backend::Schema> latest_schema =
+        LoadLatestSchemaForEvaluation();
     std::string default_time_zone = latest_schema != nullptr
                                         ? latest_schema->default_time_zone()
                                         : kDefaultTimeZone;
@@ -888,7 +899,8 @@ std::unique_ptr<googlesql::Function> FunctionCatalog::GetPGExtractFunction(
       postgres_translator::spangres::datatypes::GetPgNumericType();
   // Defines the function as a lambda, so it has access to the schema.
   auto initialize_pg_timezone = [&]() {
-    std::shared_ptr<const backend::Schema> latest_schema = GetLatestSchema();
+    std::shared_ptr<const backend::Schema> latest_schema =
+        LoadLatestSchemaForEvaluation();
     std::string default_time_zone = latest_schema != nullptr
                                         ? latest_schema->default_time_zone()
                                         : kDefaultTimeZone;
@@ -925,7 +937,8 @@ std::unique_ptr<googlesql::Function>
 FunctionCatalog::GetPGCastToTimestampFunction(const std::string& catalog_name) {
   // Defines the function as a lambda, so it has access to the schema.
   auto initialize_pg_timezone = [&]() {
-    std::shared_ptr<const backend::Schema> latest_schema = GetLatestSchema();
+    std::shared_ptr<const backend::Schema> latest_schema =
+        LoadLatestSchemaForEvaluation();
     std::string default_time_zone = latest_schema != nullptr
                                         ? latest_schema->default_time_zone()
                                         : kDefaultTimeZone;
@@ -960,7 +973,8 @@ std::unique_ptr<googlesql::Function> FunctionCatalog::GetPGCastToStringFunction(
       postgres_translator::spangres::datatypes::GetPgNumericType();
   // Defines the function as a lambda, so it has access to the schema.
   auto initialize_pg_timezone = [&]() {
-    std::shared_ptr<const backend::Schema> latest_schema = GetLatestSchema();
+    std::shared_ptr<const backend::Schema> latest_schema =
+        LoadLatestSchemaForEvaluation();
     std::string default_time_zone = latest_schema != nullptr
                                         ? latest_schema->default_time_zone()
                                         : kDefaultTimeZone;
@@ -996,7 +1010,8 @@ std::unique_ptr<googlesql::Function> FunctionCatalog::GetPGDateTruncFunction(
     const std::string& catalog_name) {
   // Defines the function as a lambda, so it has access to the schema.
   auto initialize_pg_timezone = [&]() {
-    std::shared_ptr<const backend::Schema> latest_schema = GetLatestSchema();
+    std::shared_ptr<const backend::Schema> latest_schema =
+        LoadLatestSchemaForEvaluation();
     std::string default_time_zone = latest_schema != nullptr
                                         ? latest_schema->default_time_zone()
                                         : kDefaultTimeZone;

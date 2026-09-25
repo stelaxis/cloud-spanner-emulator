@@ -110,6 +110,12 @@ class EmulatorBuiltinFunctionCatalog : public EngineBuiltinFunctionCatalog {
     return function_catalog_->GetLatestSchema();
   }
 
+  // See FunctionCatalog::GetOwnedLatestSchema.
+  std::shared_ptr<const google::spanner::emulator::backend::Schema>
+  GetOwnedLatestSchema() {
+    return function_catalog_->GetOwnedLatestSchema();
+  }
+
  private:
   // The EmulatorBuiltinFunctionCatalog object must own this pointer; otherwise,
   // the returned function pointer from GetFunction() will become invalid and

@@ -256,6 +256,11 @@ Beyond the model:
   * Read cursors own the schema their columns belong to.
   * Sequence and time zone functions evaluate against the latest schema, as
     upstream does, and hold the one they loaded until they are done.
+  * The process-wide PostgreSQL system catalog takes only schemas its source
+    catalog owns, never a schema change's intermediate schema, which is
+    destroyed when the change finishes.
+  * Admin handlers (`GetDatabaseDdl`, instance partitions) hold the latest
+    schema through `Database::GetLatestSchemaShared`.
 
   Whole schema changes are serialized by their own mutex, which also orders
   change stream churner updates.

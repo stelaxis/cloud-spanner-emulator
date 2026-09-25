@@ -234,6 +234,10 @@ const Schema* Database::GetLatestSchema() const {
   return versioned_catalog_->GetLatestSchema();
 }
 
+std::shared_ptr<const Schema> Database::GetLatestSchemaShared() const {
+  return versioned_catalog_->GetLatestSchemaShared();
+}
+
 }  // namespace backend
 }  // namespace emulator
 }  // namespace spanner

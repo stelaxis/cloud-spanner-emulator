@@ -285,9 +285,11 @@ absl::Status GetDatabaseDdl(RequestContext* ctx,
   GOOGLESQL_ASSIGN_OR_RETURN(std::shared_ptr<Database> database,
                    GetDatabase(ctx, request->database()));
 
-  auto latest_schema = database->backend()->GetLatestSchema();
+  // Owned for the whole handler: a schema change may collect it meanwhile.
+  std::shared_ptr<const backend::Schema> latest_schema =
+      database->backend()->GetLatestSchemaShared();
   GOOGLESQL_ASSIGN_OR_RETURN(std::vector<std::string> printed_statements,
-                   backend::PrintDDLStatements(latest_schema));
+                   backend::PrintDDLStatements(latest_schema.get()));
   for (const auto& statement : printed_statements) {
     response->add_statements(statement);
   }

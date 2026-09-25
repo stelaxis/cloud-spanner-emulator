@@ -51,6 +51,8 @@
 #include "backend/transaction/read_only_transaction.h"
 #include "backend/transaction/read_write_transaction.h"
 #include "common/clock.h"
+#include "third_party/spanner_pg/catalog/spangres_system_catalog.h"
+#include "third_party/spanner_pg/interface/emulator_builtin_function_catalog.h"
 
 namespace google {
 namespace spanner {
@@ -120,8 +122,8 @@ TEST_F(SchemaLifetimeTest, SequenceFunctionKeepsTheSchemaItLoaded) {
 
   absl::Notification loaded, resume;
   std::atomic<int> hook_calls = 0;
-  db_->query_engine()->mutable_function_catalog()->
-      set_schema_loaded_hook_for_testing([&]() {
+  FunctionCatalog::SetEvaluationHooksForTesting(
+      /*before_load=*/nullptr, /*after_load=*/[&]() {
         if (hook_calls++ == 0) {
           loaded.Notify();
           resume.WaitForNotification();
@@ -145,10 +147,106 @@ TEST_F(SchemaLifetimeTest, SequenceFunctionKeepsTheSchemaItLoaded) {
   PublishSchema();  // Collects the schema the evaluator loaded.
   resume.Notify();
   query.join();
+  FunctionCatalog::SetEvaluationHooksForTesting(nullptr, nullptr);
 
   GOOGLESQL_ASSERT_OK(result);
   ASSERT_TRUE(result->rows->Next());
   EXPECT_GT(result->rows->ColumnValue(0).int64_value(), 0);
+}
+
+// Every PostgreSQL analysis or translation hands its function catalog's latest
+// schema to the process-wide PostgreSQL system catalog. A schema change
+// translates a default expression against its intermediate schema, which it
+// destroys when it finishes: the system catalog must not keep that borrowed
+// schema. A PostgreSQL query paused before evaluation spans the schema change.
+// (Query evaluation itself uses the database's own function catalog: the
+// query engine rebinds PostgreSQL function calls to it.)
+TEST_F(SchemaLifetimeTest, PostgreSqlCatalogNeverTakesABorrowedSchema) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      db_, Database::Create(
+               &clock_, "pg-db",
+               SchemaChangeOperation{
+                   .statements = {"CREATE SEQUENCE seq BIT_REVERSED_POSITIVE",
+                                  "CREATE TABLE t (k bigint NOT NULL, "
+                                  "v bigint, PRIMARY KEY (k))"},
+                   .database_dialect =
+                       database_api::DatabaseDialect::POSTGRESQL}));
+  auto txn = BeginReadWrite();
+  const Schema* analysis_schema = txn->schema();
+
+  absl::Notification analyzed, resume;
+  std::atomic<int> hook_calls = 0;
+  FunctionCatalog::SetEvaluationHooksForTesting(
+      /*before_load=*/[&]() {
+        if (hook_calls++ == 0) {
+          analyzed.Notify();
+          resume.WaitForNotification();
+        }
+      },
+      /*after_load=*/nullptr);
+
+  absl::StatusOr<QueryResult> result;
+  std::thread query([&]() {
+    result = db_->query_engine()->ExecuteSql(
+        Query{.sql = "SELECT nextval('seq')"},
+        QueryContext{.schema = analysis_schema,
+                     .reader = txn.get(),
+                     .writer = txn.get(),
+                     .commit_timestamp_tracker =
+                         txn->commit_timestamp_tracker(),
+                     .allow_read_write_only_functions = true,
+                     .is_read_only_txn = false});
+  });
+  analyzed.WaitForNotification();
+  // The second statement's default expression is translated against the
+  // schema after the first, which the schema change then destroys.
+  int completed;
+  absl::Time commit_ts;
+  absl::Status backfill;
+  GOOGLESQL_ASSERT_OK(db_->UpdateSchema(
+      SchemaChangeOperation{
+          .statements = {"CREATE TABLE x1 (k bigint NOT NULL, PRIMARY KEY (k))",
+                         "CREATE TABLE x2 (k bigint NOT NULL, "
+                         "v bigint DEFAULT 1, PRIMARY KEY (k))"},
+          .database_dialect = database_api::DatabaseDialect::POSTGRESQL},
+      &completed, &commit_ts, &backfill));
+  GOOGLESQL_ASSERT_OK(backfill);
+
+  // Whatever schema the system catalog holds is still alive.
+  auto* builtin_catalog =
+      static_cast<postgres_translator::spangres::EmulatorBuiltinFunctionCatalog*>(
+          postgres_translator::spangres::SpangresSystemCatalog::
+              GetSpangresSystemCatalog()
+                  ->builtin_function_catalog());
+  std::shared_ptr<const Schema> system_catalog_schema =
+      builtin_catalog->GetLatestSchema();
+  if (system_catalog_schema != nullptr) {
+    EXPECT_NE(system_catalog_schema->FindTable("t"), nullptr);
+    EXPECT_EQ(system_catalog_schema->dialect(),
+              database_api::DatabaseDialect::POSTGRESQL);
+  }
+
+  resume.Notify();
+  query.join();
+  FunctionCatalog::SetEvaluationHooksForTesting(nullptr, nullptr);
+
+  GOOGLESQL_ASSERT_OK(result);
+  ASSERT_TRUE(result->rows->Next());
+  EXPECT_GT(result->rows->ColumnValue(0).int64_value(), 0);
+}
+
+// Admin handlers (GetDatabaseDdl, instance partitions) read the latest schema
+// outside any transaction, while schema changes publish newer ones and
+// collect it.
+TEST_F(SchemaLifetimeTest, AdminReaderKeepsTheLatestSchema) {
+  CreateDatabase();
+  std::shared_ptr<const Schema> schema = db_->GetLatestSchemaShared();
+  PublishSchema();
+  PublishSchema();  // Collects `schema`.
+
+  ASSERT_NE(schema->FindTable("T"), nullptr);
+  EXPECT_NE(schema->FindSequence("seq"), nullptr);
+  EXPECT_EQ(schema->FindTable("X2"), nullptr);
 }
 
 // A read-write transaction hands out the latest schema before its first data
@@ -166,18 +264,35 @@ TEST_F(SchemaLifetimeTest, ReadWriteTransactionKeepsTheSchemaItHandedOut) {
   ASSERT_NE(table, nullptr);
   EXPECT_EQ(table->Name(), "T");
 
+  const ReadArg read_all{
+      .table = "T", .key_set = KeySet::All(), .columns = {"k"}};
   std::unique_ptr<RowCursor> cursor;
-  EXPECT_THAT(
-      txn->Read(ReadArg{.table = "T", .key_set = KeySet::All(), .columns = {"k"}},
-                &cursor),
-      StatusIs(absl::StatusCode::kAborted));
+  EXPECT_THAT(txn->Read(read_all, &cursor),
+              StatusIs(absl::StatusCode::kAborted));
+
+  // The retry, handed the current schema, commits.
+  ASSERT_NE(txn->schema()->FindTable("T"), nullptr);
+  GOOGLESQL_ASSERT_OK(txn->Read(read_all, &cursor));
+  Mutation m;
+  m.AddWriteOp(MutationOpType::kInsert, "T", {"k", "v"},
+               {{googlesql::values::Int64(7), googlesql::values::Int64(70)}});
+  GOOGLESQL_ASSERT_OK(txn->Write(m));
+  GOOGLESQL_EXPECT_OK(txn->Commit());
+
+  // So does a new transaction, as a client would retry.
+  auto retry = BeginReadWrite();
+  ASSERT_NE(retry->schema()->FindTable("T"), nullptr);
+  GOOGLESQL_ASSERT_OK(retry->Read(read_all, &cursor));
+  m = Mutation();
+  m.AddWriteOp(MutationOpType::kInsert, "T", {"k", "v"},
+               {{googlesql::values::Int64(8), googlesql::values::Int64(80)}});
+  GOOGLESQL_ASSERT_OK(retry->Write(m));
+  GOOGLESQL_EXPECT_OK(retry->Commit());
 
   // Without a schema handed out, the first data operation takes the latest.
   auto fresh = BeginReadWrite();
   PublishSchema();
-  GOOGLESQL_EXPECT_OK(fresh->Read(
-      ReadArg{.table = "T", .key_set = KeySet::All(), .columns = {"k"}},
-      &cursor));
+  GOOGLESQL_EXPECT_OK(fresh->Read(read_all, &cursor));
 }
 
 // A read-only transaction's cursor keeps the schema its columns belong to,

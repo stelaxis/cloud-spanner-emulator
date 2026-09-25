@@ -115,6 +115,8 @@ cc_test(
     name = "schema_lifetime_test",
     srcs = ["schema_lifetime_test.cc"],
     deps = [
+        "//third_party/spanner_pg/catalog:spangres_system_catalog",
+        "//third_party/spanner_pg/interface:emulator_builtin_function_catalog",
         ":database",
         "//backend/access:read",
         "//backend/datamodel:key_set",
