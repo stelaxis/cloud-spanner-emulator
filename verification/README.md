@@ -735,7 +735,7 @@ before.
 | `publish` is atomic and durable | `Log::PublishCheckpoint`: temporary file, sync, rename, directory sync |
 | `truncate upto ≤ checkpoint.boundary` (`early_truncate_loses_recovery`) | `Log::RemoveSegmentsBelow` removes whole segments below the published boundary, never past it |
 | `restore` = checkpoint image + records with sequence ≥ boundary (`covered_wal_replay_is_wrong`) | `PersistenceManager::Recover` skips records below the boundary; recreating a database uses a fresh incarnation, so replaying a covered CREATE would not be idempotent either |
-| Clock lease: `serveRead` and `ack` stay within the durable lease; restart above `max(clockHigh, lease, recovered clock, wall)` (`wall_restart_regresses`) | `Clock::SetLease`: no timestamp past the lease is handed out before a lease record is synced; a caller-chosen read timestamp is covered before a read-only transaction exists (`Clock::CoverWithLease` in `Database::CreateReadOnlyTransaction`); the checkpoint stores `max(clock, lease)`; `Recover` calls `Clock::AdvanceTo`; a chosen read timestamp after 9999-12-31T22:59:59.749999999Z would leave no room below Spanner's maximum once the clock restarts above its lease, so `CoverWithLease` refuses it (`INVALID_ARGUMENT`), and the codec refuses to write an out-of-range timestamp |
+| Clock lease: `serveRead` and `ack` stay within the durable lease; restart above `max(clockHigh, lease, recovered clock, wall)` (`wall_restart_regresses`) | `Clock::SetLease`: no timestamp past the lease is handed out before a lease record is synced; `ReadOnlyTransaction::Read` serves data at its read timestamp only after `WaitForSafeRead` (the timestamp has passed) and `Clock::CoverWithLease` (the lease covers it), as `serveRead` requires `ts ≤ lease`. A future bound that `BeginTransaction` returns without serving data is not a `serveRead` and moves nothing. The checkpoint stores `max(clock, lease)`; `Recover` calls `Clock::AdvanceTo`; the codec refuses to write a timestamp outside Spanner's range |
 | `readAllowed boundary ts`; pre-restart exact reads rejected | `Database::SetRestartFloor`; `Database::CreateReadOnlyTransaction` returns `FAILED_PRECONDITION` below it; bounded staleness never picks a timestamp below it (`LockManager::AdvanceLastCommitTimestamp`) |
 | Sequence allocator issues only below durable reservations; a crash resumes at the durable end (`cursor_reset_reissues`) | `Sequence::GetNextSequenceValue` calls the reservation hook, which syncs a reservation record, before handing out a value past the reserved end; `Sequence::RestoreReservation` |
 | Drops: a dropped incarnation is never recreated | databases and instances have incarnation numbers; records of a dropped incarnation are ignored on replay |
@@ -782,8 +782,9 @@ Beyond the model:
    marks at its timestamp) and not logged. When statement k>1 fails in its
    backfill, the prefix is published as before, but the failed statement's
    writes are undone from a savepoint taken before it
-   (`Storage::SaveVersionsAt`/`RestoreVersionsAt`: every statement writes at
-   the change's one timestamp) and drop marks for objects the published
+   (`Storage::SaveVersionsAt`/`RestoreVersionsAt`, an undo journal of the
+   cells written at the change's one timestamp, which every statement shares;
+   statements without actions take none) and drop marks for objects the published
    schema still has are removed (`Storage::UnmarkDroppedAt`). That also
    changes the in-memory behavior: upstream 1.5.58 kept a rejected type
    change's converted values under the old column type (a later comparison
@@ -826,22 +827,24 @@ Beyond the model:
   concurrent commits with checkpoints; a corrupt log. From review: a failed
   `DROP SEQUENCE` keeps the sequence's state; a checkpoint fails rather than
   skip an unreachable database, and teardown never checkpoints one away; a
-  future read timestamp returned to the client is covered across a crash; a
   schema change is invisible while its record's sync is blocked; recovery
   from the log alone ignores values of dropped proto and enum columns. From
   the second review: a schema change rejected when it is installed is not
-  logged; a read timestamp in the year 3000 is covered across a crash;
-  sequences created and dropped in one change leave no state; a version 1
+  logged; sequences created and dropped in one change leave no state; a version 1
   data directory is recovered, its timestamps included. From the third
   review: a rejected type change leaves its column's values and type alone,
   in memory and after a restart; a rejected change's drop marks are removed;
-  read timestamps too close to the maximum are refused and the largest
-  accepted one leaves the restarted clock usable; the codec refuses
+  the codec refuses
   out-of-range timestamps; a migrated database's create time moves to the
   current field. From the fourth review: a failed first backfill and a
   partly published batch leave no orphan index rows and no drop marks for
-  live tables, in memory and across a checkpoint and restart; the read
-  timestamp cutoff does not depend on the lease an earlier request left.
+  live tables, in memory and across a checkpoint and restart. From the fifth
+  review: data read at a future timestamp is served only once the lease
+  covers it, and no commit after a crash lands at or below it (with the
+  system clock stepped back an hour); future bounds up to Spanner's maximum
+  returned by BeginTransaction leave the restarted clock at the present, so
+  reads, commits and sessions work at once; a savepoint restores exactly the
+  cells written after it (`in_memory_storage_test`).
 * The crash driver runs `emulator_main` natively with `-emulator-binary`
   (below). `-checkpoint-command 'kill -USR1 $EMULATOR_PID'` requests a
   checkpoint before a between-call kill.
@@ -927,6 +930,19 @@ seeds 1–500 with 0 mismatches (131 interrupted commits, 246 checkpoint
 requests); the stress `crash` workload is exact after SIGKILL (30,474
 acknowledged); the Stelaxis smoke test is identical after SIGKILL; `lake
 build` and the Go checks pass.
+
+After the fifth review (the new far-future test failed before the fix; the
+served-read test passes both before and after, as the invariant it keeps):
+the suite passes 132 of 134 targets with only the two known macOS failures;
+the persistence, storage, clock, schema updater and read-only transaction
+tests pass 20/20; ThreadSanitizer is clean on 7 targets × 10 runs; the crash
+driver passes seeds 1–500 with 0 mismatches (130 interrupted commits, 246
+checkpoint requests); the stress `crash` workload is exact after SIGKILL
+(33,657 acknowledged); the Stelaxis smoke test is identical after SIGKILL;
+`lake build` and the Go checks pass. Savepoint cost, `stress/smoke -rows 1000
+-migrate` (4,565 rows in 47 tables, then one schema change of 51 `CREATE
+INDEX` statements): 973 ms and 1,118 ms with full-scan savepoints, 600 ms and
+462 ms with the undo journal.
 
 Throughput, `stress -workers 16 -duration 15s`, native `emulator_main`,
 committed transactions per second:
