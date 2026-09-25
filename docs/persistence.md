@@ -67,8 +67,13 @@ another emulator process`.
   restart, and the first reads wait that out. A read timestamp the client
   chooses (`read_timestamp`, `min_read_timestamp`), which `BeginTransaction`
   can return, is covered by the lease too: a read-only transaction at a
-  future timestamp, however far (up to the year 9999), moves the lease there,
-  and after a crash the clock resumes above it.
+  future timestamp moves the lease there, and after a crash the clock resumes
+  above it. So that the resumed clock stays within Spanner's range (up to
+  9999-12-31T23:59:59.999999999Z), with `--data_dir` a chosen read timestamp
+  later than 9999-12-31T22:59:59.749999999Z fails with `INVALID_ARGUMENT`,
+  the error an out-of-range timestamp gets: that leaves room for the lease
+  window (250 ms) and an hour of timestamps after a restart. Without
+  `--data_dir` the full range is accepted.
 * **Sequences** never hand out a value twice. The emulator reserves 1000
   counter values at a time and syncs the reservation before handing out any of
   them. After a crash, a sequence continues after its last reservation, so up
@@ -85,7 +90,12 @@ and so does every later durable operation: the emulator must be restarted.
 If the failed record belongs to a schema change, whose backfill writes are
 already in memory (though not yet visible), or extends the clock lease, the
 emulator exits instead. A schema change becomes visible, to `GetDatabaseDdl`
-as to queries and transactions, only after its record is synced.
+as to queries and transactions, only after its record is synced. A schema
+change that is rejected as a whole (an invalid statement, or a database
+option such as a retention period over 7 days) leaves nothing behind: its
+backfill writes and dropped-table marks are removed from storage, with or
+without `--data_dir`, and nothing is logged. Upstream kept them, which could
+leave values of a rejected column type under the old schema.
 
 ## Files
 
