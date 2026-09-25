@@ -18,7 +18,11 @@
 #                                     BUILD                                    #
 ################################################################################
 
-FROM ubuntu:22.04 AS rpc-deps
+# CI builds `toolchain` (or `test-toolchain`) once per run and runs Bazel in it
+# with a remote cache; it then builds only the release stage, replacing `build`
+# with its prebuilt outputs (`--build-context build=...`). Local builds use every
+# stage below.
+FROM ubuntu:22.04@sha256:b8b6ee6aa931ecd9d0d952abc34dc0e5f7c6a30c6bb71b079fe399fde0329c02 AS toolchain
 
 # Perform all APT installs in a single layer to reduce image size.
 ENV GCC_VERSION=13
@@ -60,46 +64,49 @@ RUN ln -s /usr/bin/python3 /usr/bin/python
 ENV USE_BAZEL_VERSION=7.6.1
 ARG TARGETARCH
 RUN wget -O /usr/local/bin/bazel https://github.com/bazelbuild/bazelisk/releases/download/v1.17.0/bazelisk-linux-${TARGETARCH} \
-    && chmod +x /usr/local/bin/bazel
+    && chmod +x /usr/local/bin/bazel \
+    && bazel --version
 
-# Keep the upstream local default; CI overrides this for its memory budget.
-ARG BAZEL_JOBS=auto
+# Bazel does not hash the system compiler or headers into action keys. CI
+# partitions its remote cache by this key, so a toolchain upgrade starts a fresh
+# cache instead of mixing objects from two compilers.
+RUN { dpkg --print-architecture && echo "bazel ${USE_BAZEL_VERSION}" \
+      && dpkg-query --show gcc-${GCC_VERSION} g++-${GCC_VERSION} cpp-${GCC_VERSION} \
+         libstdc++-${GCC_VERSION}-dev libgcc-${GCC_VERSION}-dev libc6-dev binutils \
+         protobuf-compiler python3; } > /etc/bazel-toolchain.txt \
+    && sha256sum < /etc/bazel-toolchain.txt | cut -c1-16 > /etc/bazel-toolchain-key
+
 WORKDIR /src
+
+# CI test shards: tests/gcloud needs a pinned Google Cloud CLI.
+FROM toolchain AS test-toolchain
+RUN curl --fail --location --retry 3 \
+       https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-586.0.0-linux-x86_64.tar.gz \
+       --output /tmp/gcloud.tar.gz \
+    && echo '6c774c76793eedd501150b59da653610fbe3eaac169e822965b722de75a2f001  /tmp/gcloud.tar.gz' | sha256sum --check - \
+    && tar -xzf /tmp/gcloud.tar.gz -C /opt \
+    && rm /tmp/gcloud.tar.gz
+ENV GCLOUD_DIR=/opt/google-cloud-sdk/bin
+RUN /opt/google-cloud-sdk/bin/gcloud version
+
+FROM toolchain AS deps
+# Keep the upstream local default; use --build-arg BAZEL_JOBS=2 on small VMs.
+ARG BAZEL_JOBS=auto
 COPY build/bazel build/bazel/
 COPY MODULE.bazel MODULE.bazel.lock* .bazelversion .bazelrc BUILD.bazel \
     requirements.txt go.mod go.sum ./
-# Checkpoint the common RPC dependencies before the larger GoogleSQL build.
+# Keep the compiled dependencies in their own layer for local rebuilds.
 RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
     @com_github_grpc_grpc//:grpc++ \
-    @com_google_protobuf//:protobuf
-
-FROM rpc-deps AS deps-value
-# Preserve value even if the much larger analyzer build times out.
-RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
-    @com_google_googlesql//googlesql/public:value
-
-FROM deps-value AS deps-parser
-RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
-    @com_google_googlesql//googlesql/parser:parser
-
-FROM deps-parser AS deps-resolved-ast
-RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
-    @com_google_googlesql//googlesql/resolved_ast:resolved_ast
-
-FROM deps-resolved-ast AS deps-resolver
-RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
-    @com_google_googlesql//googlesql/analyzer:resolver
-
-FROM deps-resolver AS deps
-# Each expensive dependency above can be exported before building the analyzer.
-RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
+    @com_google_protobuf//:protobuf \
     @com_google_googlesql//googlesql/public:analyzer
 
 FROM deps AS build
 # Copy over the emulator code base into the container.
 COPY . .
 
-# Make enum NodeTag compatible with both C and C++.
+# Make enum NodeTag compatible with both C and C++. The CI workflow applies the
+# same edit before running Bazel.
 RUN find third_party/spanner_pg -name "nodes.h" -exec sed -i 's/enum NodeTag : int/enum NodeTag/g' {} +
 
 # Build the emulator binaries only.
@@ -111,7 +118,7 @@ RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
     //binaries:gateway_main \
     && bazel shutdown
 
-# Generate licenses file.
+# Generate licenses file. The CI workflow runs the same loop.
 RUN for file in $(find -L bazel-src/external                               \
                        -name "LICENSE" -o -name "COPYING")                   ; \
     do                                                                         \
@@ -122,26 +129,12 @@ RUN for file in $(find -L bazel-src/external                               \
     done > licenses.txt                                                     && \
     gzip licenses.txt
 
-# CI exports this amd64 image from the same builder that compiled the emulator.
-# Keep /src and /root/.cache/bazel in ordinary layers: shards need both the
-# compiled outputs and Bazel's action cache, with the same paths and build flags.
-FROM build AS test-builder
-RUN test -s /src/bazel-bin/binaries/emulator_main \
-    && test -d /root/.cache/bazel \
-    && curl --fail --location --retry 3 \
-       https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-586.0.0-linux-x86_64.tar.gz \
-       --output /tmp/gcloud.tar.gz \
-    && echo '6c774c76793eedd501150b59da653610fbe3eaac169e822965b722de75a2f001  /tmp/gcloud.tar.gz' | sha256sum --check - \
-    && tar -xzf /tmp/gcloud.tar.gz -C /opt \
-    && rm /tmp/gcloud.tar.gz
-ENV GCLOUD_DIR=/opt/google-cloud-sdk/bin
-RUN /opt/google-cloud-sdk/bin/gcloud version
-
 ################################################################################
 #                                   RELEASE                                    #
 ################################################################################
 
-# Now build the release image from the build image.
+# Now build the release image from the build image. Only these paths are read
+# from `build`; CI's prebuilt replacement provides exactly them.
 FROM gcr.io/distroless/cc-debian12
 
 # Copy binaries.
