@@ -16,6 +16,9 @@
 
 #include "common/clock.h"
 
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
+
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "googlesql/base/testing/status_matchers.h"
@@ -40,6 +43,22 @@ TEST(Clock, ClockReturnsValuesAtMicrosecondGranularity) {
   Clock clock;
   absl::Time t1 = clock.Now();
   EXPECT_EQ(t1, absl::FromUnixMicros(absl::ToUnixMicros(t1)));
+}
+
+// Upstream issue #277: bursts of calls within one microsecond must not leave
+// the clock permanently ahead of the system clock.
+TEST(Clock, ClockDoesNotDriftAheadOfSystemClock) {
+  Clock clock;
+  absl::Time last;
+  for (int i = 0; i < 20000; ++i) {
+    absl::Time now = clock.Now();
+    EXPECT_GT(now, last);
+    last = now;
+  }
+  absl::SleepFor(absl::Milliseconds(100));
+  absl::Time now = clock.Now();
+  EXPECT_GT(now, last);
+  EXPECT_LT(now - absl::Now(), absl::Milliseconds(5));
 }
 
 }  // namespace

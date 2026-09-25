@@ -40,12 +40,17 @@ Clock::Clock()
 absl::Time Clock::Now() {
   absl::MutexLock lock(mu_);
 
+  // Track the system clock and step by one microsecond only when it has not
+  // advanced. Adding the elapsed system time to the last dispensed time would
+  // let every +1us step accumulate as permanent drift ahead of the system
+  // clock, which read timestamps then wait out (upstream issue #277).
   absl::Time now = NowMicros();
-  absl::Time next_dispensed_time =
-      last_dispensed_time_ +
-      std::max(absl::Microseconds(1), now - last_system_time_);
+  if (now <= last_dispensed_time_) {
+    last_dispensed_time_ += absl::Microseconds(1);
+  } else {
+    last_dispensed_time_ = now;
+  }
   last_system_time_ = now;
-  last_dispensed_time_ = next_dispensed_time;
 
   return last_dispensed_time_;
 }
