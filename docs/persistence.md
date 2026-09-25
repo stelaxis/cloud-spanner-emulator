@@ -67,8 +67,8 @@ another emulator process`.
   restart, and the first reads wait that out. A read timestamp the client
   chooses (`read_timestamp`, `min_read_timestamp`), which `BeginTransaction`
   can return, is covered by the lease too: a read-only transaction at a
-  future timestamp moves the lease there, and after a crash the clock resumes
-  above it.
+  future timestamp, however far (up to the year 9999), moves the lease there,
+  and after a crash the clock resumes above it.
 * **Sequences** never hand out a value twice. The emulator reserves 1000
   counter values at a time and syncs the reservation before handing out any of
   them. After a crash, a sequence continues after its last reservation, so up
@@ -95,9 +95,13 @@ DIR/checkpoint                      the state as of a log position
 DIR/wal-00000000000000001234.log    log segments, named by their first record
 ```
 
-Every file starts with a format version; an emulator refuses files of any
-other version rather than misread them. Every record carries a checksum and a
-sequence number. On startup:
+Every file starts with a format version; an emulator refuses files of a
+version it does not know rather than misread them. This one writes version 2,
+which stores timestamps as seconds and nanoseconds so that any timestamp
+Spanner accepts (up to the year 9999) is kept exactly. It still reads
+version 1 directories, whose timestamps were int64 nanoseconds, and never
+appends to a version 1 file: new records go to a new segment. Every record
+carries a checksum and a sequence number. On startup:
 
 * a damaged or incomplete *last* record is the remains of a write cut short
   by a crash: it is dropped and the file is truncated before anything is

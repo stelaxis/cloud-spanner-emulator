@@ -730,7 +730,7 @@ before.
 | `begin → finish → fsync → flush → ack` under one global gate; records in commit-timestamp order across databases | `LockHandle::Commit` (`backend/locking/handle.cc`) takes the emulator-wide gate after validation and holds it from `ReserveCommitTimestamp` to `MarkCommitted`; inside, `ReadWriteTransaction::Commit` records the writes, `LogCommit` appends and syncs them, and only then are they applied. Catalog records take the gate and a clock timestamp (`PersistenceManager::Log*`) |
 | No `ack` without `fsync` (`early_ack_loses_durability`) | a failed write or sync fails the commit before its writes are applied, and marks the log broken so every later record fails (`Log::Append`) |
 | Torn final bytes are never replayed, and are truncated before the next append | `ScanSegment`: a damaged record with no intact record after it, in the last segment, is dropped and the file truncated in `Log::Open` |
-| Detected non-tail corruption fails recovery (`Disk.recover`) | any other damaged record, a damaged file header or checkpoint, or a missing segment is `DATA_LOSS`; an unknown format version is `FAILED_PRECONDITION` |
+| Detected non-tail corruption fails recovery (`Disk.recover`) | any other damaged record, a damaged file header or checkpoint, or a missing segment is `DATA_LOSS`; an unknown format version is `FAILED_PRECONDITION` (version 2 is written; version 1, with int64-nanosecond timestamps, is still read and never appended to) |
 | `checkpointStart` needs an idle gate; `quiescent_image` | `PersistenceManager::Checkpoint` holds the gate while it starts a segment (boundary = next LSN) and copies instances, schemas (owned, `GetPersistedSchema`), rows and sequence reservations; a database it cannot reach fails the checkpoint rather than being left out, and `ServerEnv` stops the checkpoint thread before it destroys the databases |
 | `publish` is atomic and durable | `Log::PublishCheckpoint`: temporary file, sync, rename, directory sync |
 | `truncate upto ≤ checkpoint.boundary` (`early_truncate_loses_recovery`) | `Log::RemoveSegmentsBelow` removes whole segments below the published boundary, never past it |
@@ -773,11 +773,17 @@ Beyond the model:
    wait). The new schema itself is published to the versioned catalog, which
    every reader of the latest schema (`GetDatabaseDdl`, queries, new
    transactions) goes through, only after the record is synced, as in the
-   model's `flush` after `fsync`; a dropped sequence's counter is forgotten
-   only then too. A schema change is refused if the log is already broken,
-   but if its own record fails the backfill writes cannot be undone, so the
-   emulator exits instead (`std::abort`); a restart recovers what the log
-   holds. Commits are logged before they are applied and need no such rule.
+   model's `flush` after `fsync`. Every check that installing the schema
+   makes (`VersionedCatalog::CheckSchema`: timestamp order, retention period)
+   runs before the record is written, so a logged schema is always installed;
+   a rejected one is not logged (only its backfill writes are, being in
+   storage already). Sequence counters are forgotten only once the published
+   schema lacks them, including sequences created and dropped within the same
+   change. A schema change is refused if the log is already broken, but if
+   its own record fails the backfill writes cannot be undone, so the emulator
+   exits instead (`std::abort`), as it does if a logged schema could not be
+   installed; a restart recovers what the log holds. Commits are logged
+   before they are applied and need no such rule.
 4. **The gate is taken after validation.** Validation reads only its own
    database, and that database's commit mutex already orders it with that
    database's commits and schema changes. The model takes the gate before
@@ -810,7 +816,11 @@ Beyond the model:
   skip an unreachable database, and teardown never checkpoints one away; a
   future read timestamp returned to the client is covered across a crash; a
   schema change is invisible while its record's sync is blocked; recovery
-  from the log alone ignores values of dropped proto and enum columns.
+  from the log alone ignores values of dropped proto and enum columns. From
+  the second review: a schema change rejected when it is installed is not
+  logged; a read timestamp in the year 3000 is covered across a crash;
+  sequences created and dropped in one change leave no state; a version 1
+  data directory is recovered, its timestamps included.
 * The crash driver runs `emulator_main` natively with `-emulator-binary`
   (below). `-checkpoint-command 'kill -USR1 $EMULATOR_PID'` requests a
   checkpoint before a between-call kill.
@@ -864,6 +874,18 @@ targets × 10 runs; the crash driver passes seeds 1–500 with 0 mismatches
 the stress `crash` workload is exact after SIGKILL (53,598 acknowledged at the
 kill); the Stelaxis smoke test is identical after SIGKILL; `lake build` and
 the Go checks pass.
+
+After the second review (format version 2; each new regression test failed
+before its fix): the suite passes 131 of 134 targets, the two known macOS
+failures plus `session_manager_test`'s `CreateSession`, a race inherited from
+#3 (it compares `absl::Now()` with the microsecond clock; 2 of 100 runs fail,
+none of its code is touched here); the persistence, sequence, versioned
+catalog and clock tests pass 20/20; ThreadSanitizer is clean on 7 targets × 10
+runs; the crash driver passes seeds 1–500 with 0 mismatches (130 interrupted
+commits, 246 checkpoint requests); the stress `crash` workload is exact after
+SIGKILL (53,620 acknowledged; one in-flight transfer had committed); the
+Stelaxis smoke test is identical after SIGKILL; `lake build` and the Go
+checks pass.
 
 Throughput, `stress -workers 16 -duration 15s`, native `emulator_main`,
 committed transactions per second:
