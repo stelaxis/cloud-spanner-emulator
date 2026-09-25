@@ -50,6 +50,13 @@ ABSL_FLAG(
     "Read-write transactions run concurrently and abort only on a conflict, "
     "so this is the only source of random aborts. Zero disables it.");
 
+ABSL_FLAG(
+    bool, enable_query_key_pushdown, true,
+    "If true, primary key predicates in SQL queries and DML (equality, IN and "
+    "range comparisons with literals or parameters) narrow the key ranges a "
+    "statement reads, and so the ranges its transaction validates at commit. "
+    "If false, every query and UPDATE/DELETE reads its tables in full.");
+
 namespace google {
 namespace spanner {
 namespace emulator {
@@ -73,6 +80,14 @@ int abort_current_transaction_probability() {
 
 void set_abort_current_transaction_probability(int probability) {
   absl::SetFlag(&FLAGS_abort_current_transaction_probability, probability);
+}
+
+bool query_key_pushdown_enabled() {
+  return absl::GetFlag(FLAGS_enable_query_key_pushdown);
+}
+
+void set_query_key_pushdown_enabled(bool enabled) {
+  absl::SetFlag(&FLAGS_enable_query_key_pushdown, enabled);
 }
 
 }  // namespace config

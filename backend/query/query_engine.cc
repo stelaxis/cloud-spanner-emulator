@@ -80,6 +80,7 @@
 #include "backend/query/insert_on_conflict_dml_execution.h"
 #include "backend/query/partitionability_validator.h"
 #include "backend/query/partitioned_dml_validator.h"
+#include "backend/query/key_narrowing.h"
 #include "backend/query/query_context.h"
 #include "backend/query/query_engine_options.h"
 #include "backend/query/query_engine_util.h"
@@ -1427,6 +1428,8 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteSql(
 
   QueryResult result;
   if (!IsDMLStmt(analyzer_output->resolved_statement()->node_kind())) {
+    catalog->set_scan_key_sets(ComputeScanKeySets(
+        resolved_statement.get(), params, config::query_key_pushdown_enabled()));
     GOOGLESQL_ASSIGN_OR_RETURN(
         auto cursor,
         EvaluateQuery(resolved_statement.get(), params, type_factory_,
@@ -1458,6 +1461,9 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteSql(
           resolved_statement->GetAs<googlesql::ResolvedInsertStmt>()
                   ->on_conflict_clause() != nullptr;
       if (!is_insert_on_conflict_stmt) {
+        catalog->set_scan_key_sets(
+            ComputeScanKeySets(resolved_statement.get(), params,
+                               config::query_key_pushdown_enabled()));
         GOOGLESQL_ASSIGN_OR_RETURN(
             auto execute_update_result,
             EvaluateUpdate(resolved_statement.get(), catalog.get(), params,

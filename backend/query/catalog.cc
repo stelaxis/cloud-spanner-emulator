@@ -265,11 +265,13 @@ Catalog::Catalog(
       absl::Status status = AddObjectToNamedSchema(
           std::string(SDLObjectName::GetSchemaName(name)),
           std::make_unique<QueryableTable>(table, reader, options, this,
-                                           type_factory));
+                                           type_factory, /*is_synonym=*/false,
+                                           &scan_key_sets_));
       LOG_IF(ERROR, !status.ok()) << status.message();
     } else {
       tables_[table->Name()] = std::make_unique<QueryableTable>(
-          table, reader, options, this, type_factory);
+          table, reader, options, this, type_factory, /*is_synonym=*/false,
+          &scan_key_sets_);
     }
 
     std::string synonym_name = table->synonym();
@@ -279,11 +281,13 @@ Catalog::Catalog(
             std::string(SDLObjectName::GetSchemaName(synonym_name)),
             std::make_unique<QueryableTable>(table, reader, options, this,
                                              type_factory,
-                                             /*is_synonym=*/true));
+                                             /*is_synonym=*/true,
+                                             &scan_key_sets_));
         LOG_IF(ERROR, !status.ok()) << status.message();
       } else {
         tables_[synonym_name] = std::make_unique<QueryableTable>(
-            table, reader, options, this, type_factory, /*is_synonym=*/true);
+            table, reader, options, this, type_factory, /*is_synonym=*/true,
+            &scan_key_sets_);
       }
     }
   }
