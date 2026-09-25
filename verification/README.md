@@ -776,12 +776,20 @@ Beyond the model:
    model's `flush` after `fsync`. Every check that installing the schema
    makes (`VersionedCatalog::CheckSchema`: timestamp order, retention period)
    runs before the record is written, so a logged schema is always installed.
-   A change rejected as a whole (by the updater or by `CheckSchema`) is
-   rolled back in storage (`Storage::RollBackVersionsAt` removes the
-   versions and drop marks at its timestamp) and not logged. That also
+   A change that publishes nothing (rejected by the updater or by
+   `CheckSchema`, or whose first statement's backfill fails) is rolled back
+   in storage (`Storage::RollBackVersionsAt` removes the versions and drop
+   marks at its timestamp) and not logged. When statement k>1 fails in its
+   backfill, the prefix is published as before, but the failed statement's
+   writes are undone from a savepoint taken before it
+   (`Storage::SaveVersionsAt`/`RestoreVersionsAt`: every statement writes at
+   the change's one timestamp) and drop marks for objects the published
+   schema still has are removed (`Storage::UnmarkDroppedAt`). That also
    changes the in-memory behavior: upstream 1.5.58 kept a rejected type
-   change's converted values under the old column type, and a later
-   comparison on the column crashed it (SIGSEGV). Sequence counters are forgotten only once the published
+   change's converted values under the old column type (a later comparison
+   on the column crashed it, SIGSEGV), orphan index rows, and drop marks of
+   unapplied statements (the table's rows were deleted after the retention
+   period). Sequence counters are forgotten only once the published
    schema lacks them, including sequences created and dropped within the same
    change. A schema change is refused if the log is already broken, but if
    its own record fails the backfill writes cannot be undone, so the emulator
@@ -830,7 +838,10 @@ Beyond the model:
   read timestamps too close to the maximum are refused and the largest
   accepted one leaves the restarted clock usable; the codec refuses
   out-of-range timestamps; a migrated database's create time moves to the
-  current field.
+  current field. From the fourth review: a failed first backfill and a
+  partly published batch leave no orphan index rows and no drop marks for
+  live tables, in memory and across a checkpoint and restart; the read
+  timestamp cutoff does not depend on the lease an earlier request left.
 * The crash driver runs `emulator_main` natively with `-emulator-binary`
   (below). `-checkpoint-command 'kill -USR1 $EMULATOR_PID'` requests a
   checkpoint before a between-call kill.
@@ -906,6 +917,16 @@ commits, 246 checkpoint requests); the stress `crash` workload is exact
 after SIGKILL (55,038 acknowledged; one in-flight transfer had committed);
 the Stelaxis smoke test is identical after SIGKILL; `lake build` and the Go
 checks pass.
+
+After the fourth review (each new regression test failed before its fix,
+except the argument-order one, which Apple clang evaluates in the safe order):
+the suite passes 132 of 134 targets with only the two known macOS failures;
+the persistence, storage, clock and schema updater tests pass 20/20;
+ThreadSanitizer is clean on 7 targets × 10 runs; the crash driver passes
+seeds 1–500 with 0 mismatches (131 interrupted commits, 246 checkpoint
+requests); the stress `crash` workload is exact after SIGKILL (30,474
+acknowledged); the Stelaxis smoke test is identical after SIGKILL; `lake
+build` and the Go checks pass.
 
 Throughput, `stress -workers 16 -duration 15s`, native `emulator_main`,
 committed transactions per second:

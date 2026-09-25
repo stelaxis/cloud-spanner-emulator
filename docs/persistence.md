@@ -91,11 +91,16 @@ If the failed record belongs to a schema change, whose backfill writes are
 already in memory (though not yet visible), or extends the clock lease, the
 emulator exits instead. A schema change becomes visible, to `GetDatabaseDdl`
 as to queries and transactions, only after its record is synced. A schema
-change that is rejected as a whole (an invalid statement, or a database
-option such as a retention period over 7 days) leaves nothing behind: its
-backfill writes and dropped-table marks are removed from storage, with or
-without `--data_dir`, and nothing is logged. Upstream kept them, which could
-leave values of a rejected column type under the old schema.
+change that is rejected as a whole (an invalid statement, a database option
+such as a retention period over 7 days, or a failed backfill in its first
+statement) leaves nothing behind: its backfill writes and dropped-table marks
+are removed from storage, with or without `--data_dir`, and nothing is
+logged. When a later statement's backfill fails, the statements before it are
+applied as before, but the failed statement's own writes are undone and the
+drops of the statements that were not applied are forgotten. Upstream kept
+all of these, which could leave values of a rejected column type under the
+old schema, orphan index rows, or a table whose rows were cleaned up although
+it was never dropped.
 
 ## Files
 
