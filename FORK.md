@@ -118,8 +118,10 @@ branch, impersonates the reader and also passes `--noremote_upload_local_results
 so Bazel does not attempt uploads the reader would be refused. The workflow's
 choice is not the safeguard: a PR can edit the workflow to request the writer, but
 the writer is impersonable only by the OIDC subject
-`repo:stelaxis/cloud-spanner-emulator:ref:refs/heads/master`, which only runs
-on the `master` ref present. A PR run's subject is `…:pull_request`; the reader is
+`repo:stelaxis@236181695/cloud-spanner-emulator@1386109810:ref:refs/heads/master`,
+which only runs on the `master` ref present. The repository has GitHub's
+immutable OIDC subjects enabled, so the subject carries the owner and repository
+IDs. A PR run's subject is `…:pull_request`; the reader is
 impersonable by any run of this repository. Pushes to `master` require a
 reviewed PR.
 
