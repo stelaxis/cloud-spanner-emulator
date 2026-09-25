@@ -49,10 +49,10 @@ git fetch upstream --tags && git merge vX.Y.Z
 
 | Event | amd64 build + 8 test shards | arm64 build | Cache | Publishes |
 | --- | --- | --- | --- | --- |
-| PR to `master` | yes | no; `Build (arm64)` is skipped | read-only | no |
-| Push to `master` | yes | yes | read-write | `edge`, `sha-…` |
-| `workflow_dispatch` on `master` | yes | yes | read-write | no |
-| `workflow_dispatch` on another branch | yes | yes | read-only | no |
+| PR to `master` | yes | no; `Build (arm64)` is skipped | read-only (reader) | no |
+| Push to `master` | yes | yes | read-write (writer) | `edge`, `sha-…` |
+| `workflow_dispatch` on `master` | yes | yes | read-write (writer) | no |
+| `workflow_dispatch` on another branch | yes | yes | read-only (reader) | no |
 | Push of a `v*-stx.*` tag | no | no | none | promotes `sha-…` |
 
 Pull requests do not build arm64. GitHub counts a job skipped by its `if:` as
@@ -103,22 +103,43 @@ variables → Actions → Variables); none is secret:
 | --- | --- |
 | `BAZEL_CACHE_BUCKET` | Bucket name, e.g. `stelaxis-bazel-cache-staging` |
 | `GCP_WIF_PROVIDER` | `projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>` |
-| `GCP_CACHE_SERVICE_ACCOUNT` | Service account email with object read/write on the bucket |
+| `GCP_CACHE_SERVICE_ACCOUNT` | Writer: service account email with object read/write on the bucket |
+| `GCP_CACHE_READER_SERVICE_ACCOUNT` | Reader: service account email with object read-only (`objectViewer`) on the bucket |
 
 `google-github-actions/auth` exchanges the job's GitHub OIDC token through
 Workload Identity Federation and writes a short-lived credentials file that is
 mounted into the container for `--google_credentials`. Only the Bazel jobs have
-`id-token: write`. If any variable is unset, or the run is a PR from a fork,
-there are no credentials and CI builds cold with no remote cache; it still goes
-green, just slowly.
+`id-token: write`.
 
-Write policy: pushes to `master` and `workflow_dispatch` runs on `master` read
-and write. Every other run, including every PR, reads only
-(`--noremote_upload_local_results`), so the workflow never uploads from a PR
-what `master` later reads. The workflow sets that flag, and a same-repository PR
-can edit the workflow; while all runs impersonate one read-write service
-account, the rule holds only against mistakes, not against a malicious
-collaborator.
+**PRs can read the cache but never write it; IAM enforces this.** Pushes to
+`master` and `workflow_dispatch` runs on `master` impersonate the writer and
+upload. Every other run, including every PR and every dispatch on another
+branch, impersonates the reader and also passes `--noremote_upload_local_results`,
+so Bazel does not attempt uploads the reader would be refused. The workflow's
+choice is not the safeguard: a PR can edit the workflow to request the writer, but
+the writer is impersonable only by the OIDC subject
+`repo:stelaxis/cloud-spanner-emulator:ref:refs/heads/master`, which only runs
+on the `master` ref present. A PR run's subject is `…:pull_request`; the reader is
+impersonable by any run of this repository. Pushes to `master` require a
+reviewed PR.
+
+**No Bazel job may declare an `environment:`.** A job with an environment
+presents the subject `repo:…:environment:<name>` instead of the ref, so the
+writer binding would refuse even `master`.
+
+| Event and ref | Identity | Uploads |
+| --- | --- | --- |
+| Push to `master` | writer | yes |
+| `workflow_dispatch` on `master` | writer | yes |
+| `workflow_dispatch` on another branch | reader | no |
+| PR from this repository | reader | no |
+| PR from a fork | none, builds cold | no |
+| Tag push | none, no Bazel jobs | no |
+
+If `BAZEL_CACHE_BUCKET` or `GCP_WIF_PROVIDER` is unset, or the run's own
+account variable is unset (the writer on `master`, the reader elsewhere), the
+run has no credentials and builds cold with no remote cache; it still goes
+green, just slowly. A `master` run never falls back to the reader.
 
 Bazel does not hash the system compiler or headers into action keys. The
 toolchain stage records the architecture, the Bazel version and the installed
@@ -127,6 +148,13 @@ versions of GCC, libstdc++, libc6-dev, binutils, protoc and Python in
 which is part of every action key. When one of those packages changes, CI
 starts a fresh cache rather than mixing objects from two compilers. Each job
 summary shows the cache mode, the key and its inputs.
+
+`linux-libc-dev` (kernel UAPI headers) is deliberately left out. Ubuntu updates
+it with every kernel security release, every few weeks, and each change would
+discard the whole cache; those headers are a stable ABI. The gcloud CLI is also
+not in the key, because only tests run it: its version is part of `GCLOUD_DIR`,
+and `--test_env=GCLOUD_DIR` puts that in every test's key. A new CLI re-runs
+the tests but reuses compiled outputs.
 
 The bucket deletes objects 30 days after they were written, even if they are
 still read. Bazel retries a build (`--experimental_remote_cache_eviction_retries`)

@@ -14,7 +14,10 @@ env:
   TOOLCHAIN_IMAGE: emulator-toolchain:ci
   # Repository variables, not secrets. Unset, CI builds cold without a remote cache.
   BAZEL_CACHE_BUCKET: ${{ vars.BAZEL_CACHE_BUCKET }}
-  # Only master pushes and dispatches on master upload; every other run only reads.
+  # Only master pushes and dispatches on master upload, as the writer service
+  # account, which IAM lets only the master ref impersonate. Every other run reads
+  # as the reader service account. No Bazel job may use an `environment:`: that
+  # changes the OIDC subject and breaks the master-only binding.
   BAZEL_CACHE_WRITE: ${{ github.ref == 'refs/heads/master' && github.event_name != 'pull_request' }}
 
 defaults:
@@ -79,16 +82,19 @@ jobs:
       - &gcp-auth
         name: Authenticate to the Bazel remote cache
         id: gcp
-        # Unset variables mean a cold build. Fork PRs never receive credentials.
+        # The writer on upload runs, the reader otherwise; if that one is unset,
+        # the run builds cold. Fork PRs never receive credentials.
         if: >-
           vars.BAZEL_CACHE_BUCKET != '' && vars.GCP_WIF_PROVIDER != ''
-          && vars.GCP_CACHE_SERVICE_ACCOUNT != ''
+          && (env.BAZEL_CACHE_WRITE == 'true' && vars.GCP_CACHE_SERVICE_ACCOUNT != ''
+              || env.BAZEL_CACHE_WRITE != 'true' && vars.GCP_CACHE_READER_SERVICE_ACCOUNT != '')
           && (github.event_name != 'pull_request'
               || github.event.pull_request.head.repo.full_name == github.repository)
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-          service_account: ${{ vars.GCP_CACHE_SERVICE_ACCOUNT }}
+          # The `if:` above guarantees the selected account is set.
+          service_account: ${{ env.BAZEL_CACHE_WRITE == 'true' && vars.GCP_CACHE_SERVICE_ACCOUNT || vars.GCP_CACHE_READER_SERVICE_ACCOUNT }}
           export_environment_variables: false
       # Bazel runs in the toolchain container at /src with a fixed output base, so
       # cache keys match across jobs and runs.
@@ -121,15 +127,16 @@ jobs:
             } >> "$rc"
             mounts+=(--volume "$CREDENTIALS:/gcp-credentials.json:ro")
             if [[ "$BAZEL_CACHE_WRITE" == true ]]; then
-              mode="read-write, gs://$BAZEL_CACHE_BUCKET"
+              mode="read-write as the writer, gs://$BAZEL_CACHE_BUCKET"
             else
+              # The reader cannot write anyway; this keeps Bazel from trying.
               echo 'build --noremote_upload_local_results' >> "$rc"
-              mode="read-only, gs://$BAZEL_CACHE_BUCKET"
+              mode="read-only as the reader, gs://$BAZEL_CACHE_BUCKET"
             fi
           else
             mode='off, cold build'
             if [[ -n "$BAZEL_CACHE_BUCKET" ]]; then
-              echo '::warning::No cache credentials in this run (fork PR or unset GCP_* variables); building cold.'
+              echo '::warning::No cache credentials for this run (fork PR or an unset GCP_* variable); building cold.'
             fi
           fi
           docker run --detach --init --name bazel --workdir /src "${mounts[@]}" \

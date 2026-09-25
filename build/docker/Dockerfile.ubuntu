@@ -78,16 +78,20 @@ RUN { dpkg --print-architecture && echo "bazel ${USE_BAZEL_VERSION}" \
 
 WORKDIR /src
 
-# CI test shards: tests/gcloud needs a pinned Google Cloud CLI.
+# CI test shards: tests/gcloud needs a pinned Google Cloud CLI. The version is
+# in GCLOUD_DIR, which `--test_env` puts in every test's cache key, so a new CLI
+# re-runs the tests without invalidating compiled outputs.
 FROM toolchain AS test-toolchain
+ENV GCLOUD_VERSION=586.0.0
 RUN curl --fail --location --retry 3 \
-       https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-586.0.0-linux-x86_64.tar.gz \
+       https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-${GCLOUD_VERSION}-linux-x86_64.tar.gz \
        --output /tmp/gcloud.tar.gz \
     && echo '6c774c76793eedd501150b59da653610fbe3eaac169e822965b722de75a2f001  /tmp/gcloud.tar.gz' | sha256sum --check - \
     && tar -xzf /tmp/gcloud.tar.gz -C /opt \
+    && mv /opt/google-cloud-sdk "/opt/google-cloud-sdk-${GCLOUD_VERSION}" \
     && rm /tmp/gcloud.tar.gz
-ENV GCLOUD_DIR=/opt/google-cloud-sdk/bin
-RUN /opt/google-cloud-sdk/bin/gcloud version
+ENV GCLOUD_DIR=/opt/google-cloud-sdk-${GCLOUD_VERSION}/bin
+RUN "${GCLOUD_DIR}/gcloud" version
 
 FROM toolchain AS deps
 # Keep the upstream local default; use --build-arg BAZEL_JOBS=2 on small VMs.
