@@ -209,23 +209,23 @@ The fork's emulator implements Target. Where each rule lives:
 | Target rule | C++ |
 |---|---|
 | No lock slot; lock requests never block or abort | `LockHandle::EnqueueLock` records reads only (`backend/locking/handle.cc:41`) |
-| Snapshot at the first data operation, not at `BeginTransaction` | `ReadWriteTransaction::AcquireSnapshot` (`backend/transaction/read_write_transaction.cc:342`), called from `Read` and `Write`; `LockHandle::SnapshotTimestamp` (`backend/locking/handle.cc:75`) |
-| The snapshot is never ahead of a commit still flushing | `LockManager::PickSnapshotTimestamp` takes a fresh timestamp, then `WaitForSafeRead` waits for every pending commit before it (`backend/locking/manager.cc:56,71`) |
+| Snapshot at the first data operation, not at `BeginTransaction` | `ReadWriteTransaction::AcquireSnapshot` (`backend/transaction/read_write_transaction.cc:343`), called from `Read` and `Write`; `LockHandle::SnapshotTimestamp` (`backend/locking/handle.cc:75`) |
+| The snapshot is never ahead of a commit still flushing | `LockManager::PickSnapshotTimestamp` takes a fresh timestamp, then `WaitForSafeRead` waits for every pending commit at or before it (`backend/locking/manager.cc:56,73`) |
 | Reads at the snapshot, overlaid by the buffer | `TransactionStore::ReadTimestamp` replaces `InfiniteFuture` in every storage read (`backend/transaction/transaction_store.cc:97`) |
 | Read set = key ranges scanned (`fp`), not rows returned | `TransactionStore::AcquireReadLock` (`transaction_store.cc:77`), including `RowExistsInStorage` (`:370`); index, FK and interleave checks read through `Lookup`/`Read`, so they are covered |
-| `fp (.commit ms)`: every mutation's row, before any is applied | `ReadWriteTransaction::RecordMutationReads` (`read_write_transaction.cc:353`) |
-| Commit: validate, then take a timestamp, atomically | `LockHandle::Commit` (`backend/locking/handle.cc:117`): under the commit mutex, `ReadSetIsStaleLocked` (`:93`), `ReserveCommitTimestamp`, flush, `MarkCommitted` |
+| `fp (.commit ms)`: every mutation's row, before any is applied | `ReadWriteTransaction::RecordMutationReads` (`read_write_transaction.cc:354`) |
+| Commit: validate, then take a timestamp, atomically | `LockHandle::Commit` (`backend/locking/handle.cc:124`): under the commit mutex, `ReadSetIsStaleLocked` (`:100`), `ReserveCommitTimestamp`, flush, `MarkCommitted` |
 | `stale`: a commit after the snapshot wrote a row in the read set | `Storage::HasVersionsAfter` (`backend/storage/in_memory_storage.cc:238`) |
 | Every write of a commit is a version, including a cancelled insert-then-delete | `TransactionStore::GetCancelledWrites` (`transaction_store.cc:448`) and `Storage::MarkWritten` (`in_memory_storage.cc:226`) |
-| `errCode` / `target_errors_latest`: a constraint error on a stale read set is `ABORTED` | `AbortIfReadSetStale` for `Write` and `Commit` (`read_write_transaction.cc:406,496`); DML errors raised by the query engine, `MaybeAbortOnStaleReads` (`read_write_transaction.cc:416`, called at `frontend/entities/transaction.cc:240`) |
-| Strictly increasing commit timestamps; RO reads unchanged | `LockManager::ReserveCommitTimestamp` (`manager.cc:40`); pending commits are a set, and reads wait for its minimum |
+| `errCode` / `target_errors_latest`: a constraint error on a stale read set is `ABORTED` | `AbortIfReadSetStale` for `Write` and `Commit` (`read_write_transaction.cc:409,504`); DML errors raised by the query engine, `MaybeAbortOnStaleReads` (`read_write_transaction.cc:422`, called at `frontend/entities/transaction.cc:240`) |
+| Strictly increasing commit timestamps; RO reads unchanged | `LockManager::ReserveCommitTimestamp` (`manager.cc:40`); pending commits are a set, and a read at or after a pending commit's timestamp waits for it |
 | `sqlSpan` with `pushdown` | `ComputeScanKeySets` (`backend/query/key_narrowing.cc:581`), set per statement at `backend/query/query_engine.cc:1431,1464`; flag `--enable_query_key_pushdown` (default on) |
 | `fp (.dmlInsert ..)`: the inserted row | `InsertedKeys` (`key_narrowing.cc:401`), independent of the pushdown flag |
 
 Beyond the model:
 
 * **Schema changes** hold the commit mutex exclusively
-  (`backend/database/database.cc:169`). They wait for a commit in flight but no
+  (`backend/database/database.cc:172`). They wait for a commit in flight but no
   longer fail because read-write transactions are open. Those abort on their
   next operation or at commit.
 * **Partitioned DML and `BatchWrite`** run through the same `Commit`.
@@ -242,15 +242,24 @@ Beyond the model:
   (`key_narrowing.cc:149`).
 * **Columns**: read sets are per row, like the model; a write to any column
   of a row conflicts with any read of the row.
-* **Pending commits** are a set, and a read waits for its minimum. Commits
-  run one at a time under the commit mutex, so it holds at most one entry.
+* **Pending commits** are a set; a read waits while its minimum is at or
+  before the read timestamp. Commits run one at a time under the commit
+  mutex, so it holds at most one entry.
+* **Schema changes vs transactions**: a read-write transaction holds shared
+  ownership of its schema and action registry, so a concurrent schema change
+  cannot free them mid-operation. Whole schema changes are serialized by
+  their own mutex, which also orders change stream churner updates.
 
-One deviation from the model, conservative (it can only add aborts):
+One deviation from the model (the model has no such columns):
 
-* A mutation whose key column has a default or generated value is not in the
-  pre-pass read set. Its row joins the read set when the mutation is
-  flattened, so an error from an earlier mutation of the same `Commit` is not
-  validated against it. The model has no such columns.
+* A mutation whose key column has a default or generated value cannot be put
+  in the read set before the mutations are applied, because evaluating the key
+  can have side effects (sequences). Its row joins the read set when the
+  mutation is flattened. If an earlier mutation of the same `Write` or
+  `Commit` fails first, the error is validated against the whole table instead
+  (`ReadWriteTransaction::AbortIfReadSetStale`). So the error becomes
+  `ABORTED` whenever validating the row would have made it `ABORTED`, and also
+  when a commit after the snapshot wrote any other row of that table.
 
 ### Stress test
 
