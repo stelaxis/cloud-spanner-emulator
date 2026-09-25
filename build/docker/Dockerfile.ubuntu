@@ -18,7 +18,7 @@
 #                                     BUILD                                    #
 ################################################################################
 
-FROM ubuntu:22.04 as build
+FROM ubuntu:22.04 AS rpc-deps
 
 # Perform all APT installs in a single layer to reduce image size.
 ENV GCC_VERSION=13
@@ -62,16 +62,40 @@ ARG TARGETARCH
 RUN wget -O /usr/local/bin/bazel https://github.com/bazelbuild/bazelisk/releases/download/v1.17.0/bazelisk-linux-${TARGETARCH} \
     && chmod +x /usr/local/bin/bazel
 
-# Build GoogleSQL to cache it for reuse in subsequent Docker builds.
-# GoogleSQL can take 3h+ to build, so caching it saves a lot of time.
+# Keep the upstream local default; CI overrides this for its memory budget.
+ARG BAZEL_JOBS=auto
 WORKDIR /src
 COPY build/bazel build/bazel/
 COPY MODULE.bazel MODULE.bazel.lock* .bazelversion .bazelrc BUILD.bazel \
     requirements.txt go.mod go.sum ./
-RUN bazel build -c opt \
-    @com_google_googlesql//googlesql/public:value \
+# Checkpoint the common RPC dependencies before the larger GoogleSQL build.
+RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
+    @com_github_grpc_grpc//:grpc++ \
+    @com_google_protobuf//:protobuf
+
+FROM rpc-deps AS deps-value
+# Preserve value even if the much larger analyzer build times out.
+RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
+    @com_google_googlesql//googlesql/public:value
+
+FROM deps-value AS deps-parser
+RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
+    @com_google_googlesql//googlesql/parser:parser
+
+FROM deps-parser AS deps-resolved-ast
+RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
+    @com_google_googlesql//googlesql/resolved_ast:resolved_ast
+
+FROM deps-resolved-ast AS deps-resolver
+RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
+    @com_google_googlesql//googlesql/analyzer:resolver
+
+FROM deps-resolver AS deps
+# Each expensive dependency above can be exported before building the analyzer.
+RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
     @com_google_googlesql//googlesql/public:analyzer
 
+FROM deps AS build
 # Copy over the emulator code base into the container.
 COPY . .
 
@@ -82,9 +106,10 @@ RUN find third_party/spanner_pg -name "nodes.h" -exec sed -i 's/enum NodeTag : i
 # Since we are only copying the binaries to the release image, we don't need to
 # build the rest of the targets.
 ENV EXTRA_BAZEL_ARGS="--tool_java_runtime_version=local_jdk"
-RUN bazel build -c opt \
+RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
     //binaries:emulator_main \
-    //binaries:gateway_main
+    //binaries:gateway_main \
+    && bazel shutdown
 
 # Generate licenses file.
 RUN for file in $(find -L bazel-src/external                               \
@@ -96,6 +121,21 @@ RUN for file in $(find -L bazel-src/external                               \
       cat $file                                                              ; \
     done > licenses.txt                                                     && \
     gzip licenses.txt
+
+# CI exports this amd64 image from the same builder that compiled the emulator.
+# Keep /src and /root/.cache/bazel in ordinary layers: shards need both the
+# compiled outputs and Bazel's action cache, with the same paths and build flags.
+FROM build AS test-builder
+RUN test -s /src/bazel-bin/binaries/emulator_main \
+    && test -d /root/.cache/bazel \
+    && curl --fail --location --retry 3 \
+       https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-586.0.0-linux-x86_64.tar.gz \
+       --output /tmp/gcloud.tar.gz \
+    && echo '6c774c76793eedd501150b59da653610fbe3eaac169e822965b722de75a2f001  /tmp/gcloud.tar.gz' | sha256sum --check - \
+    && tar -xzf /tmp/gcloud.tar.gz -C /opt \
+    && rm /tmp/gcloud.tar.gz
+ENV GCLOUD_DIR=/opt/google-cloud-sdk/bin
+RUN /opt/google-cloud-sdk/bin/gcloud version
 
 ################################################################################
 #                                   RELEASE                                    #

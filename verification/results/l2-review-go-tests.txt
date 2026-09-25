@@ -1,0 +1,56 @@
+=== RUN   TestPersistentCrashDriver
+=== RUN   TestPersistentCrashDriver/durable
+=== RUN   TestPersistentCrashDriver/lost
+=== RUN   TestPersistentCrashDriver/partial
+=== RUN   TestPersistentCrashDriver/success
+=== RUN   TestPersistentCrashDriver/success_lost
+=== RUN   TestPersistentCrashDriver/lost_ack_regressed_clock
+=== RUN   TestPersistentCrashDriver/terminal
+=== RUN   TestPersistentCrashDriver/wrong_terminal
+--- PASS: TestPersistentCrashDriver (3.24s)
+    --- PASS: TestPersistentCrashDriver/durable (1.76s)
+    --- PASS: TestPersistentCrashDriver/lost (0.21s)
+    --- PASS: TestPersistentCrashDriver/partial (0.21s)
+    --- PASS: TestPersistentCrashDriver/success (0.23s)
+    --- PASS: TestPersistentCrashDriver/success_lost (0.22s)
+    --- PASS: TestPersistentCrashDriver/lost_ack_regressed_clock (0.15s)
+    --- PASS: TestPersistentCrashDriver/terminal (0.25s)
+    --- PASS: TestPersistentCrashDriver/wrong_terminal (0.20s)
+=== RUN   TestRestartModel
+=== RUN   TestRestartModel/upstream/empty_restart
+=== RUN   TestRestartModel/upstream/lost_commit
+=== RUN   TestRestartModel/upstream/durable_commit
+=== RUN   TestRestartModel/upstream/empty_crash_commit
+=== RUN   TestRestartModel/target/empty_restart
+=== RUN   TestRestartModel/target/lost_commit
+=== RUN   TestRestartModel/target/durable_commit
+=== RUN   TestRestartModel/target/empty_crash_commit
+--- PASS: TestRestartModel (0.42s)
+    --- PASS: TestRestartModel/upstream/empty_restart (0.04s)
+    --- PASS: TestRestartModel/upstream/lost_commit (0.05s)
+    --- PASS: TestRestartModel/upstream/durable_commit (0.05s)
+    --- PASS: TestRestartModel/upstream/empty_crash_commit (0.06s)
+    --- PASS: TestRestartModel/target/empty_restart (0.05s)
+    --- PASS: TestRestartModel/target/lost_commit (0.04s)
+    --- PASS: TestRestartModel/target/durable_commit (0.06s)
+    --- PASS: TestRestartModel/target/empty_crash_commit (0.07s)
+=== RUN   TestPersistentOracleRejectsPartialCommit
+--- PASS: TestPersistentOracleRejectsPartialCommit (0.06s)
+=== RUN   TestRestartRejectsOldHistoryAndLosesOpenTransactions
+=== RUN   TestRestartRejectsOldHistoryAndLosesOpenTransactions/upstream
+=== RUN   TestRestartRejectsOldHistoryAndLosesOpenTransactions/target
+--- PASS: TestRestartRejectsOldHistoryAndLosesOpenTransactions (0.11s)
+    --- PASS: TestRestartRejectsOldHistoryAndLosesOpenTransactions/upstream (0.04s)
+    --- PASS: TestRestartRejectsOldHistoryAndLosesOpenTransactions/target (0.07s)
+=== RUN   TestTerminalCrashCommitIsExecuted
+=== RUN   TestTerminalCrashCommitIsExecuted/upstream/no-persistence
+=== RUN   TestTerminalCrashCommitIsExecuted/upstream/persistent
+=== RUN   TestTerminalCrashCommitIsExecuted/target/no-persistence
+=== RUN   TestTerminalCrashCommitIsExecuted/target/persistent
+--- PASS: TestTerminalCrashCommitIsExecuted (0.38s)
+    --- PASS: TestTerminalCrashCommitIsExecuted/upstream/no-persistence (0.04s)
+    --- PASS: TestTerminalCrashCommitIsExecuted/upstream/persistent (0.23s)
+    --- PASS: TestTerminalCrashCommitIsExecuted/target/no-persistence (0.05s)
+    --- PASS: TestTerminalCrashCommitIsExecuted/target/persistent (0.06s)
+PASS
+ok  	github.com/stelaxis/cloud-spanner-emulator/verification/conformance	12.727s
