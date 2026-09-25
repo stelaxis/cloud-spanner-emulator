@@ -33,11 +33,15 @@
 #include "google/spanner/v1/spanner.grpc.pb.h"
 #include "google/spanner/v1/spanner.pb.h"
 #include "google/spanner/v1/transaction.pb.h"
+#include "absl/log/log.h"
 #include "absl/memory/memory.h"
+#include "absl/status/status.h"
 #include "common/constants.h"
 #include "common/errors.h"
 #include "common/limits.h"
 #include "frontend/common/status.h"
+#include "frontend/persistence/file_system.h"
+#include "frontend/persistence/manager.h"
 #include "frontend/server/handler.h"
 #include "frontend/server/request_context.h"
 #include "grpcpp/server_builder.h"
@@ -316,6 +320,21 @@ Server::Server(std::unique_ptr<ServerEnv> env)
 // Server lifecycle methods.
 std::unique_ptr<Server> Server::Create(const Server::Options& options) {
   auto env = std::make_unique<ServerEnv>();
+  if (!options.data_dir.empty()) {
+    // Recover before the port is opened, so no request sees partial state.
+    persistence::PersistenceOptions persistence_options;
+    persistence_options.fs = persistence::PosixFileSystem();
+    persistence_options.dir = options.data_dir;
+    persistence_options.checkpoint_bytes = options.checkpoint_bytes;
+    absl::Status status = env->EnablePersistence(persistence_options);
+    if (!status.ok()) {
+      ABSL_LOG(ERROR) << "Cannot use --data_dir=" << options.data_dir << ": "
+                      << status;
+      return nullptr;
+    }
+    persistence::InstallCheckpointSignalHandler();
+    ABSL_LOG(INFO) << "Keeping emulator state in " << options.data_dir;
+  }
   std::unique_ptr<Server> server = absl::WrapUnique(new Server(std::move(env)));
   ::grpc::ServerBuilder builder;
 

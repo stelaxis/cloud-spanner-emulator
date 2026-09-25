@@ -92,6 +92,10 @@ cc_library(
         "server.h",
     ],
     deps = [
+        "//frontend/persistence:file_system",
+        "//frontend/persistence:manager",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
         ":environment",
         ":handler",
         ":request_context",
@@ -120,6 +124,8 @@ cc_library(
         "environment.h",
     ],
     deps = [
+        "//frontend/persistence:manager",
+        "@com_google_absl//absl/status",
         "//common:clock",
         "//frontend/collections:database_manager",
         "//frontend/collections:instance_manager",

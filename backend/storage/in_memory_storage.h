@@ -17,7 +17,12 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_IN_MEMORY_STORAGE_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_IN_MEMORY_STORAGE_H_
 
+#include <memory>
+#include <optional>
+#include <vector>
+
 #include "googlesql/public/value.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/time/time.h"
 #include "backend/common/ids.h"
 #include "backend/datamodel/key.h"
@@ -62,6 +67,13 @@ class InMemoryStorage : public Storage {
                       const KeyRange& key_range) override
       ABSL_LOCKS_EXCLUDED(mu_);
 
+  absl::Status MarkWritten(absl::Time timestamp, const TableID& table_id,
+                           const Key& key) override ABSL_LOCKS_EXCLUDED(mu_);
+
+  bool HasVersionsAfter(absl::Time timestamp, const TableID& table_id,
+                        const KeyRange& key_range) const override
+      ABSL_LOCKS_EXCLUDED(mu_);
+
   void SetVersionRetentionPeriod(
       absl::Duration version_retention_period) override;
 
@@ -77,6 +89,24 @@ class InMemoryStorage : public Storage {
   void MarkDroppedColumn(absl::Time timestamp, TableID dropped_table_id,
                          ColumnID dropped_column_id) override
       ABSL_LOCKS_EXCLUDED(mu_);
+
+  void RollBackVersionsAt(absl::Time timestamp) override
+      ABSL_LOCKS_EXCLUDED(mu_);
+
+  std::unique_ptr<StorageSavepoint> SaveVersionsAt(
+      absl::Time timestamp) override ABSL_LOCKS_EXCLUDED(mu_);
+  void RestoreVersionsAt(absl::Time timestamp,
+                         const StorageSavepoint& savepoint) override
+      ABSL_LOCKS_EXCLUDED(mu_);
+  void DiscardSavepoints(absl::Time timestamp) override
+      ABSL_LOCKS_EXCLUDED(mu_);
+  void UnmarkDroppedAt(
+      absl::Time timestamp, const absl::flat_hash_set<TableID>& live_tables,
+      const absl::flat_hash_set<ColumnID>& live_columns) override
+      ABSL_LOCKS_EXCLUDED(mu_);
+
+  // The IDs of the tables holding any version. For tests.
+  std::vector<TableID> TableIdsForTesting() const ABSL_LOCKS_EXCLUDED(mu_);
 
  private:
   using Cell = std::map<absl::Time, googlesql::Value>;
@@ -96,8 +126,43 @@ class InMemoryStorage : public Storage {
 
   void RemoveExpiredVersions(Cell& cell, absl::Time timestamp);
 
+  // Removes the versions at `timestamp`, and rows and tables left empty.
+  void RemoveVersionsAtLocked(absl::Time timestamp)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+  // Records the version of `cell` at `timestamp` before a write changes it,
+  // if savepoints are open at `timestamp`.
+  void JournalLocked(absl::Time timestamp, const TableID& table_id,
+                     const Key& key, const ColumnID& column_id,
+                     const Cell& cell) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+  // Recomputes the table's latest version timestamp after versions are
+  // removed.
+  void RecomputeLatestVersionLocked(const TableID& table_id)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+  // Raises the table's latest version timestamp to `timestamp`.
+  void NoteVersion(const TableID& table_id, absl::Time timestamp)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
   mutable absl::Mutex mu_;
   Tables tables_ ABSL_GUARDED_BY(mu_);
+
+  // Latest version timestamp written to each table; lets HasVersionsAfter skip
+  // tables with no newer versions without scanning them.
+  absl::flat_hash_map<TableID, absl::Time> latest_version_ ABSL_GUARDED_BY(mu_);
+
+  // The undo journal of the savepoints open at journal_timestamp_: for each
+  // cell written at it since the first one, the version it had there (none
+  // if absent). Restoring a savepoint undoes the entries after it.
+  struct UndoEntry {
+    TableID table_id;
+    Key key;
+    ColumnID column_id;
+    std::optional<googlesql::Value> prior;
+  };
+  std::optional<absl::Time> journal_timestamp_ ABSL_GUARDED_BY(mu_);
+  std::vector<UndoEntry> journal_ ABSL_GUARDED_BY(mu_);
 
   // Tracks when tables were dropped so that we can clean up the data.
   std::map<absl::Time, TableID> dropped_tables_ ABSL_GUARDED_BY(mu_);

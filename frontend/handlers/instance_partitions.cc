@@ -61,7 +61,9 @@ GetReferencingDatabases(ServerEnv* env, const std::string& instance_uri) {
     if (db->backend() == nullptr) {
       continue;
     }
-    const auto* schema = db->backend()->GetLatestSchema();
+    // Owned while in use: a schema change may collect it meanwhile.
+    std::shared_ptr<const backend::Schema> schema =
+        db->backend()->GetLatestSchemaShared();
     if (schema == nullptr) {
       continue;
     }

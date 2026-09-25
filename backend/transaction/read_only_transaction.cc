@@ -52,25 +52,22 @@ ReadOnlyTransaction::ReadOnlyTransaction(
       versioned_catalog_(versioned_catalog),
       lock_manager_(lock_manager),
       version_retention_period_(versioned_catalog->version_retention_period()) {
-  lock_handle_ = lock_manager_->CreateHandle(transaction_id,
-                                             /*try_abort_fn=*/nullptr,
-                                             /*priority=*/1);
+  lock_handle_ = lock_manager_->CreateHandle(transaction_id, /*priority=*/1);
   read_timestamp_ = PickReadTimestamp();
 }
 
 absl::Status ReadOnlyTransaction::Read(const ReadArg& read_arg,
                                        std::unique_ptr<RowCursor>* cursor) {
   absl::MutexLock lock(mu_);
-  // Wait for any concurrent schema change or read-write transactions to commit
-  // before accessing database state to perform a read.
-  lock_handle_->WaitForSafeRead(read_timestamp_);
+  WaitUntilReadable();
   auto now = clock_->Now();
   if (now - read_timestamp_ >= version_retention_period_) {
     return error::ReadTimestampPastVersionGCLimit(read_timestamp_);
   }
 
+  std::shared_ptr<const Schema> schema = SchemaShared();
   GOOGLESQL_ASSIGN_OR_RETURN(const ResolvedReadArg resolved_read_arg,
-                   ResolveReadArg(read_arg, schema()));
+                   ResolveReadArg(read_arg, schema.get()));
 
   // Clean up any dropped tables that are eligible for deletion.
   // This is inexpensive to do so it can be done for every read.
@@ -86,15 +83,34 @@ absl::Status ReadOnlyTransaction::Read(const ReadArg& read_arg,
     iterators.push_back(std::move(itr));
   }
   *cursor = std::make_unique<StorageIteratorRowCursor>(
-      std::move(iterators), resolved_read_arg.columns);
+      std::move(iterators), resolved_read_arg.columns, std::move(schema));
   return absl::OkStatus();
 }
 
 const Schema* ReadOnlyTransaction::schema() const {
+  return SchemaShared().get();
+}
+
+void ReadOnlyTransaction::WaitUntilReadable() const {
   // Wait for any concurrent schema change or read-write transactions to commit
-  // before accessing database state to read schemas in versioned_catalog.
+  // before accessing database state at the read timestamp.
   lock_handle_->WaitForSafeRead(read_timestamp_);
-  return versioned_catalog_->GetSchema(read_timestamp_);
+  // With --data_dir, nothing (rows, or the schema a query's catalog and
+  // INFORMATION_SCHEMA are built from) is served at a timestamp the durable
+  // clock lease does not cover, so after a crash every commit lands above it.
+  // By now the timestamp has passed, so this never moves the lease beyond the
+  // present; a future bound handed out by BeginTransaction alone never moves
+  // it.
+  clock_->CoverWithLease(read_timestamp_);
+}
+
+std::shared_ptr<const Schema> ReadOnlyTransaction::SchemaShared() const {
+  WaitUntilReadable();
+  absl::MutexLock lock(schema_mu_);
+  if (schema_holder_ == nullptr) {
+    schema_holder_ = versioned_catalog_->GetSchemaShared(read_timestamp_);
+  }
+  return schema_holder_;
 }
 
 absl::Time ReadOnlyTransaction::PickReadTimestamp() {

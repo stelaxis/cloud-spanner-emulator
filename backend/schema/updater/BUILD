@@ -256,9 +256,7 @@ cc_library(
     hdrs = ["scoped_schema_change_lock.h"],
     deps = [
         "//backend/common:ids",
-        "//backend/datamodel:key_range",
         "//backend/locking:manager",
-        "//common:errors",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/time",

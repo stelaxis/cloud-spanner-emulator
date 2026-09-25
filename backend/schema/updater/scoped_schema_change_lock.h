@@ -17,68 +17,53 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_SCHEMA_UPDATER_SCOPED_SCHEMA_CHANGE_LOCK_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_SCHEMA_UPDATER_SCOPED_SCHEMA_CHANGE_LOCK_H_
 
-#include <memory>
-
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/time/time.h"
 #include "backend/common/ids.h"
-#include "backend/datamodel/key_range.h"
-#include "backend/locking/handle.h"
 #include "backend/locking/manager.h"
-#include "backend/locking/request.h"
-#include "common/errors.h"
-#include "absl/status/status.h"
 
 namespace google {
 namespace spanner {
 namespace emulator {
 namespace backend {
 
-// A class that allows RAII acquisition of database locks for a schema change.
-// Locks are held during the lifetime of this object and all locks and holds
-// on reserved timestamps are released when going out of scope.
+// Holds the database's commit critical section exclusively for the lifetime of
+// a schema change. Waits for an in-flight commit to finish; open read-write
+// transactions do not block it. They abort on their next operation, or at
+// commit, once they see the new schema.
 class ScopedSchemaChangeLock {
  public:
-  ScopedSchemaChangeLock(TransactionID tid, LockManager* lock_manager) {
-    lock_handle_ = lock_manager->CreateHandle(tid, /*abort_fn=*/nullptr,
-                                              TransactionPriority(1));
-
-    // Use dummy arguments to represent a "database-wide lock".
-    LockRequest req{LockMode::kExclusive, /*table_id=*/"", KeyRange::All(),
-                    /*column_ids=*/{}};
-    lock_handle_->EnqueueLock(req);
+  ScopedSchemaChangeLock(TransactionID tid, LockManager* lock_manager)
+      : lock_manager_(lock_manager) {
+    lock_manager_->BeginExclusiveCommit();
   }
 
-  // Will wait to acquire locks on the database or return with a
-  // FAILED_PRECONDITION error if a concurrent schema change or read-write
-  // transaction was already in progress.
-  absl::Status Wait() {
-    absl::Status s = lock_handle_->Wait();
-    if (!s.ok()) {
-      GOOGLESQL_RET_CHECK_EQ(s.code(), absl::StatusCode::kAborted);
-      return error::ConcurrentSchemaChangeOrReadWriteTxnInProgress();
-    }
-    return absl::OkStatus();
-  }
+  ScopedSchemaChangeLock(const ScopedSchemaChangeLock&) = delete;
+  ScopedSchemaChangeLock& operator=(const ScopedSchemaChangeLock&) = delete;
 
-  // Reserves a commit timestamp for the shcema change.
+  // Kept for callers that expect a fallible acquisition; always OK.
+  absl::Status Wait() { return absl::OkStatus(); }
+
+  // Reserves a commit timestamp for the schema change.
   absl::StatusOr<absl::Time> ReserveCommitTimestamp() {
-    auto status_or = lock_handle_->ReserveCommitTimestamp();
-    has_commit_timestamp_ = status_or.status().ok();
-    return status_or;
+    commit_timestamp_ = lock_manager_->ReserveCommitTimestamp();
+    has_commit_timestamp_ = true;
+    return commit_timestamp_;
   }
 
   ~ScopedSchemaChangeLock() {
     if (has_commit_timestamp_) {
-      absl::Status s = lock_handle_->MarkCommitted();
+      lock_manager_->MarkCommitted(commit_timestamp_);
     }
-    lock_handle_->UnlockAll();
+    lock_manager_->EndExclusiveCommit();
   }
 
  private:
-  std::unique_ptr<LockHandle> lock_handle_;
+  LockManager* lock_manager_;
 
   bool has_commit_timestamp_ = false;
+  absl::Time commit_timestamp_;
 };
 
 }  // namespace backend

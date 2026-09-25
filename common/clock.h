@@ -17,6 +17,10 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_COMMON_CLOCK_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_COMMON_CLOCK_H_
 
+#include <functional>
+
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 
@@ -42,10 +46,43 @@ class Clock {
  public:
   Clock();
 
+  // Uses `system_now` instead of the system clock. For tests.
+  explicit Clock(std::function<absl::Time()> system_now);
+
   // Returns the current time.
   absl::Time Now() ABSL_LOCKS_EXCLUDED(mu_);
 
+  // Every later timestamp is after `floor`. For recovery (--data_dir).
+  void AdvanceTo(absl::Time floor) ABSL_LOCKS_EXCLUDED(mu_);
+
+  // With --data_dir, no timestamp handed out passes a durable lease, so that
+  // after a crash the clock can restart above everything handed out before.
+  // When Now() would pass the lease, `extend` must durably record and return
+  // a lease at or after the timestamp it is given. The process aborts if it
+  // cannot.
+  using LeaseExtender =
+      std::function<absl::StatusOr<absl::Time>(absl::Time needed)>;
+  void SetLease(absl::Time lease, LeaseExtender extend)
+      ABSL_LOCKS_EXCLUDED(mu_);
+
+  // Extends the lease, durably, to cover `timestamp` if it does not already:
+  // for a read timestamp a caller chose, before anything is served at it.
+  // Aborts, as Now() does, if the lease cannot be extended.
+  void CoverWithLease(absl::Time timestamp) ABSL_LOCKS_EXCLUDED(mu_);
+
+  // The current lease, or InfiniteFuture without one.
+  absl::Time lease() ABSL_LOCKS_EXCLUDED(mu_);
+
  private:
+  // Extends the lease to at least `needed`, or aborts.
+  void ExtendLeaseLocked(absl::Time needed) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+  // Returns the system time at microsecond granularity.
+  absl::Time SystemNowMicros() const;
+
+  // The system clock; absl::Now unless a test replaces it.
+  const std::function<absl::Time()> system_now_;
+
   // Mutex to guard state below.
   absl::Mutex mu_;
 
@@ -54,6 +91,9 @@ class Clock {
 
   // The last value we handed out in a call to Clock::Now().
   absl::Time last_dispensed_time_ ABSL_GUARDED_BY(mu_);
+
+  absl::Time lease_ ABSL_GUARDED_BY(mu_) = absl::InfiniteFuture();
+  LeaseExtender extend_lease_ ABSL_GUARDED_BY(mu_);
 };
 
 }  // namespace emulator

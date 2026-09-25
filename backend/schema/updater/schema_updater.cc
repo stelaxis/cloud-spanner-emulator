@@ -240,6 +240,15 @@ class SchemaUpdaterImpl {
     return std::move(intermediate_schemas_);
   }
 
+  void set_sequence_ids(
+      const absl::flat_hash_map<std::string, std::string>* sequence_ids) {
+    sequence_ids_ = sequence_ids;
+  }
+
+  void set_created_sequence_ids(std::vector<std::string>* ids) {
+    created_sequence_ids_ = ids;
+  }
+
  private:
   SchemaUpdaterImpl(googlesql::TypeFactory* type_factory,
                     TableIDGenerator* table_id_generator,
@@ -755,6 +764,10 @@ class SchemaUpdaterImpl {
   // Assigns OIDs to database objects when dialect is POSTGRESQL. The assigner
   // is owned by the database and is shared across all schema changes.
   PgOidAssigner* pg_oid_assigner_;
+
+  // See SchemaChangeContext::sequence_ids and created_sequence_ids.
+  const absl::flat_hash_map<std::string, std::string>* sequence_ids_ = nullptr;
+  std::vector<std::string>* created_sequence_ids_ = nullptr;
 
   // Holds the database id for this schema updater.
   std::string database_id_;
@@ -4966,11 +4979,14 @@ absl::StatusOr<const Sequence*> SchemaUpdaterImpl::CreateSequence(
             << create_sequence.sequence_name();
   }
   builder.set_name(create_sequence.sequence_name());
-  absl::BitGen bitgen;
-  builder.set_id(absl::StrCat(
-      "seq_",
-      googlesql::functions::GenerateUuid(bitgen)
-      ));
+  if (sequence_ids_ != nullptr &&
+      sequence_ids_->contains(create_sequence.sequence_name())) {
+    builder.set_id(sequence_ids_->at(create_sequence.sequence_name()));
+  } else {
+    absl::BitGen bitgen;
+    builder.set_id(
+        absl::StrCat("seq_", googlesql::functions::GenerateUuid(bitgen)));
+  }
   ::google::protobuf::RepeatedPtrField<ddl::SetOption> clause_options;
   if (dialect == database_api::DatabaseDialect::GOOGLE_STANDARD_SQL) {
     bool created_from_syntax = create_sequence.has_type() ||
@@ -4995,6 +5011,9 @@ absl::StatusOr<const Sequence*> SchemaUpdaterImpl::CreateSequence(
     builder.set_internal_use();
   }
   const Sequence* sequence = builder.get();
+  if (created_sequence_ids_ != nullptr) {
+    created_sequence_ids_->push_back(sequence->id());
+  }
 
   // Validate and set sequence options.
   const auto& set_options =
@@ -6298,7 +6317,8 @@ absl::Status SchemaUpdaterImpl::DropChangeStream(
 
 absl::Status SchemaUpdaterImpl::DropSequence(const Sequence* drop_sequence) {
   global_names_.RemoveName(drop_sequence->Name());
-  drop_sequence->RemoveSequenceFromLastValuesMap();
+  // Its counter is forgotten by Database only once the drop has taken
+  // effect; this statement can still fail validation.
   GOOGLESQL_RETURN_IF_ERROR(DropNode(drop_sequence));
   return absl::OkStatus();
 }
@@ -6947,6 +6967,8 @@ SchemaUpdater::ValidateSchemaFromDDL(
                        context.column_id_generator, context.storage,
                        context.schema_change_timestamp, context.pg_oid_assigner,
                        existing_schema, context.database_id));
+  updater.set_sequence_ids(context.sequence_ids);
+  updater.set_created_sequence_ids(context.created_sequence_ids);
   context.pg_oid_assigner->BeginAssignment();
   GOOGLESQL_ASSIGN_OR_RETURN(pending_work_,
                    updater.ApplyDDLStatements(schema_change_operation));
@@ -6964,12 +6986,31 @@ SchemaUpdater::ValidateSchemaFromDDL(
 
 // TODO : These should run in a ReadWriteTransaction with rollback
 // capability so that changes to the database can be reversed.
-absl::Status SchemaUpdater::RunPendingActions(int* num_succesful) {
+absl::Status SchemaUpdater::RunPendingActions(int* num_succesful,
+                                              Storage* storage,
+                                              absl::Time timestamp) {
+  absl::Status status;
   for (const auto& pending_statement : pending_work_) {
-    GOOGLESQL_RETURN_IF_ERROR(pending_statement.RunSchemaChangeActions());
+    // All statements write at the change's one commit timestamp, so a failed
+    // statement's partial backfill is undone by restoring the versions at it
+    // from before the statement (storage keeps an undo journal of the cells
+    // written meanwhile). Upstream left them, under a schema that never has
+    // the failed statement.
+    std::unique_ptr<StorageSavepoint> savepoint =
+        storage != nullptr && pending_statement.num_actions() > 0
+            ? storage->SaveVersionsAt(timestamp)
+            : nullptr;
+    status = pending_statement.RunSchemaChangeActions();
+    if (!status.ok()) {
+      if (savepoint != nullptr) {
+        storage->RestoreVersionsAt(timestamp, *savepoint);
+      }
+      break;
+    }
     ++(*num_succesful);
   }
-  return absl::OkStatus();
+  if (storage != nullptr) storage->DiscardSavepoints(timestamp);
+  return status;
 }
 
 absl::StatusOr<SchemaChangeResult> SchemaUpdater::UpdateSchemaFromDDL(
@@ -6982,6 +7023,8 @@ absl::StatusOr<SchemaChangeResult> SchemaUpdater::UpdateSchemaFromDDL(
                        context.column_id_generator, context.storage,
                        context.schema_change_timestamp, context.pg_oid_assigner,
                        existing_schema, context.database_id));
+  updater.set_sequence_ids(context.sequence_ids);
+  updater.set_created_sequence_ids(context.created_sequence_ids);
   context.pg_oid_assigner->BeginAssignment();
   GOOGLESQL_ASSIGN_OR_RETURN(pending_work_,
                    updater.ApplyDDLStatements(schema_change_operation));
@@ -6991,7 +7034,8 @@ absl::StatusOr<SchemaChangeResult> SchemaUpdater::UpdateSchemaFromDDL(
   int num_successful = 0;
   std::unique_ptr<const Schema> new_schema = nullptr;
 
-  absl::Status backfill_status = RunPendingActions(&num_successful);
+  absl::Status backfill_status = RunPendingActions(
+      &num_successful, context.storage, context.schema_change_timestamp);
   if (num_successful > 0) {
     new_schema = std::move(intermediate_schemas_[num_successful - 1]);
     GOOGLESQL_RETURN_IF_ERROR(context.pg_oid_assigner->EndAssignmentAtIntermediateSchema(

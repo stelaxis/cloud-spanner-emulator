@@ -23,16 +23,18 @@ func main() { os.Exit(run()) }
 func run() int {
 	var (
 		persistence = flag.String("persistence", "", "crash driver: no-persistence | persistent")
-		checkpoint  = flag.String("checkpoint-command", "", "optional asynchronous checkpoint trigger inside owned container")
+		checkpoint  = flag.String("checkpoint-command", "", "optional asynchronous checkpoint trigger inside owned container (native: run by sh with $EMULATOR_PID)")
+		binary      = flag.String("emulator-binary", "", "crash driver: run this emulator_main natively instead of a container")
+		port        = flag.Int("port", 19210, "crash driver: the native emulator's port")
 	)
 	var (
 		seeds      = flag.Int("seeds", 2000, "number of random schedules")
 		firstSeed  = flag.Uint64("first-seed", 1, "seed of the first schedule")
-		modelName  = flag.String("model", "upstream", "model to compare against: upstream | target")
+		modelName  = flag.String("model", "target", "model to compare against: target (this fork) | upstream (v1.5.58)")
 		pushdown   = flag.Bool("pushdown", false, "target model: SQL predicates narrow the read set")
 		mustMatch  = flag.Bool("must-match", true, "exit non-zero on any mismatch")
 		modelPath  = flag.String("txnmodel", "../lean/.lake/build/bin/txnmodel", "path to the txnmodel executable")
-		image      = flag.String("image", "gcr.io/cloud-spanner-emulator/emulator:1.5.58", "emulator image started when SPANNER_EMULATOR_HOST is unset")
+		image      = flag.String("image", "", "emulator image started when SPANNER_EMULATOR_HOST is unset (default: "+forkImage+" for -model target, "+upstreamImage+" for -model upstream)")
 		abortProb  = flag.Int("abort-probability", 0, "--abort_current_transaction_probability for the started emulator")
 		numKeys    = flag.Int("keys", 6, "key space size per table")
 		minTxns    = flag.Int("min-txns", 2, "minimum concurrent transactions per schedule")
@@ -61,12 +63,24 @@ func run() int {
 		return 0
 	}
 
+	if *image == "" {
+		*image = forkImage
+		if *modelName == "upstream" {
+			*image = upstreamImage
+		}
+	}
 	if *persistence != "" {
-		return runRestarts(*persistence, *image, *checkpoint, *modelPath, *modelName, *pushdown, *mustMatch, *seeds, *firstSeed, cfg, *replay, *dumpFailed)
+		return runRestarts(*persistence, *image, *binary, *port, *checkpoint, *modelPath, *modelName, *pushdown, *mustMatch, *seeds, *firstSeed, cfg, *replay, *dumpFailed)
 	}
 	addr := os.Getenv("SPANNER_EMULATOR_HOST")
 	if addr == "" {
-		a, stop, err := startDocker(*image, *abortProb)
+		// Only the fork has --enable_query_key_pushdown; it must agree with the
+		// model's read sets.
+		var extra []string
+		if *modelName == "target" {
+			extra = append(extra, fmt.Sprintf("--enable_query_key_pushdown=%v", *pushdown))
+		}
+		a, stop, err := startDocker(*image, *abortProb, extra...)
 		if err != nil {
 			log.Print(err)
 			return 2

@@ -10,8 +10,9 @@ pins down two things:
   don't abort each other, and that it accepts every history Upstream commits.
 
 The conformance harness runs the same random schedules through the emulator
-and a model and diffs every step. Today it must match **Upstream**. Once the
-emulator implements the new design, it must match **Target**.
+and a model and diffs every step. The fork's emulator implements **Target**
+(see [the implementation](#the-implementation)) and must match it; upstream
+1.5.58 matches **Upstream**.
 
 ```
 verification/
@@ -27,6 +28,7 @@ verification/
     TxnSpec/Counterexamples.lean   design variants that break a property, checked by `decide`
     TxnSpec/Json.lean, TxnModel.lean   the `txnmodel` executable
   conformance/             Go harness (raw gRPC), one driver goroutine
+  stress/                  Go-client bank-transfer stress test, 16 workers
 ```
 
 ## What is modelled
@@ -200,6 +202,122 @@ These examples show behaviour that is correct, but conservative:
   This affects only Target conflict detection (it adds a write), never results.
 * **Isolation level.** Only `SERIALIZABLE`; `REPEATABLE_READ` is out of scope.
 
+## The implementation
+
+The fork's emulator implements Target. Where each rule lives:
+
+| Target rule | C++ |
+|---|---|
+| No lock slot; lock requests never block or abort | `LockHandle::EnqueueLock` records reads only (`backend/locking/handle.cc:41`) |
+| Snapshot at the first data operation, not at `BeginTransaction` | `ReadWriteTransaction::AcquireSnapshot` (`backend/transaction/read_write_transaction.cc:343`), called from `Read` and `Write`; `LockHandle::SnapshotTimestamp` (`backend/locking/handle.cc:75`) |
+| The snapshot is never ahead of a commit still flushing | `LockManager::PickSnapshotTimestamp` takes a fresh timestamp, then `WaitForSafeRead` waits for every pending commit at or before it (`backend/locking/manager.cc:56,73`) |
+| Reads at the snapshot, overlaid by the buffer | `TransactionStore::ReadTimestamp` replaces `InfiniteFuture` in every storage read (`backend/transaction/transaction_store.cc:97`) |
+| Read set = key ranges scanned (`fp`), not rows returned | `TransactionStore::AcquireReadLock` (`transaction_store.cc:77`), including `RowExistsInStorage` (`:370`); index, FK and interleave checks read through `Lookup`/`Read`, so they are covered |
+| `fp (.commit ms)`: every mutation's row, before any is applied | `ReadWriteTransaction::RecordMutationReads` (`read_write_transaction.cc:354`) |
+| Commit: validate, then take a timestamp, atomically | `LockHandle::Commit` (`backend/locking/handle.cc:124`): under the commit mutex, `ReadSetIsStaleLocked` (`:100`), `ReserveCommitTimestamp`, flush, `MarkCommitted` |
+| `stale`: a commit after the snapshot wrote a row in the read set | `Storage::HasVersionsAfter` (`backend/storage/in_memory_storage.cc:238`) |
+| Every write of a commit is a version, including a cancelled insert-then-delete | `TransactionStore::GetCancelledWrites` (`transaction_store.cc:448`) and `Storage::MarkWritten` (`in_memory_storage.cc:226`) |
+| `errCode` / `target_errors_latest`: a constraint error on a stale read set is `ABORTED` | `AbortIfReadSetStale` for `Write` and `Commit` (`read_write_transaction.cc:409,504`); DML errors raised by the query engine, `MaybeAbortOnStaleReads` (`read_write_transaction.cc:422`, called at `frontend/entities/transaction.cc:240`) |
+| Strictly increasing commit timestamps; RO reads unchanged | `LockManager::ReserveCommitTimestamp` (`manager.cc:40`); pending commits are a set, and a read at or after a pending commit's timestamp waits for it |
+| `sqlSpan` with `pushdown` | `ComputeScanKeySets` (`backend/query/key_narrowing.cc:581`), set per statement at `backend/query/query_engine.cc:1431,1464`; flag `--enable_query_key_pushdown` (default on) |
+| `fp (.dmlInsert ..)`: the inserted row | `InsertedKeys` (`key_narrowing.cc:401`), independent of the pushdown flag |
+
+Beyond the model:
+
+* **Schema changes** hold the commit mutex exclusively
+  (`backend/database/database.cc:172`). They wait for a commit in flight but no
+  longer fail because read-write transactions are open. Those abort on their
+  next operation or at commit.
+* **Partitioned DML and `BatchWrite`** run through the same `Commit`.
+* **`--abort_current_transaction_probability`** now aborts that percentage of
+  read-write commits at random, for testing retry loops (default 0,
+  `common/config.cc:47`). The gateway forwards it and
+  `--enable_query_key_pushdown` to `emulator_main`.
+* **Pushdown also serves GoogleSQL column filters**
+  (`EvaluatorTableIterator::SetColumnFilterMap`,
+  `backend/query/queryable_table.cc:95`) for scans the statement analysis
+  leaves alone, such as a table scanned twice. Column filters are inclusive,
+  so those key sets can be wider than the predicate, never narrower.
+  Contradictory bounds read nothing rather than an inverted range
+  (`key_narrowing.cc:149`).
+* **Columns**: read sets are per row, like the model; a write to any column
+  of a row conflicts with any read of the row.
+* **Pending commits** are a set; a read waits while its minimum is at or
+  before the read timestamp. Commits run one at a time under the commit
+  mutex, so it holds at most one entry.
+* **Schema changes vs transactions**: a schema change can publish newer
+  schemas and garbage-collect old ones while transactions still use them, so
+  everything that uses a schema owns it:
+  * A read-write transaction owns its schema and action registry. Before its
+    first data operation it hands out the latest schema and keeps it; that
+    operation runs on it, or aborts if a schema change replaced it after it
+    was handed out.
+  * A read-only transaction owns the schema at its read timestamp.
+  * Read cursors own the schema their columns belong to.
+  * Sequence and time zone functions evaluate against the latest schema, as
+    upstream does, and hold the one they loaded until they are done.
+  * The process-wide PostgreSQL system catalog takes only schemas its source
+    catalog owns, never a schema change's intermediate schema, which is
+    destroyed when the change finishes.
+  * Admin handlers (`GetDatabaseDdl`, instance partitions) hold the latest
+    schema through `Database::GetLatestSchemaShared`.
+
+  Whole schema changes are serialized by their own mutex, which also orders
+  change stream churner updates.
+
+One deviation from the model (the model has no such columns):
+
+* A mutation whose key column has a default or generated value cannot be put
+  in the read set before the mutations are applied, because evaluating the key
+  can have side effects (sequences). Its row joins the read set when the
+  mutation is flattened. If an earlier mutation of the same `Write` or
+  `Commit` fails first, the error is validated against the whole table instead
+  (`ReadWriteTransaction::AbortIfReadSetStale`). So the error becomes
+  `ABORTED` whenever validating the row would have made it `ABORTED`, and also
+  when a commit after the snapshot wrote any other row of that table.
+
+### Stress test
+
+`verification/stress` runs 16 goroutines through the Go client
+(`cloud.google.com/go/spanner` v1.88, whose read-write transactions use
+multiplexed sessions) with its retry loop, 15 s per workload, and checks every
+balance against the committed transfers:
+
+* `contended`: transfers among 4 accounts, written with `UPDATE ... WHERE
+  Id = @id`.
+* `disjoint`: each worker transfers between its own 2 accounts.
+* `mux282`: inserts through an explicit `BeginTransaction` plus buffered
+  mutations (the pattern of upstream issue #282, whose writes were silently
+  lost), then checks that every committed row exists.
+
+```sh
+cd verification/stress
+SPANNER_EMULATOR_HOST=localhost:19011 mise exec go@1.25 -- go run . -workers 16
+mise exec go@1.25 -- go run . -image gcr.io/cloud-spanner-emulator/emulator:1.5.58 -abort-probability 0
+```
+
+| Emulator | Workload | Committed txn/s | Aborted attempts per commit |
+|---|---|---|---|
+| fork, native, pushdown on | contended | 498 | 0.81 |
+| | disjoint | 4,068 | **0** |
+| | mux282 | 10,740 | **0** |
+| 1.5.58 image, probability 0 | contended | 55 | 1.55 |
+| | disjoint | 105 | 0.89 |
+| | mux282 | 279 | 7.59 |
+| 1.5.58 image, probability 20 | contended | 209 | 1.23 |
+| | disjoint | 146 | 1.35 |
+
+Every run kept the total balance and every account's balance, and lost no
+committed row. With `--abort_current_transaction_probability=20`, the fork's
+disjoint workload aborts 19.9% of attempts, all injected. The 1.5.58 figures
+come from its Linux image under Docker on the same machine, so they include
+the VM's overhead. Its `mux282` run at probability 20 did not finish: after
+the writers stopped, a strong read of one row blocked for more than ten
+minutes (not diagnosed further).
+
+Issue #282 does not reproduce on the fork: 161,111 concurrent #282-pattern
+commits, none lost.
+
 ## Running
 
 ### Proofs and the model executable
@@ -237,25 +355,32 @@ Results: `"ok"`, `{"rows":[[k,v],…]}`, `{"count":n}`, `{"committed":i}` (the
 
 ### Conformance
 
-The gateway does not pass `--abort_current_transaction_probability` through
-(`binaries/gateway_main.go:52-71`), so the harness runs `emulator_main`
-directly:
+The harness runs `emulator_main` directly, with
+`--abort_current_transaction_probability=0`. Against the fork, its
+`--enable_query_key_pushdown` must agree with the harness's `-pushdown`:
 
 ```sh
 cd verification/conformance
 (cd ../lean && lake build)                           # builds txnmodel
-mise exec go@1.25 -- go run . -seeds 2000            # starts the 1.5.58 image itself
-# or against a running emulator_main started with --abort_current_transaction_probability=0:
-SPANNER_EMULATOR_HOST=localhost:9010 mise exec go@1.25 -- go run . -seeds 2000
+# the fork, built natively (docs/building-on-macos.md):
+bazel-bin/binaries/emulator_main --host_port localhost:19010 \
+  --abort_current_transaction_probability=0 --enable_query_key_pushdown=false &
+SPANNER_EMULATOR_HOST=localhost:19010 mise exec go@1.25 -- go run . -seeds 3000
+# with --enable_query_key_pushdown=true (the default):
+SPANNER_EMULATOR_HOST=localhost:19011 mise exec go@1.25 -- go run . -pushdown -seeds 3000
+# upstream 1.5.58 against the Upstream model; starts the image itself:
+mise exec go@1.25 -- go run . -model upstream -seeds 2000
 ```
 
 Useful flags:
 
 | Flag | Effect |
 |---|---|
-| `-model upstream` (default) | Upstream must match; exit 1 on any mismatch. |
-| `-model target [-pushdown] -must-match=false` | Report how the emulator diverges from Target. Phase 1 drops `-must-match=false`. |
-| `-image` | The emulator image to start. |
+| `-model target` (default) | Target must match; exit 1 on any mismatch. |
+| `-model upstream` | Upstream must match. Only upstream 1.5.58 does; the fork diverges by design. |
+| `-pushdown` | Target with SQL key predicates narrowing the read set. |
+| `-must-match=false` | Report divergences without failing. |
+| `-image` | The emulator image to start when `SPANNER_EMULATOR_HOST` is unset. |
 | `-print -first-seed N` | Print seed `N`'s schedule. |
 | `-schedule file.jsonl` | Replay one schedule and print the step-by-step diff. |
 | `-dump file.jsonl` | Save the shrunk failing schedule. |
@@ -280,6 +405,27 @@ mutations, then prints it.
 
 ## Results
 
+### The fork
+
+`emulator_main` built natively on macOS arm64 from this branch,
+`--abort_current_transaction_probability=0`, seeds 1–3000:
+
+| Model | `--enable_query_key_pushdown` | Schedules | Steps | Mismatching schedules | `ABORTED` (emulator / model) |
+|---|---|---|---|---|---|
+| `target` | `false` | 3000 | 49,332 | **0** | 726 / 726 |
+| `target -pushdown` | `true` | 3000 | 49,332 | **0** | 607 / 607 |
+
+Upstream mode now diverges, as intended. Seeds 1–1000 against `-model
+upstream`: 535 of 1000 schedules mismatch; the emulator aborts 225 times, the
+Upstream model 2,269. At every first divergence the Upstream model aborts for
+the lock slot where the fork proceeds. Crossing the pushdown settings
+(emulator with pushdown, Target model without) mismatches 36 of 1000
+schedules. At each, the model aborts where the emulator, whose read set is
+narrower, commits or reports a constraint error. So the runs above do
+exercise pushdown.
+
+### Upstream 1.5.58
+
 Emulator `gcr.io/cloud-spanner-emulator/emulator:1.5.58`, `emulator_main
 --abort_current_transaction_probability=0`, seeds 1–2000:
 
@@ -292,7 +438,7 @@ Emulator `gcr.io/cloud-spanner-emulator/emulator:1.5.58`, `emulator_main
 
 Upstream matches every step. In every one of the 1,104 Target divergences,
 the first diverging step is the emulator returning `ABORTED` where Target
-proceeds. That is the Phase 1 gap: the emulator aborts transactions because of
+proceeds. That was the gap the fork closes: 1.5.58 aborts transactions because of
 the single lock slot, and Target does not. Sometimes the Target outcome that
 first differs is a real constraint error. For example, a commit the emulator
 aborts for the lock gets `ALREADY_EXISTS` under Target because the row exists;
@@ -569,3 +715,263 @@ a comment), so the 500-seed Docker gate is not rerun for round 2.
 See the [review-response report](results/l2-report.md) for exact commands, raw
 logs, theorem dependencies and point-by-point review responses. The earlier four-shard logs are historical evidence for
 `f38776c` and are not counted toward the revised-code gate.
+
+## Persistence implementation
+
+The fork implements the L2 protocol behind `--data_dir`
+([docs/persistence.md](../docs/persistence.md)). Without the flag none of it
+runs: no gate is taken, no file is touched, and commits flush to storage as
+before.
+
+| Model (`Persistence.lean`, `PersistenceSequences.lean`) | C++ |
+|---|---|
+| One physical WAL of `(sequence, record)` entries (`Disk.physical`) | `frontend/persistence/log.cc`: segment files `wal-<first LSN>.log`; every frame holds its LSN, length and CRC32C; `Log::Open` rejects a gap in LSNs |
+| Records hold resolved physical effects; replay evaluates no SQL | `backend::StorageOp` (table/column IDs, keys, values after defaults, generated columns and commit timestamps are resolved), recorded by `RecordingStorage`; a schema change's record holds its schema and its backfill writes (`Database::ApplySchemaChangeLocked`); recovery writes them straight into storage (`LoadRows` in `frontend/persistence/manager.cc`) |
+| `begin → finish → fsync → flush → ack` under one global gate; records in commit-timestamp order across databases | `LockHandle::Commit` (`backend/locking/handle.cc`) takes the emulator-wide gate after validation and holds it from `ReserveCommitTimestamp` to `MarkCommitted`; inside, `ReadWriteTransaction::Commit` records the writes, `LogCommit` appends and syncs them, and only then are they applied. Catalog records take the gate and a clock timestamp (`PersistenceManager::Log*`) |
+| No `ack` without `fsync` (`early_ack_loses_durability`) | a failed write or sync fails the commit before its writes are applied, and marks the log broken so every later record fails (`Log::Append`) |
+| Torn final bytes are never replayed, and are truncated before the next append | `ScanSegment`: a damaged record with no intact record after it, in the last segment, is dropped and the file truncated in `Log::Open` |
+| Detected non-tail corruption fails recovery (`Disk.recover`) | any other damaged record, a damaged file header or checkpoint, or a missing segment is `DATA_LOSS`; an unknown format version is `FAILED_PRECONDITION` (version 2 is written; version 1, with int64-nanosecond timestamps, is still read and never appended to) |
+| `checkpointStart` needs an idle gate; `quiescent_image` | `PersistenceManager::Checkpoint` holds the gate while it starts a segment (boundary = next LSN) and copies instances, schemas (owned, `GetPersistedSchema`), rows and sequence reservations; a database it cannot reach fails the checkpoint rather than being left out, and `ServerEnv` stops the checkpoint thread before it destroys the databases |
+| `publish` is atomic and durable | `Log::PublishCheckpoint`: temporary file, sync, rename, directory sync |
+| `truncate upto ≤ checkpoint.boundary` (`early_truncate_loses_recovery`) | `Log::RemoveSegmentsBelow` removes whole segments below the published boundary, never past it |
+| `restore` = checkpoint image + records with sequence ≥ boundary (`covered_wal_replay_is_wrong`) | `PersistenceManager::Recover` skips records below the boundary; recreating a database uses a fresh incarnation, so replaying a covered CREATE would not be idempotent either |
+| Clock lease: `serveRead` and `ack` stay within the durable lease; restart above `max(clockHigh, lease, recovered clock, wall)` (`wall_restart_regresses`) | `Clock::SetLease`: no timestamp past the lease is handed out before a lease record is synced; `ReadOnlyTransaction::WaitUntilReadable` runs `WaitForSafeRead` (the timestamp has passed) and `Clock::CoverWithLease` (the lease covers it), as `serveRead` requires `ts ≤ lease`; it is the first step of both ways a read-only transaction reaches state, `Read` and `schema()`, which every query (`INFORMATION_SCHEMA` included) takes its catalog from. A future bound that `BeginTransaction` returns without serving data is not a `serveRead` and moves nothing. The checkpoint stores `max(clock, lease)`; `Recover` calls `Clock::AdvanceTo`; the codec refuses to write a timestamp outside Spanner's range |
+| `readAllowed boundary ts`; pre-restart exact reads rejected | `Database::SetRestartFloor`; `Database::CreateReadOnlyTransaction` returns `FAILED_PRECONDITION` below it; bounded staleness never picks a timestamp below it (`LockManager::AdvanceLastCommitTimestamp`) |
+| Sequence allocator issues only below durable reservations; a crash resumes at the durable end (`cursor_reset_reissues`) | `Sequence::GetNextSequenceValue` calls the reservation hook, which syncs a reservation record, before handing out a value past the reserved end; `Sequence::RestoreReservation` |
+| Drops: a dropped incarnation is never recreated | databases and instances have incarnation numbers; records of a dropped incarnation are ignored on replay |
+| Backfills are not re-run (`rerun_backfill_changes_rows`) | recovery rebuilds each schema from its DDL against empty storage, then loads rows; no default, generated column or backfill is evaluated |
+
+Beyond the model:
+
+* **Schemas are stored as DDL** plus the storage IDs of their tables,
+  columns and sequences. Recovery rebuilds the schema through the normal
+  `Database::Create` path with those IDs preassigned
+  (`UniqueIdGenerator::Preassign`, `SchemaChangeContext::sequence_ids`) and
+  fails if the rebuilt IDs differ. The DDL is printed with foreign keys added
+  after every table (`PrintDDLStatements(schema, /*foreign_keys_last=*/true)`),
+  because a parent can reference its interleaved child, a cycle the
+  inline form cannot recreate. The Stelaxis smoke test found this.
+* **Only GoogleSQL databases** are persisted; PostgreSQL-dialect creation is
+  refused with `--data_dir`.
+* **Values** use the client wire encoding with their own type, so a value
+  decodes without its column's current schema.
+
+### Deviations from the model
+
+1. **Sequence reservations and clock leases have no timestamp and do not take
+   the gate.** Their effect is a maximum, which commutes with every other
+   record, so their position in the log does not matter. Taking the gate
+   would deadlock: a schema change holds it while its backfill draws
+   sequence values. The model appends every record under the gate with a
+   timestamp.
+2. **Leases are log records.** The model's `Disk.lease` is a separate durable
+   field. Truncating the log can drop old lease records, so each checkpoint
+   stores `max(clock, lease)` as its clock high-water mark.
+3. **A schema change's backfill writes reach storage before its record is
+   synced**, because backfills read their own writes. They stay invisible
+   until the change is marked committed (reads at or after its timestamp
+   wait). The new schema itself is published to the versioned catalog, which
+   every reader of the latest schema (`GetDatabaseDdl`, queries, new
+   transactions) goes through, only after the record is synced, as in the
+   model's `flush` after `fsync`. Every check that installing the schema
+   makes (`VersionedCatalog::CheckSchema`: timestamp order, retention period)
+   runs before the record is written, so a logged schema is always installed.
+   A change that publishes nothing (rejected by the updater or by
+   `CheckSchema`, or whose first statement's backfill fails) is rolled back
+   in storage (`Storage::RollBackVersionsAt` removes the versions and drop
+   marks at its timestamp) and not logged. When statement k>1 fails in its
+   backfill, the prefix is published as before, but the failed statement's
+   writes are undone from a savepoint taken before it
+   (`Storage::SaveVersionsAt`/`RestoreVersionsAt`, an undo journal of the
+   cells written at the change's one timestamp, which every statement shares;
+   statements without actions take none) and drop marks for objects the published
+   schema still has are removed (`Storage::UnmarkDroppedAt`). That also
+   changes the in-memory behavior: upstream 1.5.58 kept a rejected type
+   change's converted values under the old column type (a later comparison
+   on the column crashed it, SIGSEGV), orphan index rows, and drop marks of
+   unapplied statements (the table's rows were deleted after the retention
+   period). Sequence counters are forgotten only once the published
+   schema lacks them, including sequences created and dropped within the same
+   change. A schema change is refused if the log is already broken, but if
+   its own record fails the backfill writes cannot be undone, so the emulator
+   exits instead (`std::abort`), as it does if a logged schema could not be
+   installed; a restart recovers what the log holds. Commits are logged
+   before they are applied and need no such rule.
+4. **The gate is taken after validation.** Validation reads only its own
+   database, and that database's commit mutex already orders it with that
+   database's commits and schema changes. The model takes the gate before
+   validation.
+5. **Segments.** The one physical WAL is split into files so that truncation
+   removes whole files below the published boundary.
+6. **No group commit.** Each commit syncs its own record, holding the gate.
+7. **Multiple databases.** The composition proof covers one fixed-schema
+   database; the implementation relies on one global timestamp order for all
+   databases and the catalog.
+
+### Tests and tools
+
+* `frontend/persistence/log_test.cc`: the log on a simulated file system
+  (`MemFileSystem`) that loses unsynced bytes and directory entries on a
+  crash: a torn tail at every byte offset of a record, failed write and sync
+  (not acknowledged, log broken), an unacknowledged record that reached the
+  disk, corruption mid-log and in an earlier segment, a missing segment,
+  unknown format versions, the lock, and crashes between checkpoint write,
+  rename, directory sync and truncation.
+* `frontend/persistence/persistence_test.cc`: the managers and recovery on the
+  same file system: schemas and rows (storage dumps and storage IDs) across a
+  crash, including an interleaved parent referencing its child; sequences
+  never reissuing across four crashes; pre-restart reads refused; timestamps
+  above everything before a crash even when the system clock steps back an
+  hour; drops staying dropped; PostgreSQL refused; failed sync; a crash at
+  every checkpoint stage (each fault targeted by file and checked to fire);
+  concurrent commits with checkpoints; a corrupt log. From review: a failed
+  `DROP SEQUENCE` keeps the sequence's state; a checkpoint fails rather than
+  skip an unreachable database, and teardown never checkpoints one away; a
+  schema change is invisible while its record's sync is blocked; recovery
+  from the log alone ignores values of dropped proto and enum columns. From
+  the second review: a schema change rejected when it is installed is not
+  logged; sequences created and dropped in one change leave no state; a version 1
+  data directory is recovered, its timestamps included. From the third
+  review: a rejected type change leaves its column's values and type alone,
+  in memory and after a restart; a rejected change's drop marks are removed;
+  the codec refuses
+  out-of-range timestamps; a migrated database's create time moves to the
+  current field. From the fourth review: a failed first backfill and a
+  partly published batch leave no orphan index rows and no drop marks for
+  live tables, in memory and across a checkpoint and restart. From the fifth
+  review: data read at a future timestamp is served only once the lease
+  covers it, and no commit after a crash lands at or below it (with the
+  system clock stepped back an hour); future bounds up to Spanner's maximum
+  returned by BeginTransaction leave the restarted clock at the present, so
+  reads, commits and sessions work at once; a savepoint restores exactly the
+  cells written after it (`in_memory_storage_test`). From the sixth review:
+  an `INFORMATION_SCHEMA` query at a future timestamp, through the
+  `ExecuteSql` and `ExecuteStreamingSql` handlers, is covered, so after a
+  crash with the system clock stepped back a schema change lands above it;
+  every kind of read-only query (`INFORMATION_SCHEMA`, `SPANNER_SYS`,
+  `SELECT 1`, `CURRENT_TIMESTAMP()`, a table scan, a `PLAN`) returns only once
+  the lease covers its timestamp.
+* The crash driver runs `emulator_main` natively with `-emulator-binary`
+  (below). `-checkpoint-command 'kill -USR1 $EMULATOR_PID'` requests a
+  checkpoint before a between-call kill.
+* `stress -workloads crash -emulator-binary ... -data-dir DIR` kills the
+  emulator with SIGKILL in the middle of the transfer workload and restarts
+  it. Every transfer also inserts a `Transfers` row, so in-flight commits can
+  be resolved: in one snapshot right after the restart, and again at the end,
+  every balance must equal its initial value plus the transfers present,
+  every transfer acknowledged before the kill must be present, and no
+  transfer may be present that was never attempted.
+* `stress/smoke` applies a schema file one statement at a time (foreign keys
+  last), fills every table it can with type-driven DML, kills the emulator
+  with SIGKILL, restarts it, and compares `GetDatabaseDdl` and every row, then
+  checks that sequences continue without reissuing.
+
+```sh
+cd verification/conformance
+go run . -persistence persistent -model target -pushdown \
+  -emulator-binary ../../bazel-bin/binaries/emulator_main -port 19210 \
+  -seeds 500 -checkpoint-command 'kill -USR1 $EMULATOR_PID'
+cd ../stress
+go run . -emulator-binary ../../bazel-bin/binaries/emulator_main \
+  -data-dir /tmp/stress-data -port 19220 -workloads crash -duration 20s
+go run ./smoke -emulator-binary ../../bazel-bin/binaries/emulator_main \
+  -schema .../apps/stelaxis/priv/repo/structure.sql
+```
+
+### Persistence results
+
+All on macOS arm64, native builds of this branch with `-c opt --jobs=6
+--local_resources=cpu=6 --local_resources=memory=16384`; the Go gates ran
+against the `emulator_main` built from the same tree.
+
+| Gate | Result |
+|---|---|
+| Upstream suite: `//backend/... //common/... //frontend/... //gateway/... //binaries/... //tests/conformance/...` | 134 test targets: 132 pass. The 2 failures are on #2's known macOS list: `change_stream_backfill_test` and `PGFunctionsTest.ToJsonB` (1 of 32 `emulator_conformance_test` shards) |
+| New and changed tests, `--runs_per_test=20` | `log_test` (18 cases), `persistence_test` (10 cases), `instance_manager_test`, `database_manager_test`: 20/20 each |
+| ThreadSanitizer, `--output_base=/private/var/tmp/_bazel_persistence_tsan`, flags as in Phase 1, `--runs_per_test=10` | `frontend/persistence:{log_test,persistence_test}`, `transaction:concurrency_test`, `database:{database_concurrency_test,schema_lifetime_test}`, `locking:manager_test`, `common:clock_test`: 7 targets × 10 runs, no reports (the test binaries link `libclang_rt.tsan`) |
+| Crash driver, persistent, `-model target -pushdown`, seeds 1–500, `-checkpoint-command 'kill -USR1 $EMULATOR_PID'` | 500 schedules, 15,508 steps, **0 mismatches**, 500 SIGKILL/restarts; 254 kills during a Commit: 128 interrupted RPCs, 44 successful replies, 82 matching terminal errors; 246 checkpoint requests |
+| Target conformance, `--data_dir`, `-pushdown`, seeds 1–3000 | 3000 schedules, 49,332 steps, **0 mismatches**, `ABORTED` 607 / 607 (the same as without `--data_dir`) |
+| Stress `crash` workload, 16 workers, 30 s, SIGKILL at 15 s | killed with 74,469 acknowledged transfers; restarted and verified exact in 0.6 s; exact again at the end, 143,646 transfers committed. Two more runs killed at 7 s and 23 s: exact too |
+| Stelaxis smoke, `apps/stelaxis/priv/repo/structure.sql` | 158 statements (FKs last), 51 tables, 47 filled with 137 rows; after SIGKILL and restart the 136-statement DDL and every row are identical, and both sequence-keyed tables take new rows without reissuing a value |
+| `lake build`; `grep -rn sorry`; Go vet, gofmt and `go test -race` under `verification/` | pass; no `sorry`; Lean files unchanged |
+
+After the review fixes (the regression tests in `persistence_test` each
+failed before their fix): the upstream suite again passes 132 of 134 targets
+with the same two known macOS failures; `//frontend/persistence:all` and
+`//common:clock_test` pass 20/20; ThreadSanitizer is clean on the same 7
+targets × 10 runs; the crash driver passes seeds 1–500 with 0 mismatches
+(129 interrupted commits, 43 successful replies, 246 checkpoint requests);
+the stress `crash` workload is exact after SIGKILL (53,598 acknowledged at the
+kill); the Stelaxis smoke test is identical after SIGKILL; `lake build` and
+the Go checks pass.
+
+After the second review (format version 2; each new regression test failed
+before its fix): the suite passes 131 of 134 targets, the two known macOS
+failures plus `session_manager_test`'s `CreateSession`, a race inherited from
+#3 (it compares `absl::Now()` with the microsecond clock; 2 of 100 runs fail,
+none of its code is touched here); the persistence, sequence, versioned
+catalog and clock tests pass 20/20; ThreadSanitizer is clean on 7 targets × 10
+runs; the crash driver passes seeds 1–500 with 0 mismatches (130 interrupted
+commits, 246 checkpoint requests); the stress `crash` workload is exact after
+SIGKILL (53,620 acknowledged; one in-flight transfer had committed); the
+Stelaxis smoke test is identical after SIGKILL; `lake build` and the Go
+checks pass.
+
+After the third review (merged with #3 at 9d390401; each new regression test
+failed before its fix): the suite passes 132 of 134 targets with only the two
+known macOS failures; the persistence, storage, clock, versioned catalog and
+session manager tests pass 20/20; ThreadSanitizer is clean on 7 targets × 10
+runs; the crash driver passes seeds 1–500 with 0 mismatches (128 interrupted
+commits, 246 checkpoint requests); the stress `crash` workload is exact
+after SIGKILL (55,038 acknowledged; one in-flight transfer had committed);
+the Stelaxis smoke test is identical after SIGKILL; `lake build` and the Go
+checks pass.
+
+After the fourth review (each new regression test failed before its fix,
+except the argument-order one, which Apple clang evaluates in the safe order):
+the suite passes 132 of 134 targets with only the two known macOS failures;
+the persistence, storage, clock and schema updater tests pass 20/20;
+ThreadSanitizer is clean on 7 targets × 10 runs; the crash driver passes
+seeds 1–500 with 0 mismatches (131 interrupted commits, 246 checkpoint
+requests); the stress `crash` workload is exact after SIGKILL (30,474
+acknowledged); the Stelaxis smoke test is identical after SIGKILL; `lake
+build` and the Go checks pass.
+
+After the fifth review (the new far-future test failed before the fix; the
+served-read test passes both before and after, as the invariant it keeps):
+the suite passes 132 of 134 targets with only the two known macOS failures;
+the persistence, storage, clock, schema updater and read-only transaction
+tests pass 20/20; ThreadSanitizer is clean on 7 targets × 10 runs; the crash
+driver passes seeds 1–500 with 0 mismatches (130 interrupted commits, 246
+checkpoint requests); the stress `crash` workload is exact after SIGKILL
+(33,657 acknowledged); the Stelaxis smoke test is identical after SIGKILL;
+`lake build` and the Go checks pass. Savepoint cost, `stress/smoke -rows 1000
+-migrate` (4,565 rows in 47 tables, then one schema change of 51 `CREATE
+INDEX` statements): 973 ms and 1,118 ms with full-scan savepoints, 600 ms and
+462 ms with the undo journal.
+
+After the sixth review (both new tests failed before the fix; before it, 12
+of the 14 query cases returned while the lease was below their timestamp, and
+only the table scan, which goes through `Read`, was covered): the suite
+passes 132 of 134 targets with only the two known macOS failures; the
+persistence, clock, read-only transaction and server tests pass 20/20;
+ThreadSanitizer is clean on 7 targets × 10 runs; the crash driver passes
+seeds 1–500 with 0 mismatches (128 interrupted commits, 246 checkpoint
+requests); target conformance with `--data_dir`, seeds 1–3000, has 0
+mismatches; the stress `crash` workload is exact after SIGKILL (41,510
+acknowledged); the Stelaxis smoke test is identical after SIGKILL; `lake
+build` and the Go checks pass.
+
+Throughput, `stress -workers 16 -duration 15s`, native `emulator_main`,
+committed transactions per second:
+
+| Workload | In memory | `--data_dir` |
+|---|---|---|
+| contended | 1,148 | 1,331 |
+| disjoint | 6,296 | 6,131 |
+| mux282 | 15,125 | 11,669 |
+| crash (32 accounts, SIGKILL mid-run) | | 4,784 |
+
+On macOS `fsync` does not flush the drive's cache, so a sync costs little and
+persistence costs little. On Linux, `fdatasync` bounds commits by the disk's
+sync latency: every commit syncs its own record under the gate.

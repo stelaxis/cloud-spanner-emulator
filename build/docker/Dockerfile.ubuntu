@@ -159,6 +159,10 @@ COPY --from=build /src/licenses.txt.gz .
 # Expose the default ports 9010 (gRPC) and 9020 (REST)
 EXPOSE 9010 9020
 
+# To keep state across restarts (docs/persistence.md), mount a volume at /data
+# and set SPANNER_EMULATOR_DATA_DIR=/data, or pass --data_dir=/data:
+#   docker run -v spanner-data:/data -e SPANNER_EMULATOR_DATA_DIR=/data ...
+
 # Run the gateway process, bind to 0.0.0.0 as under MacOS, listening on
 # localhost will make the server invisible outside the container.
 CMD ["./gateway_main", "--hostname", "0.0.0.0"]

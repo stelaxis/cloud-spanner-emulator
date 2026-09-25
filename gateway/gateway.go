@@ -55,6 +55,9 @@ type Options struct {
 	OverrideMaxDatabasesPerInstance                int
 	OverrideChangeStreamPartitionTokenAliveSeconds int
 	RemoteFunctionsHostPort                        string
+	AbortCurrentTransactionProbability             int
+	DisableQueryKeyPushdown                        bool
+	DataDir                                        string
 }
 
 // Gateway implements the emulator gateway server.
@@ -88,6 +91,15 @@ func (gw *Gateway) Run() {
 		}
 
 		emulatorArgs = append(emulatorArgs, "--remote_functions_host_port", gw.opts.RemoteFunctionsHostPort)
+	}
+	emulatorArgs = append(emulatorArgs,
+		fmt.Sprintf("--abort_current_transaction_probability=%d",
+			gw.opts.AbortCurrentTransactionProbability))
+	if gw.opts.DisableQueryKeyPushdown {
+		emulatorArgs = append(emulatorArgs, "--enable_query_key_pushdown=false")
+	}
+	if gw.opts.DataDir != "" {
+		emulatorArgs = append(emulatorArgs, "--data_dir="+gw.opts.DataDir)
 	}
 	emulatorArgs = append(emulatorArgs,
 		fmt.Sprintf("--override_max_databases_per_instance=%d",

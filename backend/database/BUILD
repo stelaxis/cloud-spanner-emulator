@@ -24,6 +24,19 @@ package(
 licenses(["notice"])
 
 cc_library(
+    name = "database_log",
+    hdrs = ["database_log.h"],
+    deps = [
+        "//backend/schema/catalog:schema",
+        "//backend/storage:recording_storage",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+cc_library(
     name = "database",
     srcs = [
         "database.cc",
@@ -32,6 +45,13 @@ cc_library(
         "database.h",
     ],
     deps = [
+        "@com_google_absl//absl/cleanup",
+        "@com_google_absl//absl/container:flat_hash_set",
+        ":database_log",
+        "//backend/storage:recording_storage",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/synchronization",
         "//backend/actions:manager",
         "//backend/common:ids",
         "//backend/database/change_stream:change_stream_partition_churner",
@@ -82,6 +102,59 @@ cc_test(
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/status",
         "@com_google_googlesql//googlesql/base/testing:status_matchers",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "database_concurrency_test",
+    srcs = ["database_concurrency_test.cc"],
+    deps = [
+        ":database",
+        "//backend/access:write",
+        "//backend/database/change_stream:change_stream_partition_churner",
+        "//backend/query:query_context",
+        "//backend/query:query_engine",
+        "//backend/schema/updater:schema_updater",
+        "//backend/transaction:read_write_transaction",
+        "//common:clock",
+        "//tests/common:proto_matchers",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_googlesql//googlesql/base/testing:status_matchers",
+        "@com_google_googlesql//googlesql/public:value",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "schema_lifetime_test",
+    srcs = ["schema_lifetime_test.cc"],
+    deps = [
+        "//third_party/spanner_pg/catalog:spangres_system_catalog",
+        "//third_party/spanner_pg/interface:emulator_builtin_function_catalog",
+        ":database",
+        "//backend/access:read",
+        "//backend/datamodel:key_set",
+        "//backend/query:function_catalog",
+        "//backend/query:query_context",
+        "//backend/query:query_engine",
+        "//backend/schema/catalog:schema",
+        "//backend/schema/updater:schema_updater",
+        "//backend/transaction:read_only_transaction",
+        "//backend/transaction:read_write_transaction",
+        "//common:clock",
+        "//tests/common:proto_matchers",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_googlesql//googlesql/base/testing:status_matchers",
+        "@com_google_googlesql//googlesql/public:value",
         "@com_google_googletest//:gtest_main",
     ],
 )

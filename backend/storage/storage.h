@@ -17,7 +17,10 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_STORAGE_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_STORAGE_H_
 
+#include <memory>
+
 #include "googlesql/public/value.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/time/time.h"
 #include "backend/common/ids.h"
@@ -36,6 +39,12 @@ namespace backend {
 // There will be a Storage instance for each database created. The current
 // interface is grow-only, i.e. once data is added, it will not be deleted.
 // Storage is thread-safe.
+// The versions at one timestamp, saved by Storage::SaveVersionsAt.
+class StorageSavepoint {
+ public:
+  virtual ~StorageSavepoint() = default;
+};
+
 class Storage {
  public:
   virtual ~Storage() {}
@@ -74,6 +83,19 @@ class Storage {
   virtual absl::Status Delete(absl::Time timestamp, const TableID& table_id,
                               const KeyRange& key_range) = 0;
 
+  // Records a version of `key` at `timestamp` that leaves the row's visible
+  // state unchanged, so that HasVersionsAfter reports it. A transaction that
+  // inserts and then deletes a row absent from storage buffers nothing, yet
+  // conflict detection must still see its write.
+  virtual absl::Status MarkWritten(absl::Time timestamp,
+                                   const TableID& table_id, const Key& key) = 0;
+
+  // Returns true if any row in `key_range` has a version (write, delete or
+  // MarkWritten) with a timestamp strictly after `timestamp`. `key_range`
+  // should be ClosedOpen; an empty or inverted range has no versions.
+  virtual bool HasVersionsAfter(absl::Time timestamp, const TableID& table_id,
+                                const KeyRange& key_range) const = 0;
+
   // Sets the version retention period from the database options.
   // This is used to determine when to delete expired data from storage.
   virtual void SetVersionRetentionPeriod(
@@ -87,6 +109,30 @@ class Storage {
 
   virtual void MarkDroppedColumn(absl::Time timestamp, TableID dropped_table_id,
                                  ColumnID dropped_column_id) = 0;
+
+  // Removes every version written at exactly `timestamp`, and the tables and
+  // columns marked dropped at it. A schema change owns its commit timestamp,
+  // so this undoes a change that is rejected after its backfills and drop
+  // marks reached storage.
+  virtual void RollBackVersionsAt(absl::Time timestamp) = 0;
+
+  // Marks the versions written at `timestamp` so far; RestoreVersionsAt then
+  // puts back exactly those, undoing later writes at `timestamp`. A schema
+  // change undoes a statement whose backfill failed this way: all of its
+  // statements write at its one commit timestamp.
+  virtual std::unique_ptr<StorageSavepoint> SaveVersionsAt(
+      absl::Time timestamp) = 0;
+  virtual void RestoreVersionsAt(absl::Time timestamp,
+                                 const StorageSavepoint& savepoint) = 0;
+
+  // Ends the savepoints at `timestamp`; they can no longer be restored.
+  virtual void DiscardSavepoints(absl::Time timestamp) = 0;
+
+  // Forgets the drop marks made at `timestamp` for tables and columns that
+  // are still live, so cleanup never deletes them.
+  virtual void UnmarkDroppedAt(
+      absl::Time timestamp, const absl::flat_hash_set<TableID>& live_tables,
+      const absl::flat_hash_set<ColumnID>& live_columns) = 0;
 };
 
 }  // namespace backend

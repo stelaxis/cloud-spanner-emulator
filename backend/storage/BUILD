@@ -41,7 +41,24 @@ cc_library(
         "storage.h",
     ],
     deps = [
+        "@com_google_absl//absl/container:flat_hash_set",
         ":iterator",
+        "//backend/common:ids",
+        "//backend/datamodel:key",
+        "//backend/datamodel:key_range",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/time",
+        "@com_google_googlesql//googlesql/public:value",
+    ],
+)
+
+cc_library(
+    name = "recording_storage",
+    srcs = ["recording_storage.cc"],
+    hdrs = ["recording_storage.h"],
+    deps = [
+        ":iterator",
+        ":storage",
         "//backend/common:ids",
         "//backend/datamodel:key",
         "//backend/datamodel:key_range",
@@ -58,6 +75,7 @@ cc_library(
         "in_memory_storage.h",
     ],
     deps = [
+        "@com_google_absl//absl/container:flat_hash_set",
         ":in_memory_iterator",
         ":iterator",
         ":storage",

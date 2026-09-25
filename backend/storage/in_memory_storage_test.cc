@@ -50,6 +50,57 @@ class InMemoryStorageTest : public testing::Test {
   std::unique_ptr<StorageIterator> itr_;
 };
 
+TEST_F(InMemoryStorageTest, RestoringASavepointUndoesOnlyLaterWritesAtIt) {
+  const absl::Time t0 = absl::Now();
+  const absl::Time t1 = t0 + absl::Seconds(1);
+  const Key key1({Int64(1)}), key2({Int64(2)}), key3({Int64(3)});
+  GOOGLESQL_EXPECT_OK(
+      storage_.Write(t0, kTableId0, key1, {kColumnID}, {String("old-1")}));
+  GOOGLESQL_EXPECT_OK(
+      storage_.Write(t0, kTableId0, key2, {kColumnID}, {String("old-2")}));
+  // What an earlier statement of a schema change wrote at its timestamp t1.
+  GOOGLESQL_EXPECT_OK(
+      storage_.Write(t1, kTableId0, key1, {kColumnID}, {String("prefix-1")}));
+  std::unique_ptr<StorageSavepoint> savepoint = storage_.SaveVersionsAt(t1);
+  // A later statement, which fails: an overwrite (twice), a new row, a
+  // delete and a new table.
+  GOOGLESQL_EXPECT_OK(
+      storage_.Write(t1, kTableId0, key1, {kColumnID}, {String("a")}));
+  GOOGLESQL_EXPECT_OK(
+      storage_.Write(t1, kTableId0, key1, {kColumnID}, {String("b")}));
+  GOOGLESQL_EXPECT_OK(
+      storage_.Write(t1, kTableId0, key3, {kColumnID}, {String("c")}));
+  GOOGLESQL_EXPECT_OK(
+      storage_.Delete(t1, kTableId0, KeyRange::Point(key2).ToClosedOpen()));
+  GOOGLESQL_EXPECT_OK(
+      storage_.Write(t1, kTableId1, key1, {kColumnID}, {String("d")}));
+  storage_.RestoreVersionsAt(t1, *savepoint);
+  storage_.DiscardSavepoints(t1);
+
+  std::vector<googlesql::Value> values;
+  GOOGLESQL_EXPECT_OK(
+      storage_.Lookup(t1, kTableId0, key1, {kColumnID}, &values));
+  EXPECT_THAT(values, testing::ElementsAre(String("prefix-1")));
+  GOOGLESQL_EXPECT_OK(
+      storage_.Lookup(t1, kTableId0, key2, {kColumnID}, &values));
+  EXPECT_THAT(values, testing::ElementsAre(String("old-2")));
+  EXPECT_FALSE(storage_.Lookup(t1, kTableId0, key3, {kColumnID}, &values).ok());
+  EXPECT_FALSE(storage_.Lookup(t1, kTableId1, key1, {kColumnID}, &values).ok());
+  GOOGLESQL_EXPECT_OK(
+      storage_.Lookup(t0, kTableId0, key1, {kColumnID}, &values));
+  EXPECT_THAT(values, testing::ElementsAre(String("old-1")));
+  EXPECT_TRUE(storage_.HasVersionsAfter(t0, kTableId0, KeyRange::All()));
+  EXPECT_FALSE(storage_.HasVersionsAfter(t0, kTableId1, KeyRange::All()));
+
+  // Writes after the savepoints are discarded are not journaled.
+  GOOGLESQL_EXPECT_OK(
+      storage_.Write(t1, kTableId0, key3, {kColumnID}, {String("e")}));
+  storage_.RestoreVersionsAt(t1, *savepoint);
+  GOOGLESQL_EXPECT_OK(
+      storage_.Lookup(t1, kTableId0, key3, {kColumnID}, &values));
+  EXPECT_THAT(values, testing::ElementsAre(String("e")));
+}
+
 TEST_F(InMemoryStorageTest, LookupByTable) {
   absl::Time t0 = absl::Now();
 

@@ -605,6 +605,23 @@ absl::Status AbortCurrentTransaction(backend::TransactionID holder_id,
                    "The emulator only supports one transaction at a time."));
 }
 
+absl::Status AbortReadSetConflict(backend::TransactionID id) {
+  return absl::Status(
+      absl::StatusCode::kAborted,
+      absl::StrCat("Transaction ", id,
+                   " aborted: a concurrent transaction committed a write to "
+                   "data it read. Retry the transaction."));
+}
+
+absl::Status AbortInjectedAtCommit(backend::TransactionID id) {
+  return absl::Status(
+      absl::StatusCode::kAborted,
+      absl::StrCat("Transaction ", id,
+                   " aborted at commit by "
+                   "--abort_current_transaction_probability. Retry the "
+                   "transaction."));
+}
+
 absl::Status WoundedTransaction(backend::TransactionID id) {
   return absl::Status(
       absl::StatusCode::kAborted,
@@ -813,6 +830,23 @@ absl::Status ForeignKeyReferencedRestrictionInTransaction(
                       absl::StrCat("Cannot write and delete the row with key ",
                                    key, " in the foreign key referenced table ",
                                    table, " within the same transaction."));
+}
+
+absl::Status ReadTimestampBeforeRestart(absl::Time timestamp,
+                                        absl::Time restart) {
+  return absl::Status(
+      absl::StatusCode::kFailedPrecondition,
+      absl::StrCat("Read timestamp ", absl::FormatTime(timestamp),
+                   " is before the emulator restarted at ",
+                   absl::FormatTime(restart),
+                   "; data versions from before a restart are not retained"));
+}
+
+absl::Status PostgreSQLDatabaseNotPersisted() {
+  return absl::Status(
+      absl::StatusCode::kFailedPrecondition,
+      "PostgreSQL-dialect databases are not supported with --data_dir; "
+      "start the emulator without --data_dir to use them");
 }
 
 absl::Status ReadTimestampPastVersionGCLimit(absl::Time timestamp) {

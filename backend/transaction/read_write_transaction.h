@@ -31,6 +31,7 @@
 #include "backend/actions/manager.h"
 #include "backend/common/case.h"
 #include "backend/common/ids.h"
+#include "backend/database/database_log.h"
 #include "backend/datamodel/key.h"
 #include "backend/datamodel/key_range.h"
 #include "backend/locking/handle.h"
@@ -84,7 +85,8 @@ class ReadWriteTransaction : public RowReader, public RowWriter {
                        TransactionID transaction_id, Clock* clock,
                        Storage* storage, LockManager* lock_manager,
                        const VersionedCatalog* const versioned_catalog,
-                       ActionManager* action_manager);
+                       ActionManager* action_manager,
+                       DatabaseLog* log = nullptr);
 
   absl::Status Read(const ReadArg& read_arg,
                     std::unique_ptr<RowCursor>* cursor) override
@@ -97,9 +99,12 @@ class ReadWriteTransaction : public RowReader, public RowWriter {
 
   absl::Status Rollback() ABSL_LOCKS_EXCLUDED(mu_);
 
-  // Tries to abort the transaction. This is a best effort attempt and returns
-  // OK only if the transaction could successfully be aborted.
-  absl::Status TryAbort() ABSL_LOCKS_EXCLUDED(mu_);
+  // Returns ABORTED, resetting the transaction, if `status` is an error other
+  // than ABORTED and a concurrent commit wrote data this transaction read.
+  // Otherwise returns `status`. For errors raised outside Read/Write/Commit,
+  // such as a DML statement the query engine rejects.
+  absl::Status MaybeAbortOnStaleReads(const absl::Status& status)
+      ABSL_LOCKS_EXCLUDED(mu_);
 
   absl::Status Invalidate() ABSL_LOCKS_EXCLUDED(mu_);
 
@@ -148,6 +153,18 @@ class ReadWriteTransaction : public RowReader, public RowWriter {
   // Resets the transaction and marks it Active.
   void Reset();
 
+  // Takes the snapshot on the first data operation; ABORTED if a schema
+  // change committed before it.
+  absl::Status AcquireSnapshot() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+  // Adds the rows every mutation op of `mutation` touches to the read set.
+  void RecordMutationReads(const Mutation& mutation)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+  // See MaybeAbortOnStaleReads.
+  absl::Status AbortIfReadSetStale(const absl::Status& status)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
   // Apply the constraint checks and effects to the writes.
   absl::Status ApplyValidators(const WriteOp& op);
   absl::Status ApplyEffectors(const WriteOp& op);
@@ -185,6 +202,17 @@ class ReadWriteTransaction : public RowReader, public RowWriter {
   // Catalog of schemas.
   const VersionedCatalog* const versioned_catalog_;
 
+  // Owns schema_, which a concurrent schema change may remove from the
+  // catalog. Declared before everything that points into the schema.
+  mutable std::shared_ptr<const Schema> schema_holder_ ABSL_GUARDED_BY(mu_);
+
+  // Schemas schema() handed out earlier, which callers may still use.
+  mutable std::vector<std::shared_ptr<const Schema>> retired_schemas_
+      ABSL_GUARDED_BY(mu_);
+
+  // Whether schema() handed out schema_ since the last data operation began.
+  mutable bool schema_handed_out_ ABSL_GUARDED_BY(mu_) = false;
+
   // Transaction lock management.
   std::unique_ptr<LockHandle> lock_handle_;
 
@@ -197,7 +225,11 @@ class ReadWriteTransaction : public RowReader, public RowWriter {
 
   // Action Manager for the transaction.
   ActionManager* action_manager_;
-  ActionRegistry* action_registry_;
+
+  // With --data_dir, commits are logged here before they are applied.
+  DatabaseLog* const log_;
+  // Shared with the action manager, which replaces it on a schema change.
+  std::shared_ptr<ActionRegistry> action_registry_;
   std::unique_ptr<ActionContext> action_context_;
 
   // The commit timestamp chosen for this transaction.
@@ -210,9 +242,13 @@ class ReadWriteTransaction : public RowReader, public RowWriter {
   State state_ ABSL_GUARDED_BY(mu_) = State::kUninitialized;
 
   // The schema that is in effect at the timestamp picked for this transaction.
-  const Schema* schema_ ABSL_GUARDED_BY(mu_);
+  mutable const Schema* schema_ ABSL_GUARDED_BY(mu_);
 
   CaseInsensitiveStringMap<std::vector<KeyRange>> deleted_key_ranges_by_table_;
+
+  // Tables of mutation rows whose keys have default or generated values, so
+  // their rows were not in the read set before the mutations were applied.
+  std::vector<const Table*> unrecorded_key_tables_ ABSL_GUARDED_BY(mu_);
 };
 
 }  // namespace backend

@@ -108,6 +108,13 @@ std::string PrintPlacement(const Placement* placement);
 absl::StatusOr<std::vector<std::string>> PrintDDLStatements(
     const Schema* schema);
 
+// With `foreign_keys_last`, foreign keys are added by ALTER TABLE statements
+// after every table, so that the statements can recreate a schema whose
+// foreign keys form a cycle with interleaving (persistence rebuilds schemas
+// this way).
+absl::StatusOr<std::vector<std::string>> PrintDDLStatements(
+    const Schema* schema, bool foreign_keys_last);
+
 }  // namespace backend
 }  // namespace emulator
 }  // namespace spanner

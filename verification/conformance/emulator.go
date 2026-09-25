@@ -27,14 +27,22 @@ var schemaDDL = []string{
 	"CREATE TABLE B (K INT64 NOT NULL, V INT64) PRIMARY KEY (K)",
 }
 
-// startDocker runs emulator_main directly (the gateway does not forward
-// --abort_current_transaction_probability) and returns its host:port and a
-// stop function.
-func startDocker(image string, abortProb int) (string, func(), error) {
-	out, err := exec.Command("docker", "run", "-d", "--rm", "-p", "127.0.0.1::9010",
+// Images the harness starts by default.
+const (
+	upstreamImage = "gcr.io/cloud-spanner-emulator/emulator:1.5.58"
+	forkImage     = "cloud-spanner-emulator:parallel-rw-txns"
+)
+
+// startDocker runs emulator_main directly (the upstream gateway does not
+// forward --abort_current_transaction_probability) on an ephemeral host port
+// and returns its host:port and a stop function.
+func startDocker(image string, abortProb int, extraFlags ...string) (string, func(), error) {
+	args := []string{"run", "-d", "--rm", "-p", "127.0.0.1::9010",
 		"--entrypoint", "./emulator_main", image,
 		"--host_port", "0.0.0.0:9010",
-		fmt.Sprintf("--abort_current_transaction_probability=%d", abortProb)).Output()
+		fmt.Sprintf("--abort_current_transaction_probability=%d", abortProb)}
+	args = append(args, extraFlags...)
+	out, err := exec.Command("docker", args...).Output()
 	if err != nil {
 		return "", nil, fmt.Errorf("docker run: %w", err)
 	}

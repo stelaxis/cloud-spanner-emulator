@@ -1,0 +1,161 @@
+//
+// Copyright 2026 The Stelaxis Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+syntax = "proto3";
+
+package google.spanner.emulator.frontend.persistence;
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "google/spanner/v1/type.proto";
+
+// The payloads of log records and of the checkpoint (--data_dir). Records
+// hold resolved physical effects: replay never evaluates SQL, defaults,
+// generated columns or backfills. Databases and instances are identified by
+// incarnation, never reused, so a dropped database stays dropped even if one
+// with the same name is created later.
+//
+// Timestamps are google.protobuf.Timestamp (seconds and nanos): Spanner
+// accepts read timestamps up to the year 9999, beyond int64 nanoseconds
+// (year 2262). Format version 1 wrote int64 Unix nanoseconds in the fields
+// marked "version 1"; they are still read when the new field is absent.
+
+// A stored value in the client wire encoding. No type means an unset value.
+message StoredValue {
+  google.spanner.v1.Type type = 1;
+  google.protobuf.Value value = 2;
+}
+
+message StoredKey {
+  repeated StoredValue columns = 1;
+  repeated bool descending = 2;
+  repeated bool nulls_last = 3;
+  bool infinity = 4;
+  bool prefix_limit = 5;
+}
+
+// One storage write or ClosedOpen range delete.
+message StorageOp {
+  message Write {
+    StoredKey key = 1;
+    repeated string column_ids = 2;
+    repeated StoredValue values = 3;
+  }
+  message Delete {
+    StoredKey start = 1;
+    StoredKey limit = 2;
+  }
+  string table_id = 1;
+  oneof op {
+    Write write = 2;
+    Delete delete = 3;
+  }
+}
+
+// A schema as its DDL, with the storage IDs its objects had.
+message SchemaState {
+  repeated string ddl = 1;
+  bytes proto_descriptors = 2;
+  map<string, string> table_ids = 3;
+  map<string, string> column_ids = 4;
+  map<string, string> sequence_ids = 5;
+  int64 next_table_seq = 6;
+  int64 next_column_seq = 7;
+}
+
+message InstanceState {
+  uint64 incarnation = 1;
+  string uri = 2;
+  string config = 3;
+  string display_name = 4;
+  int32 processing_units = 5;
+  map<string, string> labels = 6;
+}
+
+message DatabaseState {
+  uint64 incarnation = 1;
+  uint64 instance_incarnation = 2;
+  string uri = 3;
+  int64 create_time_nanos = 4;  // version 1
+  SchemaState schema = 5;
+  google.protobuf.Timestamp create_time = 6;
+}
+
+message Commit {
+  uint64 database = 1;
+  repeated StorageOp ops = 2;
+}
+
+message SchemaChange {
+  uint64 database = 1;
+  SchemaState schema = 2;
+  // Backfill writes.
+  repeated StorageOp ops = 3;
+}
+
+message SequenceReservation {
+  string sequence_id = 1;
+  // Counter values below this may have been handed out.
+  int64 end = 2;
+}
+
+message Record {
+  // The commit timestamp. Absent for sequence reservations and clock leases,
+  // whose effect (a maximum) does not depend on their order.
+  google.protobuf.Timestamp timestamp = 10;
+  int64 timestamp_nanos = 1;  // version 1; zero if absent
+  oneof effect {
+    Commit commit = 2;
+    SchemaChange schema_change = 3;
+    InstanceState create_instance = 4;
+    uint64 drop_instance = 5;
+    DatabaseState create_database = 6;
+    uint64 drop_database = 7;
+    SequenceReservation sequence_reservation = 8;
+    // No timestamp above this was handed out before it was extended.
+    google.protobuf.Timestamp clock_lease = 11;
+    int64 clock_lease_nanos = 9;  // version 1
+  }
+}
+
+message TableRows {
+  message Row {
+    StoredKey key = 1;
+    // Aligned with column_ids.
+    repeated StoredValue values = 2;
+  }
+  string table_id = 1;
+  repeated string column_ids = 2;
+  repeated Row rows = 3;
+}
+
+message DatabaseCheckpoint {
+  DatabaseState database = 1;
+  repeated TableRows tables = 2;
+}
+
+message Checkpoint {
+  // At or above every timestamp handed out before the capture.
+  google.protobuf.Timestamp clock_high = 7;
+  int64 clock_high_nanos = 1;  // version 1
+  // The rows are as of this timestamp.
+  google.protobuf.Timestamp data_timestamp = 8;
+  int64 data_timestamp_nanos = 2;  // version 1
+  uint64 next_incarnation = 3;
+  repeated InstanceState instances = 4;
+  repeated DatabaseCheckpoint databases = 5;
+  map<string, int64> sequence_reservations = 6;
+}

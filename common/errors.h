@@ -148,6 +148,8 @@ absl::Status AbortCurrentTransaction(backend::TransactionID holder_id,
 absl::Status WoundedTransaction(backend::TransactionID id);
 absl::Status CouldNotObtainLockHandleMutex(backend::TransactionID id);
 absl::Status CouldNotObtainTransactionMutex(backend::TransactionID id);
+absl::Status AbortReadSetConflict(backend::TransactionID id);
+absl::Status AbortInjectedAtCommit(backend::TransactionID id);
 absl::Status TransactionNotFound(backend::TransactionID id);
 absl::Status TransactionClosed(backend::TransactionID id);
 absl::Status InvalidTransactionID(backend::TransactionID id);
@@ -176,6 +178,9 @@ absl::Status CannotRollbackAfterCommit();
 absl::Status CannotReadOrQueryAfterCommitOrRollback();
 absl::Status CannotUseTransactionAfterConstraintError();
 absl::Status ReadTimestampPastVersionGCLimit(absl::Time timestamp);
+absl::Status ReadTimestampBeforeRestart(absl::Time timestamp,
+                                        absl::Time restart);
+absl::Status PostgreSQLDatabaseNotPersisted();
 absl::Status ReadTimestampTooFarInFuture(absl::Time timestamp);
 absl::Status AbortDueToConcurrentSchemaChange(backend::TransactionID id);
 absl::Status AbortReadWriteTransactionOnFirstCommit(backend::TransactionID id);

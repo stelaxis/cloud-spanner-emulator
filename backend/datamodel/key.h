@@ -97,6 +97,10 @@ class Key {
   // Returns true if the key does not have any columns.
   bool IsEmpty() const { return columns_.empty(); }
 
+  // Whether this is Infinity(), or a key made by ToPrefixLimit().
+  bool is_infinity() const { return is_infinity_; }
+  bool is_prefix_limit() const { return is_prefix_limit_; }
+
   // Returns the logical size of the key in bytes.
   int64_t LogicalSizeInBytes() const;
 

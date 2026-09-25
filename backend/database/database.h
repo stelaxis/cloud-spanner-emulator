@@ -17,19 +17,23 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_DATABASE_DATABASE_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_DATABASE_DATABASE_H_
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "google/spanner/admin/database/v1/common.pb.h"
 #include "googlesql/public/type.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/time.h"
 #include "absl/types/variant.h"
 #include "backend/actions/manager.h"
 #include "backend/common/ids.h"
+#include "backend/database/database_log.h"
 #include "backend/database/change_stream/change_stream_partition_churner.h"
 #include "backend/database/pg_oid_assigner/pg_oid_assigner.h"
 #include "backend/locking/manager.h"
@@ -55,14 +59,56 @@ namespace database_api = ::google::spanner::admin::database::v1;
 //
 // Database largely ties together various subsystems - transactions, locking,
 // schemas, queries, storage etc. and acts as a container for these subsystems.
+class ScopedSchemaChangeLock;
+
+// The storage IDs of a schema's tables (including index and change stream
+// tables), columns and sequences, keyed by the names the schema updater
+// generates them from: table name, "table.column" and sequence name.
+struct SchemaIds {
+  absl::flat_hash_map<std::string, TableID> tables;
+  absl::flat_hash_map<std::string, ColumnID> columns;
+  absl::flat_hash_map<std::string, std::string> sequences;
+
+  bool operator==(const SchemaIds& other) const = default;
+};
+
+SchemaIds CollectSchemaIds(const Schema* schema);
+
+// A database being rebuilt from the persisted DDL of its schema: its objects
+// get their persisted IDs back, so that its stored rows map onto them.
+struct DatabaseRestore {
+  SchemaIds ids;
+  int64_t next_table_seq = 0;
+  int64_t next_column_seq = 0;
+};
+
 class Database {
  public:
   // Constructs a fully initialized database with schema created using
   // create_statements. Returns an error if create_statements are invalid, or if
   // failed to create the database.
+  //
+  // With `log` (--data_dir), commits and schema changes are logged there.
+  // With `restore`, the schema is rebuilt with the given IDs; it fails if the
+  // rebuilt schema's IDs differ.
   static absl::StatusOr<std::unique_ptr<Database>> Create(
       Clock* clock, std::string_view database_id,
-      const SchemaChangeOperation& schema_change_operation);
+      const SchemaChangeOperation& schema_change_operation,
+      std::unique_ptr<DatabaseLog> log = nullptr,
+      const DatabaseRestore* restore = nullptr);
+
+  // Where commits and schema changes are logged, or null without --data_dir.
+  DatabaseLog* log() const { return log_.get(); }
+
+  // The latest schema and the ID allocator positions (--data_dir).
+  PersistedSchema GetPersistedSchema();
+
+  // The storage, for loading recovered rows and capturing checkpoints.
+  Storage* storage() { return storage_.get(); }
+
+  // Refuses reads before `floor`: data from before a restart is not
+  // retained. Set before the database is used.
+  void SetRestartFloor(absl::Time floor);
 
   // Creates a read only transaction attached to this database.
   absl::StatusOr<std::unique_ptr<ReadOnlyTransaction>>
@@ -110,6 +156,10 @@ class Database {
   // Retrives the current version of the schema.
   const Schema* GetLatestSchema() const;
 
+  // The latest schema, owned: a schema change can publish newer schemas and
+  // garbage-collect this one while the caller still uses it.
+  std::shared_ptr<const Schema> GetLatestSchemaShared() const;
+
   // Used to execute queries against the database.
   QueryEngine* query_engine() { return query_engine_.get(); }
 
@@ -122,6 +172,12 @@ class Database {
 
   PgOidAssigner* get_pg_oid_assigner() { return pg_oid_assigner_.get(); }
 
+  // Runs `hook` in every schema change after it has read the new schema and
+  // before it reconciles change stream churners with it. For tests.
+  void set_before_churner_update_hook_for_testing(std::function<void()> hook) {
+    before_churner_update_hook_ = std::move(hook);
+  }
+
  private:
   Database();
   // Delete copy and assignment operators since database shouldn't be copyable.
@@ -130,8 +186,27 @@ class Database {
 
   SchemaChangeContext GetSchemaChangeContext();
 
+  // Applies a schema change while `lock` holds the commit critical section.
+  absl::Status ApplySchemaChangeLocked(
+      const SchemaChangeOperation& schema_change_operation,
+      ScopedSchemaChangeLock& lock, int* num_succesful_statements,
+      absl::Time* commit_timestamp, absl::Status* backfill_status);
+
+  // Serializes whole schema changes, including the change stream churner
+  // reconciliation that runs after the commit critical section is released.
+  absl::Mutex schema_change_mu_;
+
+  // See set_before_churner_update_hook_for_testing. Set before concurrent use.
+  std::function<void()> before_churner_update_hook_;
+
   // Clock to provide commit timestamps.
   Clock* clock_;
+
+  // With --data_dir, where commits and schema changes are logged.
+  std::unique_ptr<DatabaseLog> log_;
+
+  // Reads before this timestamp are refused (see SetRestartFloor).
+  absl::Time restart_floor_ = absl::InfinitePast();
 
   // Holds the database id.
   std::string database_id_;

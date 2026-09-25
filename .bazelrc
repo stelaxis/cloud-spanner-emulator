@@ -15,9 +15,36 @@ build --python_version=PY3
 build --incompatible_use_python_toolchains=false
 build --action_env=PYTHON_BIN=/usr/bin/python3
 
+# Apply build:linux on Linux hosts and build:macos on macOS hosts.
+common --enable_platform_specific_config
+
 # Prevent ld.gold AArch64 internal crash on Cortex-A53 erratum 843419 (PR gold/21868)
-build --linkopt=-Wl,--no-fix-cortex-a53-843419
-build --host_linkopt=-Wl,--no-fix-cortex-a53-843419
+# GNU ld/gold only; Apple's ld64 rejects it.
+build:linux --linkopt=-Wl,--no-fix-cortex-a53-843419
+build:linux --host_linkopt=-Wl,--no-fix-cortex-a53-843419
+
+# macOS: build C/C++ with apple_support's Xcode toolchain; the autoconfigured
+# bazel_tools one rejects Xcode 16+'s implicit SDKSettings.json compile input.
+# The macOS-only repos below are named canonically (Bazel 7 "~" form) so that
+# MODULE.bazel needs no new bazel_dep: that would reorder toolchain registration
+# for every platform, Linux included.
+build:macos --extra_toolchains=@@apple_support~~apple_cc_configure_extension~local_config_apple_cc_toolchains//:all
+# Otherwise the deployment target defaults to the SDK version, so binaries
+# would refuse to run on any macOS older than the Xcode that built them.
+build:macos --macos_minimum_os=14.0
+build:macos --host_macos_minimum_os=14.0
+
+# macOS: use the system make and pkg-config for rules_foreign_cc (ICU's
+# configure_make) instead of bootstrapping them. The bootstraps are exec-config
+# builds, where Bazel always strips, and apple_support's STRIP_DEBUG_SYMBOLS
+# link flag breaks their configure probes (they link without -o, so strip gets
+# an empty path).
+build:macos --extra_toolchains=@@rules_foreign_cc~//toolchains:preinstalled_make_toolchain
+build:macos --extra_toolchains=@@rules_foreign_cc~//toolchains:preinstalled_pkgconfig_toolchain
+# The default --strip=sometimes strips fastbuild links, and apple_support's
+# STRIP_DEBUG_SYMBOLS then fails ICU's configure probes in the target config the
+# same way. -c opt (the release build) never strips.
+build:macos --strip=never
 
 # =============================================================================
 # 2. COMPILER COMPATIBILITY (GCC 11+ FIXES)

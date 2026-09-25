@@ -16,11 +16,14 @@
 
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_SCHEMA_CATALOG_SEQUENCE_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_SCHEMA_CATALOG_SEQUENCE_H_
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
 #include "googlesql/public/type.h"
 #include "absl/base/thread_annotations.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/memory/memory.h"
 #include "absl/status/status.h"
 #include "absl/synchronization/mutex.h"
@@ -69,6 +72,27 @@ class Sequence : public SchemaNode {
   // the key should be a unique id for the sequence across all databases.
   inline static absl::flat_hash_map<std::string, int64_t> SequenceLastValues
       ABSL_GUARDED_BY(SequenceMutex);
+  inline static std::function<absl::Status(const std::string&, int64_t)>
+      reservation_hook_ ABSL_GUARDED_BY(SequenceMutex);
+  inline static absl::flat_hash_map<std::string, int64_t> reservation_ends_
+      ABSL_GUARDED_BY(SequenceMutex);
+
+  // With --data_dir, a counter value is handed out only below a durable
+  // reservation end, which the hook makes durable before returning. After a
+  // restart the counter resumes at the reservation end, so no value is handed
+  // out twice (the rest of the reserved range is skipped).
+  using ReservationHook =
+      std::function<absl::Status(const std::string& sequence_id, int64_t end)>;
+  static void SetReservationHook(ReservationHook hook)
+      ABSL_LOCKS_EXCLUDED(SequenceMutex);
+
+  // Resumes a recovered sequence at its durable reservation end.
+  static void RestoreReservation(const std::string& sequence_id, int64_t end)
+      ABSL_LOCKS_EXCLUDED(SequenceMutex);
+
+  // The durable reservation end of every sequence that has one.
+  static absl::flat_hash_map<std::string, int64_t> ReservationEnds()
+      ABSL_LOCKS_EXCLUDED(SequenceMutex);
 
   // Returns the next sequence value according to the sequence kind.
   absl::StatusOr<googlesql::Value> GetNextSequenceValue() const
@@ -83,6 +107,10 @@ class Sequence : public SchemaNode {
 
   // Remove the sequence from the last values map.
   void RemoveSequenceFromLastValuesMap() const
+      ABSL_LOCKS_EXCLUDED(SequenceMutex);
+
+  // Forgets the counter and reservation of the sequence with this ID.
+  static void ForgetState(const std::string& sequence_id)
       ABSL_LOCKS_EXCLUDED(SequenceMutex);
 
   // SchemaNode interface implementation.

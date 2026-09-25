@@ -17,7 +17,13 @@
 #include "common/clock.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <utility>
 
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 
@@ -25,29 +31,68 @@ namespace google {
 namespace spanner {
 namespace emulator {
 
-namespace {
+Clock::Clock() : Clock([]() { return absl::Now(); }) {}
 
-// Returns the current time at microsecond granularity.
-absl::Time NowMicros() {
-  return absl::FromUnixMicros(absl::ToUnixMicros(absl::Now()));
+Clock::Clock(std::function<absl::Time()> system_now)
+    : system_now_(std::move(system_now)),
+      last_system_time_(SystemNowMicros()),
+      last_dispensed_time_(last_system_time_) {}
+
+absl::Time Clock::SystemNowMicros() const {
+  return absl::FromUnixMicros(absl::ToUnixMicros(system_now_()));
 }
-
-}  // namespace
-
-Clock::Clock()
-    : last_system_time_(NowMicros()), last_dispensed_time_(last_system_time_) {}
 
 absl::Time Clock::Now() {
   absl::MutexLock lock(mu_);
 
-  absl::Time now = NowMicros();
-  absl::Time next_dispensed_time =
-      last_dispensed_time_ +
-      std::max(absl::Microseconds(1), now - last_system_time_);
+  // Follow the system clock, stepping by one microsecond only when it has not
+  // passed the last value handed out. Timestamps can run ahead of the system
+  // clock during a burst of calls within one microsecond, or after it steps
+  // back, but only until it catches up: the lead does not accumulate. Adding
+  // the elapsed system time to the last value instead let every step add up
+  // to permanent drift, which read timestamps then waited out (upstream issue
+  // #277).
+  absl::Time now = SystemNowMicros();
+  if (now <= last_dispensed_time_) {
+    last_dispensed_time_ += absl::Microseconds(1);
+  } else {
+    last_dispensed_time_ = now;
+  }
   last_system_time_ = now;
-  last_dispensed_time_ = next_dispensed_time;
 
+  if (last_dispensed_time_ > lease_) ExtendLeaseLocked(last_dispensed_time_);
   return last_dispensed_time_;
+}
+
+void Clock::ExtendLeaseLocked(absl::Time needed) {
+  absl::StatusOr<absl::Time> lease = extend_lease_(needed);
+  if (!lease.ok() || *lease < needed) {
+    std::fprintf(stderr, "Cannot extend the durable clock lease: %s\n",
+                 lease.status().ToString().c_str());
+    std::abort();
+  }
+  lease_ = std::max(lease_, *lease);
+}
+
+void Clock::AdvanceTo(absl::Time floor) {
+  absl::MutexLock lock(mu_);
+  if (last_dispensed_time_ < floor) last_dispensed_time_ = floor;
+}
+
+void Clock::SetLease(absl::Time lease, LeaseExtender extend) {
+  absl::MutexLock lock(mu_);
+  lease_ = lease;
+  extend_lease_ = std::move(extend);
+}
+
+void Clock::CoverWithLease(absl::Time timestamp) {
+  absl::MutexLock lock(mu_);
+  if (extend_lease_ && timestamp > lease_) ExtendLeaseLocked(timestamp);
+}
+
+absl::Time Clock::lease() {
+  absl::MutexLock lock(mu_);
+  return lease_;
 }
 
 }  // namespace emulator

@@ -142,9 +142,10 @@ class QueryEngine {
   googlesql::TypeFactory* type_factory() const { return type_factory_; }
 
   const FunctionCatalog* function_catalog() const { return &function_catalog_; }
+  FunctionCatalog* mutable_function_catalog() { return &function_catalog_; }
 
-  void SetLatestSchemaForFunctionCatalog(const Schema* schema) {
-    function_catalog_.SetLatestSchema(schema);
+  void SetLatestSchemaForFunctionCatalog(std::shared_ptr<const Schema> schema) {
+    function_catalog_.SetLatestSchema(std::move(schema));
   }
 
  private:

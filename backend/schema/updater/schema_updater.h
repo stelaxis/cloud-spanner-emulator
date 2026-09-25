@@ -23,6 +23,7 @@
 
 #include "google/spanner/admin/database/v1/common.pb.h"
 #include "googlesql/public/type.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
@@ -73,6 +74,14 @@ struct SchemaChangeContext {
 
   // The database id for the schema change.
   std::string database_id;
+
+  // Sequence IDs by sequence name, used instead of fresh ones when a schema
+  // is rebuilt from its DDL on recovery (--data_dir).
+  const absl::flat_hash_map<std::string, std::string>* sequence_ids = nullptr;
+
+  // If set, receives the ID of every sequence the change creates, including
+  // ones a later statement of the same change drops.
+  std::vector<std::string>* created_sequence_ids = nullptr;
 };
 
 // The result of processing a set of DDL statements for a schema change request.
@@ -132,7 +141,10 @@ class SchemaUpdater {
       const Schema* existing_schema = nullptr);
 
  private:
-  absl::Status RunPendingActions(int* num_succesful);
+  // Runs each statement's actions in turn. A statement whose actions fail
+  // has its writes to `storage` at `timestamp` undone.
+  absl::Status RunPendingActions(int* num_succesful, Storage* storage,
+                                 absl::Time timestamp);
 
   std::vector<SchemaValidationContext> pending_work_;
 

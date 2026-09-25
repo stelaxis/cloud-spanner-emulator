@@ -246,8 +246,7 @@ absl::Status DeleteInstance(RequestContext* ctx,
   }
 
   // Clean up the instance.
-  ctx->env()->instance_manager()->DeleteInstance(request->name());
-  return absl::OkStatus();
+  return ctx->env()->instance_manager()->DeleteInstance(request->name());
 }
 REGISTER_GRPC_HANDLER(InstanceAdmin, DeleteInstance);
 

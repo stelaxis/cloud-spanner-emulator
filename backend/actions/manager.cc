@@ -58,7 +58,11 @@ namespace backend {
 
 absl::Status ActionRegistry::ExecuteValidators(const ActionContext* ctx,
                                                const WriteOp& op) {
-  for (auto& validator : table_validators_[TableOf(op)]) {
+  auto it = table_validators_.find(TableOf(op));
+  if (it == table_validators_.end()) {
+    return absl::OkStatus();
+  }
+  for (const auto& validator : it->second) {
     GOOGLESQL_RETURN_IF_ERROR(validator->Validate(ctx, op));
   }
   return absl::OkStatus();
@@ -66,7 +70,11 @@ absl::Status ActionRegistry::ExecuteValidators(const ActionContext* ctx,
 
 absl::Status ActionRegistry::ExecuteEffectors(const ActionContext* ctx,
                                               const WriteOp& op) {
-  for (auto& effector : table_effectors_[TableOf(op)]) {
+  auto it = table_effectors_.find(TableOf(op));
+  if (it == table_effectors_.end()) {
+    return absl::OkStatus();
+  }
+  for (const auto& effector : it->second) {
     GOOGLESQL_RETURN_IF_ERROR(effector->Effect(ctx, op));
   }
   return absl::OkStatus();
@@ -76,19 +84,21 @@ absl::Status ActionRegistry::ExecuteEvaluatedKeyEffectors(
     const MutationOp& op,
     std::vector<std::vector<googlesql::Value>>* evaluated_values,
     std::vector<const Column*>* columns_with_evaluated_values) {
-  if (table_evaluated_key_effectors_.find(op.table) ==
-      table_evaluated_key_effectors_.end()) {
+  auto it = table_evaluated_key_effectors_.find(op.table);
+  if (it == table_evaluated_key_effectors_.end()) {
     return absl::OkStatus();
   }
-
-  GOOGLESQL_RETURN_IF_ERROR(table_evaluated_key_effectors_[op.table]->Effect(
-      op, evaluated_values, columns_with_evaluated_values));
-  return absl::OkStatus();
+  return it->second->Effect(op, evaluated_values,
+                            columns_with_evaluated_values);
 }
 
 absl::Status ActionRegistry::ExecuteModifiers(const ActionContext* ctx,
                                               const WriteOp& op) {
-  for (auto& modifier : table_modifiers_[TableOf(op)]) {
+  auto it = table_modifiers_.find(TableOf(op));
+  if (it == table_modifiers_.end()) {
+    return absl::OkStatus();
+  }
+  for (const auto& modifier : it->second) {
     GOOGLESQL_RETURN_IF_ERROR(modifier->Modify(ctx, op));
   }
   return absl::OkStatus();
@@ -96,7 +106,11 @@ absl::Status ActionRegistry::ExecuteModifiers(const ActionContext* ctx,
 
 absl::Status ActionRegistry::ExecuteVerifiers(const ActionContext* ctx,
                                               const WriteOp& op) {
-  for (auto& verifier : table_verifiers_[TableOf(op)]) {
+  auto it = table_verifiers_.find(TableOf(op));
+  if (it == table_verifiers_.end()) {
+    return absl::OkStatus();
+  }
+  for (const auto& verifier : it->second) {
     GOOGLESQL_RETURN_IF_ERROR(verifier->Verify(ctx, op));
   }
   return absl::OkStatus();
@@ -233,10 +247,10 @@ void ActionManager::AddActionsForSchema(const Schema* schema,
   absl::MutexLock l(mutex_);
   latest_schema_ = schema;
   registry_ =
-      std::make_unique<ActionRegistry>(schema, function_catalog, type_factory);
+      std::make_shared<ActionRegistry>(schema, function_catalog, type_factory);
 }
 
-absl::StatusOr<ActionRegistry*> ActionManager::GetActionsForSchema(
+absl::StatusOr<std::shared_ptr<ActionRegistry>> ActionManager::GetActionsForSchema(
     const Schema* schema) const {
   absl::MutexLock l(mutex_);
   if (latest_schema_ != schema) {
@@ -244,7 +258,7 @@ absl::StatusOr<ActionRegistry*> ActionManager::GetActionsForSchema(
         absl::StrCat("Schema generation ", schema->generation(),
                      " was not registered with the Action Manager"));
   }
-  return registry_.get();
+  return registry_;
 }
 
 }  // namespace backend

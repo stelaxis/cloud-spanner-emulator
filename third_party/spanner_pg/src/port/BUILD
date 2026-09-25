@@ -72,8 +72,14 @@ filegroup(
         "quotes.c",
         "snprintf.c",
         "strerror.c",
-        "strlcat.c",
-        "strlcpy.c",
+    ] + select({
+        # libSystem has strlcat and strlcpy.
+        "@platforms//os:macos": [],
+        "//conditions:default": [
+            "strlcat.c",
+            "strlcpy.c",
+        ],
+    }) + [
         "tar.c",
         "thread.c",
         "timingsafe_bcmp.c",
