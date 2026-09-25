@@ -47,8 +47,9 @@ git fetch upstream --tags && git merge vX.Y.Z
 
 PRs to master build both architectures without publishing. PRs and master pushes
 run the full upstream unit/conformance selection on native amd64 in eight parallel
-area shards. Each shard loads the builder independently, with a six-hour job
-budget: up to 75 minutes for loading, 255 for tests, and 30 for setup/log cleanup.
+area shards. Each shard downloads the compiled amd64 builder from the current run,
+with a six-hour job budget: up to 20 minutes to download, 30 to load, 285 for tests,
+and 25 for setup/log cleanup. Loading is only `docker load`, with no build fallback.
 The required `Upstream unit and conformance tests` aggregate fails unless **every
 shard succeeds**, including when the matrix is skipped by a failed build.
 
@@ -80,25 +81,43 @@ for `tests/gcloud`. Tests run via `docker run`, so BuildKit cannot clip their lo
 Failures upload `bazel-testlogs-<area>` and the full console log for seven days.
 Build and test job summaries include `df -h`, including after loading the builder
 and before test-container cleanup. Tests use the builder's compiled dependencies;
-there is no separate Bazel disk cache or test-image cache export. Cold test work
-is divided across runners rather than relying on partial snapshots after timeout.
+the image includes `/src` and `/root/.cache/bazel` in ordinary layers, and Bazel
+is shut down before export. Build and test use the same working directory, user,
+Bazel version, `-c opt` and `BAZEL_JOBS`. Only test-specific actions need compiling.
+There is no separate Bazel disk cache or per-shard Docker build.
 
-Separate native jobs checkpoint gRPC/protobuf (`rpc-deps`), GoogleSQL (`deps`),
-and the runtime build, each with a six-hour budget. The GoogleSQL job exports
-`deps-value`, `deps-parser`, `deps-resolved-ast`, and `deps-resolver` in sequence
-before building/exporting the public analyzer in `deps`. Each architecture has
-its own GitHub Actions `mode=max` cache scopes, with nonfatal exports after every
-checkpoint. A later timeout retains completed exports for a retry. A missing or
-evicted build-stage cache during test-image loading requires a native build rerun.
+Native jobs build gRPC/protobuf (`rpc-deps`), GoogleSQL (`deps`), and the runtime,
+each with a six-hour budget. GoogleSQL still builds value, parser, resolved AST,
+resolver and analyzer in order on one runner. RPC and GoogleSQL jobs each export
+one complete BuildKit local cache (`mode=max`, zstd) as an artifact for the next
+job. Export/upload failure fails the producer; artifacts contain both the manifest
+and every referenced layer. `Build (amd64)` also exports `test-builder` from its
+live BuildKit builder, adds the pinned Google Cloud CLI, and uploads a gzip image
+archive. All eight test shards load that same archive, retaining compiled outputs.
 
-The repository reports a **10 GB** cache limit (`max_cache_size_gb: 10`), not a
-verified 10-GiB allowance. **Docker layer exports on PRs and master are unchecked
-writes against that quota.** No quota guard or cache-cleanup job remains. Layer
-blobs can be shared across scopes by digest, but source changes, different refs
-and both architectures still add data. Total layer size is unmeasured; the former
-5–6-GiB estimate is not a capacity guarantee. Monitor Actions cache usage and
-evictions on the first CI runs; move checkpoints to registry caching if needed.
-Test shards do not export the short-lived Google Cloud CLI layer on every commit.
+This replaces all `type=gha` layer caches. Run
+[36067621737](https://github.com/stelaxis/cloud-spanner-emulator/actions/runs/36067621737)
+imported cache manifests, then all eight shards reported 16 missing layer blobs
+and rebuilt dependencies until their 75-minute builder step timed out. The
+Dockerfile had no cache mounts. The repository was near its 10-GB cache limit;
+`CACHED` metadata alone did not guarantee its layer data still existed.
+
+This workflow writes **zero compilation data to the Actions cache quota**;
+Buildx binary caching is disabled too. Dependency/builder artifacts use separate
+Actions artifact storage, expire after one day, and are replaced on job reruns.
+Cache directories
+are fresh per job, with no cross-run accumulation or prefix restore. This costs
+artifact storage/transfer and rebuilds dependencies on each new workflow run.
+Rerun all producer jobs if their artifacts have expired. A partial GoogleSQL job
+does not publish a reusable snapshot; its last successful upstream job does.
+Image archive size and runner free disk are reported in job summaries.
+
+Planning estimates from that run, excluding queue time: RPC 35–55 minutes per
+architecture; GoogleSQL 50–70 minutes amd64 / 95–115 arm64; Build 150–180 minutes
+amd64 / 260–285 arm64. These allow transfer/export overhead beyond observed
+31/35, 45/90 and 141/255-minute jobs respectively. Test shards are unmeasured:
+allow roughly 45–210 minutes each for transfer and test-only compilation/execution,
+with a 285-minute test-step ceiling. The next CI run must confirm those estimates.
 
 CI sets `BAZEL_JOBS=2` once for all builds and tests. Observed generated C++ files
 exceed 5 GiB per compiler; two workers leave room for Bazel, linking, and the OS
