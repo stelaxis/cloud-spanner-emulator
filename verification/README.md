@@ -10,8 +10,9 @@ pins down two things:
   don't abort each other, and that it accepts every history Upstream commits.
 
 The conformance harness runs the same random schedules through the emulator
-and a model and diffs every step. Today it must match **Upstream**. Once the
-emulator implements the new design, it must match **Target**.
+and a model and diffs every step. The fork's emulator implements **Target**
+(see [the implementation](#the-implementation)) and must match it; upstream
+1.5.58 matches **Upstream**.
 
 ```
 verification/
@@ -27,6 +28,7 @@ verification/
     TxnSpec/Counterexamples.lean   design variants that break a property, checked by `decide`
     TxnSpec/Json.lean, TxnModel.lean   the `txnmodel` executable
   conformance/             Go harness (raw gRPC), one driver goroutine
+  stress/                  Go-client bank-transfer stress test, 16 workers
 ```
 
 ## What is modelled
@@ -200,6 +202,122 @@ These examples show behaviour that is correct, but conservative:
   This affects only Target conflict detection (it adds a write), never results.
 * **Isolation level.** Only `SERIALIZABLE`; `REPEATABLE_READ` is out of scope.
 
+## The implementation
+
+The fork's emulator implements Target. Where each rule lives:
+
+| Target rule | C++ |
+|---|---|
+| No lock slot; lock requests never block or abort | `LockHandle::EnqueueLock` records reads only (`backend/locking/handle.cc:41`) |
+| Snapshot at the first data operation, not at `BeginTransaction` | `ReadWriteTransaction::AcquireSnapshot` (`backend/transaction/read_write_transaction.cc:343`), called from `Read` and `Write`; `LockHandle::SnapshotTimestamp` (`backend/locking/handle.cc:75`) |
+| The snapshot is never ahead of a commit still flushing | `LockManager::PickSnapshotTimestamp` takes a fresh timestamp, then `WaitForSafeRead` waits for every pending commit at or before it (`backend/locking/manager.cc:56,73`) |
+| Reads at the snapshot, overlaid by the buffer | `TransactionStore::ReadTimestamp` replaces `InfiniteFuture` in every storage read (`backend/transaction/transaction_store.cc:97`) |
+| Read set = key ranges scanned (`fp`), not rows returned | `TransactionStore::AcquireReadLock` (`transaction_store.cc:77`), including `RowExistsInStorage` (`:370`); index, FK and interleave checks read through `Lookup`/`Read`, so they are covered |
+| `fp (.commit ms)`: every mutation's row, before any is applied | `ReadWriteTransaction::RecordMutationReads` (`read_write_transaction.cc:354`) |
+| Commit: validate, then take a timestamp, atomically | `LockHandle::Commit` (`backend/locking/handle.cc:124`): under the commit mutex, `ReadSetIsStaleLocked` (`:100`), `ReserveCommitTimestamp`, flush, `MarkCommitted` |
+| `stale`: a commit after the snapshot wrote a row in the read set | `Storage::HasVersionsAfter` (`backend/storage/in_memory_storage.cc:238`) |
+| Every write of a commit is a version, including a cancelled insert-then-delete | `TransactionStore::GetCancelledWrites` (`transaction_store.cc:448`) and `Storage::MarkWritten` (`in_memory_storage.cc:226`) |
+| `errCode` / `target_errors_latest`: a constraint error on a stale read set is `ABORTED` | `AbortIfReadSetStale` for `Write` and `Commit` (`read_write_transaction.cc:409,504`); DML errors raised by the query engine, `MaybeAbortOnStaleReads` (`read_write_transaction.cc:422`, called at `frontend/entities/transaction.cc:240`) |
+| Strictly increasing commit timestamps; RO reads unchanged | `LockManager::ReserveCommitTimestamp` (`manager.cc:40`); pending commits are a set, and a read at or after a pending commit's timestamp waits for it |
+| `sqlSpan` with `pushdown` | `ComputeScanKeySets` (`backend/query/key_narrowing.cc:581`), set per statement at `backend/query/query_engine.cc:1431,1464`; flag `--enable_query_key_pushdown` (default on) |
+| `fp (.dmlInsert ..)`: the inserted row | `InsertedKeys` (`key_narrowing.cc:401`), independent of the pushdown flag |
+
+Beyond the model:
+
+* **Schema changes** hold the commit mutex exclusively
+  (`backend/database/database.cc:172`). They wait for a commit in flight but no
+  longer fail because read-write transactions are open. Those abort on their
+  next operation or at commit.
+* **Partitioned DML and `BatchWrite`** run through the same `Commit`.
+* **`--abort_current_transaction_probability`** now aborts that percentage of
+  read-write commits at random, for testing retry loops (default 0,
+  `common/config.cc:47`). The gateway forwards it and
+  `--enable_query_key_pushdown` to `emulator_main`.
+* **Pushdown also serves GoogleSQL column filters**
+  (`EvaluatorTableIterator::SetColumnFilterMap`,
+  `backend/query/queryable_table.cc:95`) for scans the statement analysis
+  leaves alone, such as a table scanned twice. Column filters are inclusive,
+  so those key sets can be wider than the predicate, never narrower.
+  Contradictory bounds read nothing rather than an inverted range
+  (`key_narrowing.cc:149`).
+* **Columns**: read sets are per row, like the model; a write to any column
+  of a row conflicts with any read of the row.
+* **Pending commits** are a set; a read waits while its minimum is at or
+  before the read timestamp. Commits run one at a time under the commit
+  mutex, so it holds at most one entry.
+* **Schema changes vs transactions**: a schema change can publish newer
+  schemas and garbage-collect old ones while transactions still use them, so
+  everything that uses a schema owns it:
+  * A read-write transaction owns its schema and action registry. Before its
+    first data operation it hands out the latest schema and keeps it; that
+    operation runs on it, or aborts if a schema change replaced it after it
+    was handed out.
+  * A read-only transaction owns the schema at its read timestamp.
+  * Read cursors own the schema their columns belong to.
+  * Sequence and time zone functions evaluate against the latest schema, as
+    upstream does, and hold the one they loaded until they are done.
+  * The process-wide PostgreSQL system catalog takes only schemas its source
+    catalog owns, never a schema change's intermediate schema, which is
+    destroyed when the change finishes.
+  * Admin handlers (`GetDatabaseDdl`, instance partitions) hold the latest
+    schema through `Database::GetLatestSchemaShared`.
+
+  Whole schema changes are serialized by their own mutex, which also orders
+  change stream churner updates.
+
+One deviation from the model (the model has no such columns):
+
+* A mutation whose key column has a default or generated value cannot be put
+  in the read set before the mutations are applied, because evaluating the key
+  can have side effects (sequences). Its row joins the read set when the
+  mutation is flattened. If an earlier mutation of the same `Write` or
+  `Commit` fails first, the error is validated against the whole table instead
+  (`ReadWriteTransaction::AbortIfReadSetStale`). So the error becomes
+  `ABORTED` whenever validating the row would have made it `ABORTED`, and also
+  when a commit after the snapshot wrote any other row of that table.
+
+### Stress test
+
+`verification/stress` runs 16 goroutines through the Go client
+(`cloud.google.com/go/spanner` v1.88, whose read-write transactions use
+multiplexed sessions) with its retry loop, 15 s per workload, and checks every
+balance against the committed transfers:
+
+* `contended`: transfers among 4 accounts, written with `UPDATE ... WHERE
+  Id = @id`.
+* `disjoint`: each worker transfers between its own 2 accounts.
+* `mux282`: inserts through an explicit `BeginTransaction` plus buffered
+  mutations (the pattern of upstream issue #282, whose writes were silently
+  lost), then checks that every committed row exists.
+
+```sh
+cd verification/stress
+SPANNER_EMULATOR_HOST=localhost:19011 mise exec go@1.25 -- go run . -workers 16
+mise exec go@1.25 -- go run . -image gcr.io/cloud-spanner-emulator/emulator:1.5.58 -abort-probability 0
+```
+
+| Emulator | Workload | Committed txn/s | Aborted attempts per commit |
+|---|---|---|---|
+| fork, native, pushdown on | contended | 498 | 0.81 |
+| | disjoint | 4,068 | **0** |
+| | mux282 | 10,740 | **0** |
+| 1.5.58 image, probability 0 | contended | 55 | 1.55 |
+| | disjoint | 105 | 0.89 |
+| | mux282 | 279 | 7.59 |
+| 1.5.58 image, probability 20 | contended | 209 | 1.23 |
+| | disjoint | 146 | 1.35 |
+
+Every run kept the total balance and every account's balance, and lost no
+committed row. With `--abort_current_transaction_probability=20`, the fork's
+disjoint workload aborts 19.9% of attempts, all injected. The 1.5.58 figures
+come from its Linux image under Docker on the same machine, so they include
+the VM's overhead. Its `mux282` run at probability 20 did not finish: after
+the writers stopped, a strong read of one row blocked for more than ten
+minutes (not diagnosed further).
+
+Issue #282 does not reproduce on the fork: 161,111 concurrent #282-pattern
+commits, none lost.
+
 ## Running
 
 ### Proofs and the model executable
@@ -237,25 +355,32 @@ Results: `"ok"`, `{"rows":[[k,v],…]}`, `{"count":n}`, `{"committed":i}` (the
 
 ### Conformance
 
-The gateway does not pass `--abort_current_transaction_probability` through
-(`binaries/gateway_main.go:52-71`), so the harness runs `emulator_main`
-directly:
+The harness runs `emulator_main` directly, with
+`--abort_current_transaction_probability=0`. Against the fork, its
+`--enable_query_key_pushdown` must agree with the harness's `-pushdown`:
 
 ```sh
 cd verification/conformance
 (cd ../lean && lake build)                           # builds txnmodel
-mise exec go@1.25 -- go run . -seeds 2000            # starts the 1.5.58 image itself
-# or against a running emulator_main started with --abort_current_transaction_probability=0:
-SPANNER_EMULATOR_HOST=localhost:9010 mise exec go@1.25 -- go run . -seeds 2000
+# the fork, built natively (docs/building-on-macos.md):
+bazel-bin/binaries/emulator_main --host_port localhost:19010 \
+  --abort_current_transaction_probability=0 --enable_query_key_pushdown=false &
+SPANNER_EMULATOR_HOST=localhost:19010 mise exec go@1.25 -- go run . -seeds 3000
+# with --enable_query_key_pushdown=true (the default):
+SPANNER_EMULATOR_HOST=localhost:19011 mise exec go@1.25 -- go run . -pushdown -seeds 3000
+# upstream 1.5.58 against the Upstream model; starts the image itself:
+mise exec go@1.25 -- go run . -model upstream -seeds 2000
 ```
 
 Useful flags:
 
 | Flag | Effect |
 |---|---|
-| `-model upstream` (default) | Upstream must match; exit 1 on any mismatch. |
-| `-model target [-pushdown] -must-match=false` | Report how the emulator diverges from Target. Phase 1 drops `-must-match=false`. |
-| `-image` | The emulator image to start. |
+| `-model target` (default) | Target must match; exit 1 on any mismatch. |
+| `-model upstream` | Upstream must match. Only upstream 1.5.58 does; the fork diverges by design. |
+| `-pushdown` | Target with SQL key predicates narrowing the read set. |
+| `-must-match=false` | Report divergences without failing. |
+| `-image` | The emulator image to start when `SPANNER_EMULATOR_HOST` is unset. |
 | `-print -first-seed N` | Print seed `N`'s schedule. |
 | `-schedule file.jsonl` | Replay one schedule and print the step-by-step diff. |
 | `-dump file.jsonl` | Save the shrunk failing schedule. |
@@ -280,6 +405,27 @@ mutations, then prints it.
 
 ## Results
 
+### The fork
+
+`emulator_main` built natively on macOS arm64 from this branch,
+`--abort_current_transaction_probability=0`, seeds 1–3000:
+
+| Model | `--enable_query_key_pushdown` | Schedules | Steps | Mismatching schedules | `ABORTED` (emulator / model) |
+|---|---|---|---|---|---|
+| `target` | `false` | 3000 | 49,332 | **0** | 726 / 726 |
+| `target -pushdown` | `true` | 3000 | 49,332 | **0** | 607 / 607 |
+
+Upstream mode now diverges, as intended. Seeds 1–1000 against `-model
+upstream`: 535 of 1000 schedules mismatch; the emulator aborts 225 times, the
+Upstream model 2,269. At every first divergence the Upstream model aborts for
+the lock slot where the fork proceeds. Crossing the pushdown settings
+(emulator with pushdown, Target model without) mismatches 36 of 1000
+schedules. At each, the model aborts where the emulator, whose read set is
+narrower, commits or reports a constraint error. So the runs above do
+exercise pushdown.
+
+### Upstream 1.5.58
+
 Emulator `gcr.io/cloud-spanner-emulator/emulator:1.5.58`, `emulator_main
 --abort_current_transaction_probability=0`, seeds 1–2000:
 
@@ -292,7 +438,7 @@ Emulator `gcr.io/cloud-spanner-emulator/emulator:1.5.58`, `emulator_main
 
 Upstream matches every step. In every one of the 1,104 Target divergences,
 the first diverging step is the emulator returning `ABORTED` where Target
-proceeds. That is the Phase 1 gap: the emulator aborts transactions because of
+proceeds. That was the gap the fork closes: 1.5.58 aborts transactions because of
 the single lock slot, and Target does not. Sometimes the Target outcome that
 first differs is a real constraint error. For example, a commit the emulator
 aborts for the lock gets `ALREADY_EXISTS` under Target because the row exists;
@@ -308,23 +454,37 @@ regression schedule in
 the old model, it fails 65 of 2000 schedules and shrinks to
 `delete B{0}; delete B{0}; insert B{0}; update B{0}`.
 
-**Upstream bug found:** a RW `Read` of an empty open range such as `(2,2)`
-crashes the emulator process (SIGSEGV, exit 139), once the transaction has
-buffered a write in that table. `KeyRange::ToClosedOpen` turns `(k,k)` into
-`[succ(k), k)`, with start after limit (`backend/datamodel/key_range.cc:126-140`).
-`TransactionStore::Read` then walks the buffered ops from `lower_bound(start)`
-until it reaches `lower_bound(limit)`, which is earlier in the map, so it runs
-off the end (`backend/transaction/transaction_store.cc:256-259`). Reproduce
-with:
+**Empty-range crash (fixed on this fork):** upstream 1.5.58 crashes
+(SIGSEGV, exit 139) on a RW `Read` of `(2,2)` once the transaction has
+buffered a write in that table. `KeyRange::ToClosedOpen` produces
+`[succ(k), k)`, and `TransactionStore::Read` walked the buffered ops from
+`lower_bound(start)` towards `lower_bound(limit)`, which is earlier in the
+map, so it ran off the end. It now skips the buffer scan when start >= limit,
+as `InMemoryStorage::Read` already does. Delete-range mutations flatten
+through the same read, so empty deletes were affected too. Lock acquisition
+and pending-commit-timestamp checks are unchanged.
+
+The former crash repro is now `testdata/regression_empty_open_range.jsonl`:
+its equal-bound and inverted reads return zero rows, and later reads keep both
+updated rows. `testdata/regression_*.jsonl` are schedules that must match;
+replay each with `-schedule` against an `emulator_main` built from this fork:
 
 ```sh
-go run . -schedule testdata/upstream_crash_empty_open_range.jsonl
+SPANNER_EMULATOR_HOST=localhost:19110 mise exec go@1.25 -- go run . \
+  -schedule testdata/regression_empty_open_range.jsonl
+SPANNER_EMULATOR_HOST=localhost:19110 mise exec go@1.25 -- go run . -seeds 2000
 ```
 
-`testdata/regression_*.jsonl` are schedules that must match; replay each with
-`-schedule`.
-
-The generator avoids empty ranges so the rest of the run can proceed.
+The generator draws range endpoints independently. With six keys, 5/12 of
+generated ranges are inverted and 1/6 have equal endpoints (with
+independently chosen inclusivity). The 1.5.58 results above predate this and
+used a generator that avoided empty ranges. Against `emulator_main` built from
+this fork, seeds 1–2000 of the current generator give 2000 schedules, 32,880
+steps, **0** mismatches, 4,623 / 4,623 `ABORTED`; 2,601 of their 4,994 range
+operations (reads, SQL, DML) are empty or inverted. The Lean models need no
+change: `KeySpec.contains` checks both endpoints and `rowsOf` / `matched`
+filter by it, so empty ranges already read as empty.
+`TestEmptyRangeRegressionModel` asserts this for the regression schedule.
 
 ## L2: persistence protocol and crash conformance
 

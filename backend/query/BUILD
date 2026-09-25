@@ -108,6 +108,7 @@ cc_library(
     srcs = ["query_engine.cc"],
     hdrs = ["query_engine.h"],
     deps = [
+        ":key_narrowing",
         ":analyzer_options",
         ":ann_functions_rewriter",
         ":ann_validator",
@@ -566,6 +567,7 @@ cc_library(
         "catalog.h",
     ],
     deps = [
+        ":key_narrowing",
         ":analyzer_options",
         ":function_catalog",
         ":information_schema_catalog",
@@ -669,6 +671,56 @@ cc_test(
 )
 
 cc_library(
+    name = "key_narrowing",
+    srcs = ["key_narrowing.cc"],
+    hdrs = ["key_narrowing.h"],
+    deps = [
+        ":queryable_column",
+        "//backend/datamodel:key",
+        "//backend/datamodel:key_range",
+        "//backend/datamodel:key_set",
+        "//backend/schema/catalog:schema",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_googlesql//googlesql/public:catalog",
+        "@com_google_googlesql//googlesql/public:evaluator_table_iterator",
+        "@com_google_googlesql//googlesql/public:function",
+        "@com_google_googlesql//googlesql/public:type",
+        "@com_google_googlesql//googlesql/public:value",
+        "@com_google_googlesql//googlesql/resolved_ast",
+        "@com_google_googlesql//googlesql/resolved_ast:resolved_node_kind_cc_proto",
+    ],
+)
+
+cc_test(
+    name = "key_narrowing_test",
+    srcs = ["key_narrowing_test.cc"],
+    deps = [
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_googlesql//googlesql/public:type",
+        ":key_narrowing",
+        ":query_context",
+        ":query_engine",
+        "//backend/access:read",
+        "//backend/database",
+        "//backend/datamodel:key",
+        "//backend/datamodel:key_range",
+        "//backend/datamodel:key_set",
+        "//backend/transaction:read_write_transaction",
+        "//common:clock",
+        "//common:config",
+        "//tests/common:proto_matchers",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_googlesql//googlesql/base/testing:status_matchers",
+        "@com_google_googlesql//googlesql/public:value",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "queryable_column",
     srcs = [
     ],
@@ -731,6 +783,9 @@ cc_library(
         "queryable_table.h",
     ],
     deps = [
+        ":key_narrowing",
+        "//common:config",
+        "@com_google_absl//absl/container:flat_hash_map",
         ":queryable_column",
         "//backend/access:read",
         "//backend/datamodel:key_set",
@@ -814,6 +869,7 @@ cc_library(
         "function_catalog.h",
     ],
     deps = [
+        "@com_google_absl//absl/synchronization",
         ":analyzer_options",
         "//backend/common:case",
         "//backend/query/graph:mock_graph_algo_table_valued_function",

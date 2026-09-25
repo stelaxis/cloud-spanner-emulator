@@ -2,6 +2,11 @@
 /* src/include/pg_config.h.in.  Generated from configure.in by autoheader.  */
 /* SPECKLE_POSTGRES Use fixed-width integer types from //base. */
 #include <stdint.h>
+#ifdef __APPLE__
+/* macOS: include xlocale.h early so that _l locale functions (isprint_l, etc.)
+   are available when <ctype.h> and <wctype.h> are later included. */
+#include <xlocale.h>
+#endif
 #ifdef __cplusplus
 extern "C++" {
 #endif
@@ -98,7 +103,9 @@ extern "C++" {
 #endif
 
 /* Define to 1 if you have the `append_history' function. */
+#ifndef __APPLE__
 #define HAVE_APPEND_HISTORY 1
+#endif
 
 /* Define to 1 if you have the `ASN1_STRING_get0_data' function. */
 /* #undef HAVE_ASN1_STRING_GET0_DATA */
@@ -177,11 +184,19 @@ extern "C++" {
 
 /* Define to 1 if you have the declaration of `strlcat', and to 0 if you
    don't. */
+#ifdef __APPLE__
+#define HAVE_DECL_STRLCAT 1
+#else
 #define HAVE_DECL_STRLCAT 0
+#endif
 
 /* Define to 1 if you have the declaration of `strlcpy', and to 0 if you
    don't. */
+#ifdef __APPLE__
+#define HAVE_DECL_STRLCPY 1
+#else
 #define HAVE_DECL_STRLCPY 0
+#endif
 
 /* Define to 1 if you have the declaration of `strnlen', and to 0 if you
    don't. */
@@ -442,10 +457,14 @@ extern "C++" {
 #define HAVE_POLL_H 1
 
 /* Define to 1 if you have the `posix_fadvise' function. */
+#ifndef __APPLE__
 #define HAVE_POSIX_FADVISE 1
+#endif
 
 /* Define to 1 if you have the `posix_fallocate' function. */
+#ifndef __APPLE__
 #define HAVE_POSIX_FALLOCATE 1
+#endif
 
 /* Define to 1 if the assembler supports PPC's LWARX mutex hint bit. */
 /* #undef HAVE_PPC_LWARX_MUTEX_HINT */
@@ -497,7 +516,9 @@ extern "C++" {
 #define HAVE_RL_FILENAME_COMPLETION_FUNCTION 1
 
 /* Define to 1 if you have the `rl_reset_screen_size' function. */
+#ifndef __APPLE__
 #define HAVE_RL_RESET_SCREEN_SIZE 1
+#endif
 
 /* Define to 1 if you have the <security/pam_appl.h> header file. */
 /* #undef HAVE_SECURITY_PAM_APPL_H */
@@ -611,13 +632,19 @@ extern "C++" {
 #define HAVE_SYMLINK 1
 
 /* Define to 1 if you have the `sync_file_range' function. */
+#ifdef __APPLE__
+/* sync_file_range is Linux-specific */
+#else
 #define HAVE_SYNC_FILE_RANGE 1
+#endif
 
 /* Define to 1 if you have the syslog interface. */
 #define HAVE_SYSLOG 1
 
 /* Define to 1 if you have the <sys/epoll.h> header file. */
+#ifndef __APPLE__
 #define HAVE_SYS_EPOLL_H 1
+#endif
 
 /* Define to 1 if you have the <sys/ipc.h> header file. */
 #define HAVE_SYS_IPC_H 1
@@ -650,7 +677,11 @@ extern "C++" {
 #define HAVE_SYS_TYPES_H 1
 
 /* Define to 1 if you have the <sys/ucred.h> header file. */
+#ifdef __APPLE__
+#define HAVE_SYS_UCRED_H 1
+#else
 /* #undef HAVE_SYS_UCRED_H */
+#endif
 
 /* Define to 1 if you have the <sys/un.h> header file. */
 #define HAVE_SYS_UN_H 1
@@ -794,7 +825,11 @@ extern "C++" {
 #define INT64_MODIFIER "l"
 
 /* Define to 1 if `locale_t' requires <xlocale.h>. */
+#ifdef __APPLE__
+#define LOCALE_T_IN_XLOCALE 1
+#else
 /* #undef LOCALE_T_IN_XLOCALE */
+#endif
 
 /* Define as the maximum alignment requirement of any C data type. */
 #define MAXIMUM_ALIGNOF 8
@@ -885,7 +920,11 @@ extern "C++" {
 #define STDC_HEADERS 1
 
 /* Define to 1 if strerror_r() returns int. */
+#ifdef __APPLE__
+#define STRERROR_R_INT 1
+#else
 /* #undef STRERROR_R_INT */
+#endif
 
 /* Define to 1 if your <sys/time.h> declares `struct tm'. */
 /* #undef TM_IN_SYS_TIME */
@@ -987,7 +1026,11 @@ extern "C++" {
 /* #undef USE_WIN32_SHARED_MEMORY */
 
 /* Define to 1 if `wcstombs_l' requires <xlocale.h>. */
+#ifdef __APPLE__
+#define WCSTOMBS_L_IN_XLOCALE 1
+#else
 /* #undef WCSTOMBS_L_IN_XLOCALE */
+#endif
 
 /* Define WORDS_BIGENDIAN to 1 if your processor stores words with the most
    significant byte first (like Motorola and SPARC, unlike Intel). */

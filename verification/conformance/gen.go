@@ -36,15 +36,8 @@ func (g *generator) keys(allowAll bool) *Keys {
 		return g.point()
 	case n < 8 || !allowAll:
 		lo, hi := g.key(), g.key()
-		if lo > hi {
-			lo, hi = hi, lo
-		}
-		if lo == hi {
-			// An empty range such as (k,k) crashes upstream 1.5.58 once the
-			// transaction has buffered writes in the table; see
-			// testdata/upstream_crash_empty_open_range.jsonl.
-			return &Keys{Lo: lo, Hi: hi, LoIncl: true, HiIncl: true}
-		}
+		// Keep independently drawn endpoints: equal and inverted bounds
+		// exercise empty reads, SQL predicates, and DML ranges.
 		return &Keys{Lo: lo, Hi: hi, LoIncl: g.r.IntN(3) > 0, HiIncl: g.r.IntN(2) > 0}
 	default:
 		return &Keys{All: true}

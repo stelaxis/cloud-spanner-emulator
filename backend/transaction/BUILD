@@ -119,6 +119,34 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "concurrency_test",
+    srcs = ["concurrency_test.cc"],
+    deps = [
+        "//backend/query:function_catalog",
+        ":read_only_transaction",
+        ":read_write_transaction",
+        "//backend/access:read",
+        "//backend/access:write",
+        "//backend/actions:manager",
+        "//backend/datamodel:key",
+        "//backend/datamodel:key_range",
+        "//backend/datamodel:key_set",
+        "//backend/datamodel:value",
+        "//backend/locking:manager",
+        "//backend/schema/catalog:versioned_catalog",
+        "//backend/storage:in_memory_storage",
+        "//common:clock",
+        "//tests/common:proto_matchers",
+        "//tests/common:test_schema_constructor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/time",
+        "@com_google_googlesql//googlesql/base/testing:status_matchers",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "foreign_key_restrictions",
     srcs = [

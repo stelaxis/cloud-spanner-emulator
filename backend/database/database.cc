@@ -68,7 +68,8 @@ absl::StatusOr<std::unique_ptr<Database>> Database::Create(
   database->clock_ = clock;
   database->database_id_ = database_id;
   database->storage_ = std::make_unique<InMemoryStorage>();
-  database->lock_manager_ = std::make_unique<LockManager>(clock);
+  database->lock_manager_ =
+      std::make_unique<LockManager>(clock, database->storage_.get());
   database->type_factory_ = std::make_unique<googlesql::TypeFactory>();
   database->action_manager_ = std::make_unique<ActionManager>();
   database->dialect_ = schema_change_operation.database_dialect;
@@ -117,7 +118,7 @@ absl::StatusOr<std::unique_ptr<Database>> Database::Create(
   // Some functions need to access the schema (e.g. sequence functions), so
   // set the latest schema to the function catalog here.
   database->query_engine_->SetLatestSchemaForFunctionCatalog(
-      database->versioned_catalog_->GetLatestSchema());
+      database->versioned_catalog_->GetLatestSchemaShared());
 
   database->storage_->SetVersionRetentionPeriod(
       database->versioned_catalog_->version_retention_period());
@@ -159,12 +160,34 @@ absl::Status Database::UpdateSchema(
     return error::UpdateDatabaseMissingStatements();
   }
 
-  // Make an exclusive lock request for the database. If there are any
-  // concurrent transactions it will be denied and the operation aborted.
-  ScopedSchemaChangeLock lock{transaction_id_generator_.NextId(),
-                              lock_manager_.get()};
-  GOOGLESQL_RETURN_IF_ERROR(lock.Wait());
+  // One schema change at a time, so that churners are reconciled with the
+  // schemas in commit order.
+  absl::MutexLock schema_change_lock(schema_change_mu_);
+  {
+    // Hold the commit critical section exclusively: in-flight commits finish
+    // first, and open read-write transactions abort once they see the new
+    // schema. The change stream churner is updated after the lock is released,
+    // because stopping a churning thread joins it, and that thread may be
+    // waiting to commit.
+    ScopedSchemaChangeLock lock{transaction_id_generator_.NextId(),
+                                lock_manager_.get()};
+    GOOGLESQL_RETURN_IF_ERROR(lock.Wait());
+    GOOGLESQL_RETURN_IF_ERROR(ApplySchemaChangeLocked(
+        schema_change_operation, lock, num_succesful_statements,
+        commit_timestamp, backfill_status));
+  }
+  const Schema* schema = versioned_catalog_->GetLatestSchema();
+  if (before_churner_update_hook_ != nullptr) {
+    before_churner_update_hook_();
+  }
+  change_stream_partition_churner_->Update(schema);
+  return absl::OkStatus();
+}
 
+absl::Status Database::ApplySchemaChangeLocked(
+    const SchemaChangeOperation& schema_change_operation,
+    ScopedSchemaChangeLock& lock, int* num_succesful_statements,
+    absl::Time* commit_timestamp, absl::Status* backfill_status) {
   // Reserve a commit timestamp for the schema changes. Even if the
   // schema change fails, it will result in a no-op commit that will
   // be invisible to other read-only/read-write transactions.
@@ -191,13 +214,10 @@ absl::Status Database::UpdateSchema(
                                          query_engine_->function_catalog(),
                                          query_engine_->type_factory());
   }
-  change_stream_partition_churner_->Update(
-      versioned_catalog_->GetLatestSchema());
-
   // Some functions need to access the schema (e.g. sequence functions), so
   // set the latest schema to the function catalog here.
   query_engine_->SetLatestSchemaForFunctionCatalog(
-      versioned_catalog_->GetLatestSchema());
+      versioned_catalog_->GetLatestSchemaShared());
 
   storage_->SetVersionRetentionPeriod(
       versioned_catalog_->version_retention_period());
@@ -212,6 +232,10 @@ absl::Status Database::UpdateSchema(
 
 const Schema* Database::GetLatestSchema() const {
   return versioned_catalog_->GetLatestSchema();
+}
+
+std::shared_ptr<const Schema> Database::GetLatestSchemaShared() const {
+  return versioned_catalog_->GetLatestSchemaShared();
 }
 
 }  // namespace backend

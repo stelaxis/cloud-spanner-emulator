@@ -227,10 +227,7 @@ TEST_F(DatabaseTest, UpdateSchemaPartialSuccess) {
   EXPECT_EQ(completed_statements, 1);
 }
 
-TEST_F(DatabaseTest, ConcurrentSchemaChangeIsAborted) {
-  auto current_probability = config::abort_current_transaction_probability();
-  config::set_abort_current_transaction_probability(0);
-
+TEST_F(DatabaseTest, SchemaChangeSucceedsWithOpenReadWriteTransaction) {
   std::vector<std::string> create_statements = {R"(
     CREATE TABLE T(
       k1 INT64,
@@ -242,28 +239,30 @@ TEST_F(DatabaseTest, ConcurrentSchemaChangeIsAborted) {
       Database::Create(&clock_, kDatabaseId,
                        SchemaChangeOperation{.statements = create_statements}));
 
-  // Initiate a Read inside a read-write transaction to acquire locks.
+  // A read-write transaction that has read, and one that has not started.
   std::unique_ptr<RowCursor> row_cursor;
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(
       std::unique_ptr<ReadWriteTransaction> txn,
       db->CreateReadWriteTransaction(ReadWriteOptions(), RetryState()));
   GOOGLESQL_EXPECT_OK(txn->Read(read_column("T", "k1"), &row_cursor));
 
+  // The schema change does not fail because the transaction is open.
   std::vector<std::string> update_statements = {R"(
-    CREATE TABLE T(
+    CREATE TABLE T2(
       k1 INT64,
-      k2 INT64,
     ) PRIMARY KEY(k1)
   )"};
   absl::Status backfill_status;
   int completed_statements;
   absl::Time commit_ts;
-  EXPECT_EQ(
+  GOOGLESQL_EXPECT_OK(
       db->UpdateSchema(SchemaChangeOperation{.statements = update_statements},
-                       &completed_statements, &commit_ts, &backfill_status),
-      error::ConcurrentSchemaChangeOrReadWriteTxnInProgress());
+                       &completed_statements, &commit_ts, &backfill_status));
+  GOOGLESQL_EXPECT_OK(backfill_status);
 
-  config::set_abort_current_transaction_probability(current_probability);
+  // The open transaction aborts on its next operation.
+  EXPECT_THAT(txn->Read(read_column("T", "k1"), &row_cursor),
+              StatusIs(absl::StatusCode::kAborted));
 }
 
 TEST_F(DatabaseTest, SchemaChangeLocksSuccesfullyReleased) {

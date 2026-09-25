@@ -4799,7 +4799,7 @@ TEST_P(QueryEngineTest, ExecuteSqlInsertWithNamedSchemaSequence) {
                     type_factory(),
                     /*proto_descriptor_bytes=*/""));
   }
-  query_engine().SetLatestSchemaForFunctionCatalog(schema.get());
+  query_engine().mutable_function_catalog()->SetLatestSchema(schema.get());
   test::TestRowReader reader{
       {{"test_schema.test_table",
         {{"int64_col", "string_col"},
@@ -5129,7 +5129,7 @@ TEST_P(QueryEngineTest, UDFCallingSequenceInsert) {
               PRIMARY KEY (int64_col))"},
           type_factory(),
           /*proto_descriptor_bytes=*/""));
-  query_engine().SetLatestSchemaForFunctionCatalog(schema.get());
+  query_engine().mutable_function_catalog()->SetLatestSchema(schema.get());
 
   test::TestRowReader reader{
       {{"test_table",

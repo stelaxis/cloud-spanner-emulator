@@ -3,3 +3,9 @@
 {"txn":1,"op":"begin_rw","args":{}}
 {"txn":1,"op":"dml_update","args":{"table":"A","keys":{"lo":2,"lo_incl":true,"hi":4,"hi_incl":false},"val":83}}
 {"txn":1,"op":"read","args":{"table":"A","keys":{"lo":2,"lo_incl":false,"hi":2,"hi_incl":false}}}
+{"txn":1,"op":"read","args":{"table":"A","keys":{"lo":4,"lo_incl":true,"hi":2,"hi_incl":false}}}
+{"txn":1,"op":"read","args":{"table":"A","keys":{"lo":2,"lo_incl":false,"hi":2,"hi_incl":true}}}
+{"txn":1,"op":"read","args":{"table":"A","keys":"all"}}
+{"txn":1,"op":"commit","args":{"mutations":[]}}
+{"txn":2,"op":"begin_ro","args":{}}
+{"txn":2,"op":"read","args":{"table":"A","keys":"all"}}

@@ -116,11 +116,20 @@ genrule(
     outs = [
         "nodes.inc",
     ],
-    cmd = """\
+    # macOS: BSD sed does not know \s (it silently emits nothing), so use
+    # the POSIX spelling there.
+    cmd = select({
+        "@platforms//os:macos": """\
+        sed -En "s/^[[:space:]]+T_([A-Za-z0-9_]+)[[:space:]]*=.*,$$/NODE(\\1)/p" \
+            < $(location //third_party/spanner_pg/src/backend/nodes:nodetags.h) \
+            | sort > $(location nodes.inc)
+    """,
+        "//conditions:default": """\
         sed -rn "s/^\\s+T_([A-Za-z0-9_]+)\\s*=.*,$$/NODE(\\1)/p" \
             < $(location //third_party/spanner_pg/src/backend/nodes:nodetags.h) \
             | sort > $(location nodes.inc)
     """,
+    }),
 )
 
 cc_library(

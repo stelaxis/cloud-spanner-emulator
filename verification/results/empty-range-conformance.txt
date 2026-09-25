@@ -1,0 +1,38 @@
+emulator_main built from this branch (bazel-bin/binaries/emulator_main), run with
+--host_port=0.0.0.0:19110 --abort_current_transaction_probability=0.
+
+$ SPANNER_EMULATOR_HOST=localhost:19110 go run . -schedule testdata/regression_empty_open_range.jsonl
+    0  T0 begin_rw                              emulator=ok                       model=ok
+    1  T0 commit [insert A{2}=5, insert A{3}=93] emulator=committed:1              model=committed:1
+    2  T1 begin_rw                              emulator=ok                       model=ok
+    3  T1 dml_update A[2,4) := 83               emulator=count:2                  model=count:2
+    4  T1 read A(2,2)                           emulator=rows:                    model=rows:
+    5  T1 read A[4,2)                           emulator=rows:                    model=rows:
+    6  T1 read A(2,2]                           emulator=rows:                    model=rows:
+    7  T1 read Aall                             emulator=rows:2=83,3=83           model=rows:2=83,3=83
+    8  T1 commit []                             emulator=committed:2              model=committed:2
+    9  T2 begin_ro strong                       emulator=ok                       model=ok
+   10  T2 read Aall                             emulator=rows:2=83,3=83           model=rows:2=83,3=83
+exit=0
+
+$ SPANNER_EMULATOR_HOST=localhost:19110 go run . -schedule testdata/regression_repeated_delete_reinsert.jsonl
+    0  T0 begin_rw                              emulator=ok                       model=ok
+    1  T0 commit []                             emulator=committed:1              model=committed:1
+    2  T1 begin_rw                              emulator=ok                       model=ok
+    3  T1 commit [delete A{1}=0, delete A{1}=0, insert A{1}=7, update A{1}=7] emulator=committed:2              model=committed:2
+    4  T2 begin_ro strong                       emulator=ok                       model=ok
+    5  T2 read Aall                             emulator=rows:1=7                 model=rows:1=7
+    6  T2 read Ball                             emulator=rows:                    model=rows:
+exit=0
+
+$ SPANNER_EMULATOR_HOST=localhost:19110 go run . -model upstream -seeds 2000
+model=upstream pushdown=false schedules=2000 steps=32880 mismatched=0 aborted(emulator)=4623 aborted(model)=4623
+exit=0
+
+Range operations in seeds 1-2000 (from -print), by op and emptiness:
+  read        empty-equal 196  inverted 707  nonempty 800
+  sql         empty-equal  88  inverted 351  nonempty 420
+  dml_update  empty-equal 182  inverted 671  nonempty 792
+  dml_delete  empty-equal  86  inverted 320  nonempty 381
+  total empty or inverted: 2601 of 4994
+The emulator process was still running after all schedules.

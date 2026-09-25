@@ -605,6 +605,23 @@ absl::Status AbortCurrentTransaction(backend::TransactionID holder_id,
                    "The emulator only supports one transaction at a time."));
 }
 
+absl::Status AbortReadSetConflict(backend::TransactionID id) {
+  return absl::Status(
+      absl::StatusCode::kAborted,
+      absl::StrCat("Transaction ", id,
+                   " aborted: a concurrent transaction committed a write to "
+                   "data it read. Retry the transaction."));
+}
+
+absl::Status AbortInjectedAtCommit(backend::TransactionID id) {
+  return absl::Status(
+      absl::StatusCode::kAborted,
+      absl::StrCat("Transaction ", id,
+                   " aborted at commit by "
+                   "--abort_current_transaction_probability. Retry the "
+                   "transaction."));
+}
+
 absl::Status WoundedTransaction(backend::TransactionID id) {
   return absl::Status(
       absl::StatusCode::kAborted,

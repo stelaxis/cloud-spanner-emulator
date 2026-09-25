@@ -27,6 +27,7 @@
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "backend/access/read.h"
+#include "backend/query/key_narrowing.h"
 #include "backend/query/queryable_column.h"
 #include "backend/schema/catalog/change_stream.h"
 #include "backend/schema/catalog/schema.h"
@@ -48,7 +49,8 @@ class QueryableTable : public googlesql::Table {
       const backend::Table* table, RowReader* reader,
       std::optional<const googlesql::AnalyzerOptions> options = std::nullopt,
       googlesql::Catalog* catalog = nullptr,
-      googlesql::TypeFactory* type_factory = nullptr, bool is_synonym = false);
+      googlesql::TypeFactory* type_factory = nullptr, bool is_synonym = false,
+      const ScanKeySets* scan_key_sets = nullptr);
 
   std::string Name() const override {
     return std::string(SDLObjectName::GetInSchemaName(SynonymOrName()));
@@ -100,6 +102,10 @@ class QueryableTable : public googlesql::Table {
   // A RowReader which data of the table can be read from to build a
   // EvalutorTableIterator when CreateEvaluatorTableIterator is called.
   RowReader* reader_;
+
+  // Key sets that bound the current statement's reads, owned by the catalog.
+  // Null or without an entry for this table: the table is read in full.
+  const ScanKeySets* scan_key_sets_;
 
   // The columns in the table.
   std::vector<std::unique_ptr<const QueryableColumn>> columns_;

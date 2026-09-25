@@ -17,7 +17,11 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_TRANSACTION_ROW_CURSOR_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_TRANSACTION_ROW_CURSOR_H_
 
+#include <memory>
+#include <vector>
+
 #include "backend/access/read.h"
+#include "backend/schema/catalog/schema.h"
 #include "backend/schema/catalog/table.h"
 #include "backend/storage/in_memory_iterator.h"
 
@@ -32,10 +36,15 @@ namespace backend {
 // This class is not thread-safe.
 class StorageIteratorRowCursor : public RowCursor {
  public:
+  // `schema` owns `columns`; the cursor keeps it alive, so that it can outlive
+  // the transaction and the schema's removal from the catalog.
   StorageIteratorRowCursor(
       std::vector<std::unique_ptr<StorageIterator>> iterators,
-      std::vector<const Column*> columns)
-      : iterators_(std::move(iterators)), columns_(std::move(columns)) {}
+      std::vector<const Column*> columns,
+      std::shared_ptr<const Schema> schema = nullptr)
+      : schema_(std::move(schema)),
+        iterators_(std::move(iterators)),
+        columns_(std::move(columns)) {}
 
   // Implementation of the RowCursor interface
   bool Next() override;
@@ -46,6 +55,8 @@ class StorageIteratorRowCursor : public RowCursor {
   const googlesql::Type* ColumnType(int i) const override;
 
  private:
+  const std::shared_ptr<const Schema> schema_;
+
   const std::vector<std::unique_ptr<StorageIterator>> iterators_;
 
   // Index of the iterator being read by row cursor in iterators_.

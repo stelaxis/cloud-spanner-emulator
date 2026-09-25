@@ -77,24 +77,32 @@ void ResetInvalidValuesToNull(absl::Span<const Column* const> columns,
 absl::Status TransactionStore::AcquireReadLock(
     const Table* table, const KeyRange& key_range,
     absl::Span<const Column* const> columns) const {
+  // Nothing is locked: the scanned range joins the read set validated at
+  // commit.
   lock_handle_->EnqueueLock(LockRequest(LockMode::kShared, table->id(),
                                         key_range, GetColumnIDs(columns)));
-  return lock_handle_->Wait();
+  return absl::OkStatus();
 }
 
 absl::Status TransactionStore::AcquireWriteLock(
-    const Table* table, const KeyRange& key_range,
-    absl::Span<const Column* const> columns) const {
+    const Table* table, const Key& key,
+    absl::Span<const Column* const> columns) {
   lock_handle_->EnqueueLock(LockRequest(LockMode::kExclusive, table->id(),
-                                        key_range, GetColumnIDs(columns)));
-  return lock_handle_->Wait();
+                                        KeyRange::Point(key),
+                                        GetColumnIDs(columns)));
+  written_keys_[table].insert(key);
+  return absl::OkStatus();
+}
+
+absl::Time TransactionStore::ReadTimestamp() const {
+  return lock_handle_->SnapshotTimestamp();
 }
 
 absl::Status TransactionStore::BufferInsert(
     const Table* table, const Key& key, absl::Span<const Column* const> columns,
     const ValueList& values) {
   // Acquire locks to prevent another transaction to modify this entity.
-  GOOGLESQL_RETURN_IF_ERROR(AcquireWriteLock(table, KeyRange::Point(key), columns));
+  GOOGLESQL_RETURN_IF_ERROR(AcquireWriteLock(table, key, columns));
 
   RowOp row_op;
   bool row_exists = RowExistsInBuffer(table, key, &row_op);
@@ -117,7 +125,7 @@ absl::Status TransactionStore::BufferUpdate(
     const Table* table, const Key& key, absl::Span<const Column* const> columns,
     const ValueList& values) {
   // Acquire locks to prevent another transaction to modify this entity.
-  GOOGLESQL_RETURN_IF_ERROR(AcquireWriteLock(table, KeyRange::Point(key), columns));
+  GOOGLESQL_RETURN_IF_ERROR(AcquireWriteLock(table, key, columns));
 
   RowOp row_op;
   bool row_exists = RowExistsInBuffer(table, key, &row_op);
@@ -146,7 +154,7 @@ absl::Status TransactionStore::BufferUpdate(
 absl::Status TransactionStore::BufferDelete(const Table* table,
                                             const Key& key) {
   // Acquire locks to prevent another transaction to modify this entity.
-  GOOGLESQL_RETURN_IF_ERROR(AcquireWriteLock(table, KeyRange::Point(key), {}));
+  GOOGLESQL_RETURN_IF_ERROR(AcquireWriteLock(table, key, {}));
 
   RowOp row_op;
 
@@ -212,7 +220,7 @@ absl::StatusOr<ValueList> TransactionStore::ReadCommitted(
     std::vector<const Column*> columns) const {
   GOOGLESQL_RETURN_IF_ERROR(AcquireReadLock(table, KeyRange::Point(key), columns));
   std::unique_ptr<StorageIterator> base_itr;
-  GOOGLESQL_RETURN_IF_ERROR(base_storage_->Read(absl::InfiniteFuture(), table->id(),
+  GOOGLESQL_RETURN_IF_ERROR(base_storage_->Read(ReadTimestamp(), table->id(),
                                       KeyRange::Point(key),
                                       GetColumnIDs(columns), &base_itr));
   ValueList values;
@@ -250,7 +258,10 @@ absl::Status TransactionStore::Read(
   auto table_itr = buffered_ops_.find(table);
   typename absl::btree_map<Key, RowOp>::const_iterator buffer_it, buffer_end;
   bool has_buffer = false;
-  if (table_itr != buffered_ops_.end()) {
+  // Empty normalized ranges may have start > limit (for example, (k, k)).
+  // In that case lower_bound(limit) can precede lower_bound(start).
+  if (table_itr != buffered_ops_.end() &&
+      key_range.start_key() < key_range.limit_key()) {
     const auto& key_to_row_op_map = table_itr->second;
     // Key range lookup.
     auto begin_itr = key_to_row_op_map.lower_bound(key_range.start_key());
@@ -281,7 +292,7 @@ absl::Status TransactionStore::Read(
   // Read from the base storage and apply the changes buffered in transaction
   // store.
   std::unique_ptr<StorageIterator> base_itr;
-  GOOGLESQL_RETURN_IF_ERROR(base_storage_->Read(absl::InfiniteFuture(), table->id(),
+  GOOGLESQL_RETURN_IF_ERROR(base_storage_->Read(ReadTimestamp(), table->id(),
                                       key_range, GetColumnIDs(columns),
                                       &base_itr));
 
@@ -360,8 +371,10 @@ bool TransactionStore::HasPendingCommitTimestamp(const Column* column) const {
 }
 
 bool TransactionStore::RowExistsInStorage(const Table* table, const Key& key) {
+  // The answer decides whether a delete is buffered, so it is a read.
+  AcquireReadLock(table, KeyRange::Point(key), {}).IgnoreError();
   absl::Status row_in_base_storage =
-      base_storage_->Lookup(absl::InfiniteFuture(), table->id(), key, {}, {});
+      base_storage_->Lookup(ReadTimestamp(), table->id(), key, {}, {});
   return row_in_base_storage.code() != absl::StatusCode::kNotFound;
 }
 
@@ -408,7 +421,7 @@ absl::StatusOr<ValueList> TransactionStore::Lookup(
       case OpType::kUpdate: {
         // For update, the base storage needs to be checked to retrieve values
         // which might not be included in the update.
-        GOOGLESQL_RETURN_IF_ERROR(base_storage_->Lookup(absl::InfiniteFuture(),
+        GOOGLESQL_RETURN_IF_ERROR(base_storage_->Lookup(ReadTimestamp(),
                                               table->id(), key,
                                               GetColumnIDs(columns), &values));
         ResetInvalidValuesToNull(columns, &values);
@@ -429,10 +442,25 @@ absl::StatusOr<ValueList> TransactionStore::Lookup(
     }
     return values;
   }
-  GOOGLESQL_RETURN_IF_ERROR(base_storage_->Lookup(absl::InfiniteFuture(), table->id(),
+  GOOGLESQL_RETURN_IF_ERROR(base_storage_->Lookup(ReadTimestamp(), table->id(),
                                         key, GetColumnIDs(columns), &values));
   ResetInvalidValuesToNull(columns, &values);
   return values;
+}
+
+std::vector<std::pair<const Table*, Key>> TransactionStore::GetCancelledWrites()
+    const {
+  std::vector<std::pair<const Table*, Key>> cancelled;
+  for (const auto& [table, keys] : written_keys_) {
+    auto table_itr = buffered_ops_.find(table);
+    for (const Key& key : keys) {
+      if (table_itr == buffered_ops_.end() ||
+          !table_itr->second.contains(key)) {
+        cancelled.emplace_back(table, key);
+      }
+    }
+  }
+  return cancelled;
 }
 
 std::vector<WriteOp> TransactionStore::GetBufferedOps() const {

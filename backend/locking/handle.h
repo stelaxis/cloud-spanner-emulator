@@ -17,50 +17,29 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_LOCKING_HANDLE_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_LOCKING_HANDLE_H_
 
+#include <functional>
+#include <optional>
+#include <vector>
+
 #include "absl/base/thread_annotations.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "backend/common/ids.h"
+#include "backend/datamodel/key_range.h"
 #include "backend/locking/request.h"
-#include "absl/status/status.h"
 
 namespace google {
 namespace spanner {
 namespace emulator {
 namespace backend {
 
-// Forward declaration of the LockManager to avoid a circular reference.
 class LockManager;
 
-// LockHandle encapsulates a transaction's interface to the lock manager.
-//
-// A transaction first creates a lock handle via LockManager::CreateHandle().
-// All subsequent communication between the transaction and the LockManager
-// happens via the LockHandle. This includes incremental acquisition of read
-// write locks, waiting on those locks, and unlocking those locks.
-//
-// EnqueueLock() is non-blocking and only enqueues the lock request. The
-// transaction can subsequently query whether the requests have completed by
-// checking IsBlocked() or perform a blocking Wait() to find out the final
-// state of the lock requests.
-//
-// Usage (happy path, error handling skipped):
-//    // Get a handle.
-//    auto handle = lock_manager->CreateHandle(txn_id, txn_priority);
-//
-//    // Request some locks.
-//    handle->EnqueueLock(...)
-//    handle->EnqueueLock(...)
-//
-//    // Wait for those locks to be granted.
-//    handle->Wait()
-//
-//    // Do work based on those locks.
-//    ...
-//
-//    // Unlock all locks held by this transaction.
-//    handle->UnlockAll();
+// A transaction's view of the LockManager: its snapshot timestamp, its read
+// set, and the commit protocol. Methods are thread-safe.
 class LockHandle {
  public:
   // Returns the ID of the transaction which owns this handle.
@@ -69,36 +48,46 @@ class LockHandle {
   // Returns the priority of the transaction which owns this handle.
   TransactionPriority priority() { return priority_; }
 
-  // Enqueues a lock request for this transaction. This method returns
-  // immediately. Lock request status can be queried via IsBlocked() and Wait().
-  // Many lock requests can be queued up before calling Wait(). Lock requests
-  // from aborted handles are ignored by the lock manager.
-  void EnqueueLock(const LockRequest& request);
+  // Records a lock request. Nothing is locked and the call never blocks or
+  // aborts. A kShared request adds its key range to the read set that Commit
+  // validates. The key range is what the read *scanned*, not the rows it
+  // returned, so a later insert into the range is a conflict (no phantoms).
+  // Row granularity: columns are ignored. kExclusive requests are not needed
+  // for validation, which reads committed versions from storage.
+  void EnqueueLock(const LockRequest& request) ABSL_LOCKS_EXCLUDED(mu_);
 
-  // Unlocks all locks held by this transaction. The transaction can acquire new
-  // locks using the same handle. Frees any waiters waiting on these locks. This
-  // method can be called even if the transaction never acquired any locks.
-  void UnlockAll();
+  // Forgets the snapshot and the read set. The transaction can start over.
+  void UnlockAll() ABSL_LOCKS_EXCLUDED(mu_);
 
-  // Returns true if this handle is waiting on any lock requests to complete.
-  bool IsBlocked() ABSL_LOCKS_EXCLUDED(mu_);
+  // Returns the transaction's snapshot timestamp, fixing it on the first call.
+  // The snapshot is taken lazily, at the transaction's first data operation
+  // rather than at BeginTransaction, so a transaction that begins, waits, and
+  // then reads does not validate against commits it could have observed.
+  absl::Time SnapshotTimestamp() ABSL_LOCKS_EXCLUDED(mu_);
 
-  // Returns true if this handle has been aborted by the lock manager. Previous
-  // locks acquired by the handle are not release automatically. The handle must
-  // explicitly call UnlockAll().
-  bool IsAborted() ABSL_LOCKS_EXCLUDED(mu_);
+  // Returns the snapshot timestamp if one has been taken.
+  std::optional<absl::Time> snapshot() ABSL_LOCKS_EXCLUDED(mu_);
 
-  // Waits till all locks requested via this handle have either all been granted
-  // or have at least one request denied. Lock denials will return ABORTED
-  // status, otherwise OK will be returned.
-  absl::Status Wait() ABSL_LOCKS_EXCLUDED(mu_);
+  // Returns true if a version committed after the snapshot lies in a key range
+  // of the read set. False when no snapshot was taken.
+  bool ReadSetIsStale() ABSL_LOCKS_EXCLUDED(mu_);
 
-  // Returns timestamp which can be used by this transaction as a commit
-  // timestamp.
-  absl::StatusOr<absl::Time> ReserveCommitTimestamp();
+  // Returns true if a version committed after the snapshot lies anywhere in
+  // the table. False when no snapshot was taken.
+  bool TableChangedSinceSnapshot(const TableID& table_id)
+      ABSL_LOCKS_EXCLUDED(mu_);
 
-  // Notifies the LockManager that this transaction has committed.
-  absl::Status MarkCommitted();
+  // Runs the commit protocol in the database's commit critical section:
+  //   1. `precheck` (e.g. the schema is unchanged); its error is returned.
+  //   2. Validate the read set; ABORTED if stale.
+  //   3. Reserve a commit timestamp.
+  //   4. `flush` at that timestamp, then mark the commit complete.
+  // Returns the commit timestamp, or the first error. Validation and timestamp
+  // reservation are atomic with respect to every other commit.
+  absl::StatusOr<absl::Time> Commit(
+      const std::function<absl::Status()>& precheck,
+      const std::function<absl::Status(absl::Time)>& flush)
+      ABSL_LOCKS_EXCLUDED(mu_);
 
   // Waits for the intended read timestamp to be safe from any in-progress
   // commits.
@@ -109,19 +98,16 @@ class LockHandle {
   friend class LockManager;
   friend std::unique_ptr<LockHandle>::deleter_type;
   LockHandle(LockManager* manager, TransactionID tid,
-             const std::function<absl::Status()>& abort_fn,
              TransactionPriority priority);
-  ~LockHandle();
+  ~LockHandle() = default;
 
-  // Aborts the requests made by this handle (and puts it in a final state).
-  void Abort(const absl::Status& status) ABSL_LOCKS_EXCLUDED(mu_);
-  // Tries to abort this transaction. This is a best effort attempt and returns
-  // OK only if the transaction could successfully be aborted.
-  absl::Status TryAbortTransaction(const absl::Status& status)
-      ABSL_LOCKS_EXCLUDED(mu_);
+  // Key ranges read from one table. `all` subsumes `ranges`.
+  struct TableReads {
+    bool all = false;
+    std::vector<KeyRange> ranges;
+  };
 
-  // Resets the state of this handle.
-  void Reset() ABSL_LOCKS_EXCLUDED(mu_);
+  bool ReadSetIsStaleLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   // The LockManager which this LockHandle interacts with.
   LockManager* const manager_;
@@ -129,21 +115,17 @@ class LockHandle {
   // The ID of the transaction which owns this lock handle.
   TransactionID tid_;
 
-  // A function to try to abort the underlying transaction. The function will
-  // be called if another transaction wants to acquire the locks held by this
-  // transaction. The function will return OK only if the transaction was
-  // successfully aborted.
-  // This can be nullptr if the transaction cannot be aborted.
-  std::function<absl::Status()> try_abort_transaction_fn_;
-
   // The priority of the transaction which owns this lock handle.
   TransactionPriority priority_;
 
   // Mutex to guard state below.
   absl::Mutex mu_;
 
-  // The status of the lock handle requests.
-  absl::Status status_ ABSL_GUARDED_BY(mu_);
+  // The snapshot timestamp, once taken.
+  std::optional<absl::Time> snapshot_ ABSL_GUARDED_BY(mu_);
+
+  // The read set: ClosedOpen key ranges per table.
+  absl::flat_hash_map<TableID, TableReads> read_set_ ABSL_GUARDED_BY(mu_);
 };
 
 }  // namespace backend

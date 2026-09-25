@@ -1,0 +1,47 @@
+Linux arm64 Docker (cse-prw-builder image, --cpus=4 --memory=8g), Bazel 7.6.1, -c opt.
+
+## Fail-before: da86d674 sources (TransactionStore::Read unguarded) + the new tests
+
+$ bazel test -c opt --jobs=4 --test_filter='*EmptyRange*' \
+    //backend/transaction:transaction_store_test //backend/transaction:read_write_transaction_test
+//backend/transaction:read_write_transaction_test                        FAILED in 4.6s
+//backend/transaction:transaction_store_test                             FAILED in 4.6s
+Executed 2 out of 2 tests: 2 fail locally.
+
+transaction_store_test: 18 cases (9 ranges x with/without buffered writes), 13 pass, 5 fail.
+Each failure is `C++ exception with description "std::bad_array_new_length"`
+(the buffer iterator walking past the map's end; the server process SIGSEGVs on the same path):
+  ReadsNoRows/1   ((2 ... 2), buffered)
+  ReadsNoRows/7   ([5 ... 1), buffered)
+  ReadsNoRows/9   ([5 ... 1], buffered)
+  ReadsNoRows/11  ((5 ... 1), buffered)
+  ReadsNoRows/13  ((5 ... 1], buffered)
+The cases that pass before the fix: every no-buffer case (base storage already
+guards start >= limit), and buffered [2,2), (2,2], (2 ... (2,1)) and the empty
+range, whose two lower_bounds happen to coincide for these buffered keys.
+
+read_write_transaction_test: EmptyRangeDeletesPreserveBufferedWrites fails with
+`C++ exception with description "std::bad_alloc"` (the delete of (2,2) is
+flattened through TransactionStore::Read).
+
+## Pass-after: this branch
+
+$ bazel test -c opt --jobs=3 --build_tests_only=false \
+    //backend/transaction/... //backend/datamodel/... //binaries:emulator_main
+//backend/datamodel:key_range_test                                       PASSED
+//backend/datamodel:key_set_test                                         PASSED
+//backend/datamodel:key_test                                             PASSED
+//backend/datamodel:types_test                                           PASSED
+//backend/transaction:commit_timestamp_test                              PASSED
+//backend/transaction:flush_test                                         PASSED
+//backend/transaction:foreign_key_restrictions_test                      PASSED
+//backend/transaction:read_only_transaction_test                         PASSED
+//backend/transaction:read_write_transaction_test                        PASSED
+//backend/transaction:resolve_test                                       PASSED
+//backend/transaction:row_cursor_test                                    PASSED
+//backend/transaction:transaction_store_test                             PASSED
+Executed 12 out of 12 tests: 12 tests pass.
+INFO: Build completed successfully   (includes //binaries:emulator_main)
+
+transaction_store_test: 33 test cases, all pass (18 EmptyRanges/EmptyRangeTransactionStoreTest.ReadsNoRows/*).
+read_write_transaction_test: 50 test cases, all pass (incl. EmptyRangeDeletesPreserveBufferedWrites).

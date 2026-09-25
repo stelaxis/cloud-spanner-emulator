@@ -175,6 +175,27 @@ bool ShouldAbortOnFirstCommit() {
          absl::uniform_int_distribution<int>(1, 100)(gen) <= 5;
 }
 
+// --abort_current_transaction_probability: a percentage of commits aborted at
+// random, for testing application retry loops. Zero by default.
+bool ShouldInjectCommitAbort() {
+  int probability = config::abort_current_transaction_probability();
+  if (probability <= 0) {
+    return false;
+  }
+  absl::BitGen gen;
+  return absl::uniform_int_distribution<int>(1, 100)(gen) <= probability;
+}
+
+const Table* FindMutationTable(const MutationOp& mutation_op,
+                               const Schema* schema) {
+  if (IsChangeStreamPartitionTable(mutation_op.table)) {
+    absl::StatusOr<const Table*> table =
+        FindChangeStreamPartitionTable(schema, mutation_op.table);
+    return table.ok() ? *table : nullptr;
+  }
+  return schema->FindTable(mutation_op.table);
+}
+
 RetryState MakeRetryState(const RetryState& retry_state, Clock* clock) {
   RetryState state = retry_state;
   state.priority = (retry_state.priority == 0 ? absl::ToUnixMicros(clock->Now())
@@ -243,9 +264,9 @@ ReadWriteTransaction::ReadWriteTransaction(
       clock_(clock),
       base_storage_(storage),
       versioned_catalog_(versioned_catalog),
-      lock_handle_(lock_manager->CreateHandle(
-          transaction_id, [&]() -> absl::Status { return TryAbort(); },
-          retry_state_.priority)),
+      schema_holder_(versioned_catalog_->GetLatestSchemaShared()),
+      lock_handle_(
+          lock_manager->CreateHandle(transaction_id, retry_state_.priority)),
       commit_timestamp_tracker_(std::make_unique<CommitTimestampTracker>()),
       transaction_store_(std::make_unique<TransactionStore>(
           base_storage_, lock_handle_.get(), commit_timestamp_tracker_.get())),
@@ -254,7 +275,7 @@ ReadWriteTransaction::ReadWriteTransaction(
           std::make_unique<TransactionReadOnlyStore>(transaction_store_.get()),
           std::make_unique<TransactionEffectsBuffer>(&write_ops_queue_),
           clock)),
-      schema_(versioned_catalog_->GetLatestSchema()) {}
+      schema_(schema_holder_.get()) {}
 
 absl::StatusOr<absl::Time> ReadWriteTransaction::GetCommitTimestamp() {
   absl::MutexLock lock(mu_);
@@ -271,6 +292,7 @@ absl::Status ReadWriteTransaction::Read(const ReadArg& read_arg,
                                         std::unique_ptr<RowCursor>* cursor) {
   return GuardedCall(OpType::kRead, [&]() -> absl::Status {
     mu_.AssertHeld();
+    GOOGLESQL_RETURN_IF_ERROR(AcquireSnapshot());
 
     GOOGLESQL_ASSIGN_OR_RETURN(const ResolvedReadArg& resolved_read_arg,
                      ResolveReadArg(read_arg, schema_));
@@ -284,7 +306,7 @@ absl::Status ReadWriteTransaction::Read(const ReadArg& read_arg,
       iterators.push_back(std::move(itr));
     }
     *cursor = std::make_unique<StorageIteratorRowCursor>(
-        std::move(iterators), resolved_read_arg.columns);
+        std::move(iterators), resolved_read_arg.columns, schema_holder_);
     return absl::OkStatus();
   });
 }
@@ -313,9 +335,113 @@ void ReadWriteTransaction::UpdateTrackedCommitTimestamps() {
 const Schema* ReadWriteTransaction::schema() const {
   absl::MutexLock lock(mu_);
   if (state_ == State::kUninitialized) {
-    return versioned_catalog_->GetLatestSchema();
+    // Before the first data operation, hand out the latest schema and keep
+    // it: callers analyze the request against it, and the first data
+    // operation runs on it (GuardedCall).
+    std::shared_ptr<const Schema> latest =
+        versioned_catalog_->GetLatestSchemaShared();
+    if (latest.get() != schema_) {
+      retired_schemas_.push_back(std::move(schema_holder_));
+      schema_holder_ = std::move(latest);
+      schema_ = schema_holder_.get();
+    }
+    schema_handed_out_ = true;
   }
   return schema_;
+}
+
+absl::Status ReadWriteTransaction::AcquireSnapshot() {
+  mu_.AssertHeld();
+  absl::Time snapshot = lock_handle_->SnapshotTimestamp();
+  // A schema change that committed before the snapshot is visible in storage
+  // at it, but this transaction runs against the older schema.
+  if (versioned_catalog_->GetSchema(snapshot) != schema_) {
+    return error::AbortDueToConcurrentSchemaChange(id_);
+  }
+  return absl::OkStatus();
+}
+
+void ReadWriteTransaction::RecordMutationReads(const Mutation& mutation) {
+  mu_.AssertHeld();
+  for (const MutationOp& mutation_op : mutation.ops()) {
+    const Table* table = FindMutationTable(mutation_op, schema_);
+    if (table == nullptr) {
+      continue;
+    }
+    if (mutation_op.type == MutationOpType::kDelete) {
+      absl::StatusOr<ResolvedMutationOp> resolved =
+          ResolveDeleteMutationOp(mutation_op, schema_, clock_->Now());
+      if (!resolved.ok()) {
+        continue;
+      }
+      for (const KeyRange& key_range : resolved->key_ranges) {
+        transaction_store_->RecordRead(resolved->table, key_range);
+      }
+      continue;
+    }
+    // Keys are computed from the supplied columns only: evaluating default or
+    // generated key columns here could have side effects (sequences). Such
+    // rows are read while they are flattened; until then the whole table
+    // stands in for them when an error is validated (AbortIfReadSetStale).
+    if (!ValidateNonDeleteMutationOp(mutation_op, schema_).ok()) {
+      continue;
+    }
+    absl::StatusOr<std::vector<const Column*>> columns =
+        GetColumnsByName(table, mutation_op.columns);
+    if (!columns.ok()) {
+      continue;
+    }
+    absl::StatusOr<std::vector<std::optional<int>>> key_indices =
+        ExtractPrimaryKeyIndices(*columns, table->primary_key());
+    if (!key_indices.ok() ||
+        absl::c_any_of(*key_indices, [](const std::optional<int>& index) {
+          return !index.has_value();
+        })) {
+      unrecorded_key_tables_.push_back(table);
+      continue;
+    }
+    for (const ValueList& row : mutation_op.rows) {
+      if (row.size() != columns->size()) {
+        continue;
+      }
+      absl::StatusOr<ValueList> resolved_row =
+          MaybeSetCommitTimestampSentinel(*columns, row);
+      if (!resolved_row.ok()) {
+        continue;
+      }
+      transaction_store_->RecordRead(
+          table, KeyRange::Point(ComputeKey(*resolved_row, table->primary_key(),
+                                            *key_indices)));
+    }
+  }
+}
+
+absl::Status ReadWriteTransaction::AbortIfReadSetStale(
+    const absl::Status& status) {
+  mu_.AssertHeld();
+  if (status.ok() || status.code() == absl::StatusCode::kAborted) {
+    return status;
+  }
+  bool stale = lock_handle_->ReadSetIsStale() ||
+               absl::c_any_of(unrecorded_key_tables_, [&](const Table* table) {
+                 return lock_handle_->TableChangedSinceSnapshot(table->id());
+               });
+  return stale ? error::AbortReadSetConflict(id_) : status;
+}
+
+absl::Status ReadWriteTransaction::MaybeAbortOnStaleReads(
+    const absl::Status& status) {
+  absl::MutexLock lock(mu_);
+  if (state_ != State::kActive) {
+    return status;
+  }
+  absl::Status result = AbortIfReadSetStale(status);
+  if (result.code() == absl::StatusCode::kAborted &&
+      status.code() != absl::StatusCode::kAborted) {
+    Reset();
+    ++retry_state_.abort_retry_count;
+  }
+  return result;
 }
 
 void ReadWriteTransaction::Reset() {
@@ -323,6 +449,8 @@ void ReadWriteTransaction::Reset() {
 
   lock_handle_->UnlockAll();
   transaction_store_->Clear();
+  unrecorded_key_tables_.clear();
+  schema_handed_out_ = false;
   std::queue<WriteOp> empty;
   write_ops_queue_.swap(empty);
   state_ = State::kUninitialized;
@@ -354,7 +482,21 @@ absl::Status ReadWriteTransaction::GuardedCall(
       break;
     }
     case State::kUninitialized: {
-      schema_ = versioned_catalog_->GetLatestSchema();
+      std::shared_ptr<const Schema> latest =
+          versioned_catalog_->GetLatestSchemaShared();
+      if (latest.get() != schema_) {
+        // The caller may have analyzed this request against the schema that
+        // schema() handed out, which a schema change has since replaced.
+        if (schema_handed_out_ && op != OpType::kRollback) {
+          Reset();
+          ++retry_state_.abort_retry_count;
+          return error::AbortDueToConcurrentSchemaChange(id_);
+        }
+        retired_schemas_.push_back(std::move(schema_holder_));
+        schema_holder_ = std::move(latest);
+        schema_ = schema_holder_.get();
+      }
+      schema_handed_out_ = false;
       auto maybe_action_registry =
           action_manager_->GetActionsForSchema(schema_);
       if (!maybe_action_registry.ok()) {
@@ -377,6 +519,14 @@ absl::Status ReadWriteTransaction::GuardedCall(
   }
 
   absl::Status status = fn();
+
+  // A constraint error raised against a stale snapshot may not hold at the
+  // latest committed state, and clients treat constraint errors as final.
+  // Report ABORTED instead, so the client retries (Lean model: `errCode`,
+  // theorems `target_errors_latest` and `target_commit_errors_latest`).
+  if (op == OpType::kWrite || op == OpType::kCommit) {
+    status = AbortIfReadSetStale(status);
+  }
 
   if (!status.ok()) {
     if (status.code() == absl::StatusCode::kAborted) {
@@ -499,6 +649,11 @@ ReadWriteTransaction::ResolveNonDeleteMutationOp(const MutationOp& mutation_op,
 absl::Status ReadWriteTransaction::Write(const Mutation& mutation) {
   return GuardedCall(OpType::kWrite, [&]() -> absl::Status {
     mu_.AssertHeld();
+    GOOGLESQL_RETURN_IF_ERROR(AcquireSnapshot());
+    // Every mutation's rows are read before any is applied, so that an error
+    // from one mutation is validated against the rows of all of them (Lean:
+    // `fp (.commit ms)`).
+    RecordMutationReads(mutation);
     ForeignKeyRestrictions fk_restrictions;
 
     // When writing, comparison may be required in the process. Comparison of
@@ -601,6 +756,8 @@ absl::Status ReadWriteTransaction::Write(const Mutation& mutation) {
     // to effector reads if the updates are split into separate Write calls, but
     // should succeed if written together).
     UpdateTrackedCommitTimestamps();
+    // Every row has now been flattened, and so read.
+    unrecorded_key_tables_.clear();
     return absl::OkStatus();
   });
 }
@@ -611,6 +768,9 @@ absl::Status ReadWriteTransaction::Commit() {
 
     if (retry_state_.abort_retry_count == 0 && ShouldAbortOnFirstCommit()) {
       return error::AbortReadWriteTransactionOnFirstCommit(id_);
+    }
+    if (ShouldInjectCommitAbort()) {
+      return error::AbortInjectedAtCommit(id_);
     }
     GOOGLESQL_RETURN_IF_ERROR(ProcessChangeStreamWriteOps());
 
@@ -623,16 +783,30 @@ absl::Status ReadWriteTransaction::Commit() {
         std::unique_ptr<postgres_translator::interfaces::PGArena> arena,
         postgres_translator::spangres::MemoryContextPGArena::Init(nullptr));
 
-    // Pick a commit timestamp.
-    GOOGLESQL_ASSIGN_OR_RETURN(commit_timestamp_, lock_handle_->ReserveCommitTimestamp());
-
-    // Write the mutations to the base storage.
-    absl::Status flush_status = FlushWriteOpsToStorage(
-        transaction_store_->GetBufferedOps(), base_storage_, commit_timestamp_);
-    GOOGLESQL_RETURN_IF_ERROR(lock_handle_->MarkCommitted());
-    if (!flush_status.ok()) {
-      return flush_status;
-    }
+    // Validate the read set, pick a commit timestamp and write the mutations
+    // to the base storage, atomically with respect to other commits.
+    GOOGLESQL_ASSIGN_OR_RETURN(
+        commit_timestamp_,
+        lock_handle_->Commit(
+            [&]() -> absl::Status {
+              if (versioned_catalog_->GetLatestSchema() != schema_) {
+                return error::AbortDueToConcurrentSchemaChange(id_);
+              }
+              return absl::OkStatus();
+            },
+            [&](absl::Time commit_timestamp) -> absl::Status {
+              GOOGLESQL_RETURN_IF_ERROR(FlushWriteOpsToStorage(
+                  transaction_store_->GetBufferedOps(), base_storage_,
+                  commit_timestamp));
+              for (const auto& [table, key] :
+                   transaction_store_->GetCancelledWrites()) {
+                GOOGLESQL_RETURN_IF_ERROR(base_storage_->MarkWritten(
+                    commit_timestamp, table->id(),
+                    MaybeSetCommitTimestamp(table->primary_key(), key,
+                                            commit_timestamp)));
+              }
+              return absl::OkStatus();
+            }));
 
     // Mark the transaction as committed.
     state_ = State::kCommitted;
@@ -657,28 +831,6 @@ absl::Status ReadWriteTransaction::Rollback() {
 
     return absl::OkStatus();
   });
-}
-
-absl::Status ReadWriteTransaction::TryAbort() {
-  if (!mu_.try_lock()) {
-    return error::CouldNotObtainTransactionMutex(id());
-  }
-
-  if (state_ != State::kActive) {
-    mu_.unlock();
-    return error::TransactionClosed(id());
-  }
-
-  // Reset the transaction and release the lock handle.
-  // Aborts do not invalidate the transaction.
-  // Reset();
-  ++retry_state_.abort_retry_count;
-
-  // Mark the transaction as aborted.
-  state_ = State::kAborted;
-
-  mu_.unlock();
-  return absl::OkStatus();
 }
 
 absl::Status ReadWriteTransaction::Invalidate() {

@@ -1,0 +1,13 @@
+$ go test -count=1 ./...
+ok  	github.com/stelaxis/cloud-spanner-emulator/verification/conformance	2.363s
+$ go test -count=1 -v -run "EmptyRange|GeneratorIncludes" .
+=== RUN   TestEmptyRangeRegressionModel
+=== RUN   TestEmptyRangeRegressionModel/upstream
+=== RUN   TestEmptyRangeRegressionModel/target
+--- PASS: TestEmptyRangeRegressionModel (0.07s)
+    --- PASS: TestEmptyRangeRegressionModel/upstream (0.03s)
+    --- PASS: TestEmptyRangeRegressionModel/target (0.03s)
+=== RUN   TestGeneratorIncludesEmptyRanges
+--- PASS: TestGeneratorIncludesEmptyRanges (0.00s)
+PASS
+ok  	github.com/stelaxis/cloud-spanner-emulator/verification/conformance	0.372s

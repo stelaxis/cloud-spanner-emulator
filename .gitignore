@@ -3,3 +3,8 @@ bazel-cloud-spanner-emulator
 bazel-genfiles
 bazel-out
 bazel-testlogs
+
+# Written into the source tree by
+# //third_party/spanner_pg/bootstrap_catalog:generate_bootstrap_catalog_srcs.
+/third_party/spanner_pg/bootstrap_catalog/spanner_pg_data/pg_aggregate.dat
+/third_party/spanner_pg/bootstrap_catalog/spanner_pg_data/pg_proc.dat

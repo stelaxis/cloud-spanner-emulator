@@ -148,6 +148,8 @@ absl::Status AbortCurrentTransaction(backend::TransactionID holder_id,
 absl::Status WoundedTransaction(backend::TransactionID id);
 absl::Status CouldNotObtainLockHandleMutex(backend::TransactionID id);
 absl::Status CouldNotObtainTransactionMutex(backend::TransactionID id);
+absl::Status AbortReadSetConflict(backend::TransactionID id);
+absl::Status AbortInjectedAtCommit(backend::TransactionID id);
 absl::Status TransactionNotFound(backend::TransactionID id);
 absl::Status TransactionClosed(backend::TransactionID id);
 absl::Status InvalidTransactionID(backend::TransactionID id);

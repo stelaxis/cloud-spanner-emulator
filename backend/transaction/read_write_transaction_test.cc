@@ -66,8 +66,8 @@ class ReadWriteTransactionTest : public testing::Test {
   ReadWriteTransactionTest() = default;
   void SetUp() override {
     type_factory_ = std::make_unique<googlesql::TypeFactory>();
-    lock_manager_ = std::make_unique<LockManager>(&clock_);
     storage_ = std::make_unique<InMemoryStorage>();
+    lock_manager_ = std::make_unique<LockManager>(&clock_, storage_.get());
     versioned_catalog_ =
         std::make_unique<VersionedCatalog>(std::move(GetSchema()).value());
     action_manager_ = std::make_unique<ActionManager>();
@@ -190,6 +190,35 @@ TEST_F(ReadWriteTransactionTest, CanReadAfterFlush) {
                                 {Int64(3), String("value3")}}));
 }
 
+TEST_F(ReadWriteTransactionTest, EmptyRangeDeletesPreserveBufferedWrites) {
+  auto txn = CreateReadWriteTransaction();
+  Mutation insert;
+  insert.AddWriteOp(MutationOpType::kInsert, "test_table",
+                    {"int64_col", "string_col"},
+                    {{Int64(1), String("one")}, {Int64(2), String("two")},
+                     {Int64(3), String("three")}});
+  GOOGLESQL_ASSERT_OK(txn->Write(insert));
+
+  for (const KeyRange& range : {
+           KeyRange::OpenOpen(Key({Int64(2)}), Key({Int64(2)})),
+           KeyRange::ClosedOpen(Key({Int64(3)}), Key({Int64(1)})),
+           KeyRange::OpenClosed(Key({Int64(2)}), Key({Int64(2)}))}) {
+    SCOPED_TRACE(range.DebugString());
+    Mutation remove;
+    remove.AddDeleteOp("test_table", KeySet(range));
+    GOOGLESQL_ASSERT_OK(txn->Write(remove));
+    EXPECT_THAT(ReadUsingIndex(txn.get(), KeySet(range), "", {"int64_col"}),
+                IsOkAndHoldsRows({}));
+  }
+  GOOGLESQL_ASSERT_OK(txn->Commit());
+
+  auto verify_txn = CreateReadWriteTransaction();
+  EXPECT_THAT(ReadAll(verify_txn.get(), {"int64_col", "string_col"}),
+              IsOkAndHoldsRows({{Int64(1), String("one")},
+                               {Int64(2), String("two")},
+                               {Int64(3), String("three")}}));
+}
+
 TEST_F(ReadWriteTransactionTest, ReadEmptyDatabase) {
   auto txn1 = CreateReadWriteTransaction();
   EXPECT_THAT(ReadAll(txn1.get(), {"int64_col", "string_col"}),
@@ -292,10 +321,7 @@ TEST_F(ReadWriteTransactionTest, CommitWithMultipleChangesToDatabase) {
               IsOkAndHoldsRows({{String("value-2")}, {String("value")}}));
 }
 
-TEST_F(ReadWriteTransactionTest,
-       ConcurrentReadWriteTransactionsReturnsAborted) {
-  auto current_probability = config::abort_current_transaction_probability();
-  config::set_abort_current_transaction_probability(0);
+TEST_F(ReadWriteTransactionTest, ConcurrentTransactionsOnDisjointRowsCommit) {
   // Started "writes" on first transaction.
   Mutation m1;
   m1.AddWriteOp(MutationOpType::kInsert, "test_table",
@@ -304,26 +330,23 @@ TEST_F(ReadWriteTransactionTest,
   auto txn1 = CreateReadWriteTransaction();
   GOOGLESQL_EXPECT_OK(txn1->Write(m1));
 
-  // Before commiting first transaction, starting another transaction is in
-  // progress. Write for second transaction should consistently ABORT.
+  // A second transaction writing a different row, while the first is open,
+  // proceeds and both commit.
   auto txn2 = CreateReadWriteTransaction();
   Mutation m2;
   m2.AddWriteOp(MutationOpType::kInsert, "test_table",
                 {"int64_col", "string_col"}, {{Int64(2), String("value-2")}});
-  for (int i = 0; i < 5; i++) {
-    EXPECT_THAT(txn2->Write(m2), StatusIs(absl::StatusCode::kAborted));
-  }
+  GOOGLESQL_EXPECT_OK(txn2->Write(m2));
 
-  // Commit the first transaction.
   GOOGLESQL_EXPECT_OK(txn1->Commit());
   EXPECT_EQ(txn1->state(), ReadWriteTransaction::State::kCommitted);
-
-  // Now, secondary transaction can write / commit.
-  GOOGLESQL_EXPECT_OK(txn2->Write(m2));
   GOOGLESQL_EXPECT_OK(txn2->Commit());
   EXPECT_EQ(txn2->state(), ReadWriteTransaction::State::kCommitted);
 
-  config::set_abort_current_transaction_probability(current_probability);
+  auto txn3 = CreateReadWriteTransaction();
+  EXPECT_THAT(ReadAll(txn3.get(), {"int64_col", "string_col"}),
+              IsOkAndHoldsRows({{Int64(1), String("value-1")},
+                                {Int64(2), String("value-2")}}));
 }
 
 TEST_F(ReadWriteTransactionTest, ConcurrentTransactionsEventuallySucceed) {
@@ -468,8 +491,9 @@ TEST_F(ReadWriteTransactionTest, OneTransactionDoesNotBlockAllOthers) {
     }
   }
 
-  // Verify that the first transaction was aborted.
-  EXPECT_EQ(cur_txn->state(), ReadWriteTransaction::State::kAborted);
+  // The first transaction read the row the other one overwrote: its commit
+  // fails validation.
+  EXPECT_THAT(cur_txn->Commit(), StatusIs(absl::StatusCode::kAborted));
 
   // Verify the value.
   auto verify_txn = CreateReadWriteTransaction();

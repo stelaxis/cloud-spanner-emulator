@@ -44,12 +44,18 @@ ABSL_FLAG(bool, disable_query_null_filtered_index_check, false,
           "for all the queries at once.");
 
 ABSL_FLAG(
-    int, abort_current_transaction_probability, 20,
-    "The probability that the emulator will try to abort the current "
-    "transaction if a new transaction is requested. A higher value gives "
-    "higher priority to new transactions. A lower value gives higher priority "
-    "to the current transaction. A value of zero means that the emulator will "
-    "never abort the current transaction.");
+    int, abort_current_transaction_probability, 0,
+    "The percentage (0-100) of read-write transaction commits that the "
+    "emulator aborts at random, to test application abort-retry loops. "
+    "Read-write transactions run concurrently and abort only on a conflict, "
+    "so this is the only source of random aborts. Zero disables it.");
+
+ABSL_FLAG(
+    bool, enable_query_key_pushdown, true,
+    "If true, primary key predicates in SQL queries and DML (equality, IN and "
+    "range comparisons with literals or parameters) narrow the key ranges a "
+    "statement reads, and so the ranges its transaction validates at commit. "
+    "If false, every query and UPDATE/DELETE reads its tables in full.");
 
 namespace google {
 namespace spanner {
@@ -74,6 +80,14 @@ int abort_current_transaction_probability() {
 
 void set_abort_current_transaction_probability(int probability) {
   absl::SetFlag(&FLAGS_abort_current_transaction_probability, probability);
+}
+
+bool query_key_pushdown_enabled() {
+  return absl::GetFlag(FLAGS_enable_query_key_pushdown);
+}
+
+void set_query_key_pushdown_enabled(bool enabled) {
+  absl::SetFlag(&FLAGS_enable_query_key_pushdown, enabled);
 }
 
 }  // namespace config
