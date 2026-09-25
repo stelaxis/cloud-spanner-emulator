@@ -22,6 +22,7 @@
 #include <functional>
 #include <utility>
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -80,6 +81,15 @@ void Clock::SetLease(absl::Time lease, LeaseExtender extend) {
   absl::MutexLock lock(mu_);
   lease_ = lease;
   extend_lease_ = std::move(extend);
+}
+
+absl::Status Clock::CoverWithLease(absl::Time timestamp) {
+  absl::MutexLock lock(mu_);
+  if (!extend_lease_ || timestamp <= lease_) return absl::OkStatus();
+  absl::StatusOr<absl::Time> lease = extend_lease_(timestamp);
+  if (!lease.ok()) return lease.status();
+  lease_ = std::max(lease_, *lease);
+  return absl::OkStatus();
 }
 
 absl::Time Clock::lease() {

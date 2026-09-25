@@ -19,6 +19,7 @@
 
 #include <functional>
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
@@ -63,6 +64,11 @@ class Clock {
       std::function<absl::StatusOr<absl::Time>(absl::Time needed)>;
   void SetLease(absl::Time lease, LeaseExtender extend)
       ABSL_LOCKS_EXCLUDED(mu_);
+
+  // Extends the lease, durably, to cover `timestamp` if it does not already:
+  // for timestamps a caller chose rather than Now() handed out. OK without a
+  // lease.
+  absl::Status CoverWithLease(absl::Time timestamp) ABSL_LOCKS_EXCLUDED(mu_);
 
   // The current lease, or InfiniteFuture without one.
   absl::Time lease() ABSL_LOCKS_EXCLUDED(mu_);

@@ -6309,7 +6309,8 @@ absl::Status SchemaUpdaterImpl::DropChangeStream(
 
 absl::Status SchemaUpdaterImpl::DropSequence(const Sequence* drop_sequence) {
   global_names_.RemoveName(drop_sequence->Name());
-  drop_sequence->RemoveSequenceFromLastValuesMap();
+  // Its counter is forgotten by Database only once the drop has taken
+  // effect; this statement can still fail validation.
   GOOGLESQL_RETURN_IF_ERROR(DropNode(drop_sequence));
   return absl::OkStatus();
 }

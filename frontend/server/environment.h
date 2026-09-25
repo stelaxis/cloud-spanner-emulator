@@ -59,6 +59,12 @@ class ServerEnv {
     return absl::OkStatus();
   }
 
+  // The databases are destroyed before persistence, which they log through;
+  // a checkpoint must not run meanwhile and find them gone.
+  ~ServerEnv() {
+    if (persistence_ != nullptr) persistence_->StopCheckpoints();
+  }
+
   persistence::PersistenceManager* persistence() { return persistence_.get(); }
 
   Clock* clock() { return clock_.get(); }

@@ -440,16 +440,19 @@ absl::Status Log::RemoveSegmentsBelow(uint64_t boundary) {
   absl::MutexLock lock(mu_);
   boundary = std::min(boundary, checkpoint_boundary_);
   size_t removed = 0;
+  absl::Status status;
   while (removed + 1 < segments_.size() && segments_[removed + 1] <= boundary) {
-    if (auto status = fs_->Remove(Path(SegmentName(segments_[removed])));
-        !status.ok() && !absl::IsNotFound(status)) {
-      break;
-    }
+    status = fs_->Remove(Path(SegmentName(segments_[removed])));
+    if (!status.ok() && !absl::IsNotFound(status)) break;
+    status = absl::OkStatus();
     ++removed;
   }
   segments_.erase(segments_.begin(), segments_.begin() + removed);
-  if (removed == 0) return absl::OkStatus();
-  return fs_->SyncDir(dir_);
+  if (removed > 0) {
+    absl::Status synced = fs_->SyncDir(dir_);
+    if (status.ok()) status = synced;
+  }
+  return status;
 }
 
 uint64_t Log::CurrentSegmentBytes() {

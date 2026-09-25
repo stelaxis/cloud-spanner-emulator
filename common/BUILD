@@ -32,6 +32,7 @@ cc_library(
     srcs = ["clock.cc"],
     hdrs = ["clock.h"],
     deps = [
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",

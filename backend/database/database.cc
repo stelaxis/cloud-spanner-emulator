@@ -219,6 +219,13 @@ Database::CreateReadOnlyTransaction(const ReadOnlyOptions& options) {
     return error::ReadTimestampBeforeRestart(transaction->read_timestamp(),
                                              restart_floor_);
   }
+  if (log_ != nullptr) {
+    // A caller-chosen timestamp (exact or minimum bound) can be past the
+    // clock's lease, and BeginTransaction returns it. Cover it durably, so
+    // that after a crash the clock resumes above it.
+    GOOGLESQL_RETURN_IF_ERROR(
+        clock_->CoverWithLease(transaction->read_timestamp()));
+  }
   return transaction;
 }
 
@@ -309,14 +316,40 @@ absl::Status Database::ApplySchemaChangeLocked(
   auto context = GetSchemaChangeContext();
   context.schema_change_timestamp = update_timestamp;
   if (recorded.has_value()) context.storage = &*recorded;
-  const Schema* existing_schema = versioned_catalog_->GetLatestSchema();
+  // Owned: the sequences it drops are cleaned up after it is replaced.
+  std::shared_ptr<const Schema> existing_schema =
+      versioned_catalog_->GetLatestSchemaShared();
   SchemaUpdater updater;
-  GOOGLESQL_ASSIGN_OR_RETURN(auto result,
-                   updater.UpdateSchemaFromDDL(
-                       existing_schema, schema_change_operation, context));
+  GOOGLESQL_ASSIGN_OR_RETURN(
+      auto result,
+      updater.UpdateSchemaFromDDL(existing_schema.get(),
+                                  schema_change_operation, context));
   *commit_timestamp = update_timestamp;
   *num_succesful_statements = result.num_successful_statements;
   *backfill_status = result.backfill_status;
+
+  // With --data_dir, the new schema is published only once its record is
+  // synced: nothing (GetDatabaseDdl, queries, new transactions) can see it
+  // before. Its backfill writes are already in storage but invisible, since
+  // reads at or after its timestamp wait until it is marked committed. They
+  // cannot be undone, so if the record fails the emulator stops; restarting
+  // recovers what the log holds.
+  if (log_ != nullptr &&
+      (result.updated_schema != nullptr || !recorded->ops().empty())) {
+    PersistedSchema persisted = GetPersistedSchema();
+    if (result.updated_schema != nullptr) {
+      // Borrowed for the call; `result` owns it.
+      persisted.schema = std::shared_ptr<const Schema>(
+          std::shared_ptr<const Schema>(), result.updated_schema.get());
+    }
+    absl::Status status =
+        log_->LogSchemaChange(update_timestamp, persisted, recorded->ops());
+    if (!status.ok()) {
+      std::fprintf(stderr, "Cannot log a schema change of database %s: %s\n",
+                   database_id_.c_str(), status.ToString().c_str());
+      std::abort();
+    }
+  }
 
   // We update the schema even if the backfill status was not OK, the returned
   // schema will be the schema for the last valid statement before the statement
@@ -327,6 +360,16 @@ absl::Status Database::ApplySchemaChangeLocked(
     action_manager_->AddActionsForSchema(versioned_catalog_->GetLatestSchema(),
                                          query_engine_->function_catalog(),
                                          query_engine_->type_factory());
+    // Forget the counters of dropped sequences only now that the drop has
+    // taken effect: a DROP SEQUENCE that fails validation keeps its state.
+    const Schema* latest = versioned_catalog_->GetLatestSchema();
+    for (const Sequence* sequence : existing_schema->sequences()) {
+      bool kept = false;
+      for (const Sequence* current : latest->sequences()) {
+        if (current->id() == sequence->id()) kept = true;
+      }
+      if (!kept) sequence->RemoveSequenceFromLastValuesMap();
+    }
   }
   // Some functions need to access the schema (e.g. sequence functions), so
   // set the latest schema to the function catalog here.
@@ -341,20 +384,6 @@ absl::Status Database::ApplySchemaChangeLocked(
   storage_->CleanUpDeletedColumns(update_timestamp);
   versioned_catalog_->RemoveExpiredSchemas(update_timestamp);
 
-  // The change is already applied in memory but not yet visible: reads at or
-  // after its timestamp wait until it is marked committed. It cannot be
-  // undone, so if its record fails the emulator stops rather than let anyone
-  // see a change that may be lost; restarting recovers what the log holds.
-  if (log_ != nullptr &&
-      (*num_succesful_statements > 0 || !recorded->ops().empty())) {
-    absl::Status status = log_->LogSchemaChange(
-        update_timestamp, GetPersistedSchema(), recorded->ops());
-    if (!status.ok()) {
-      std::fprintf(stderr, "Cannot log a schema change of database %s: %s\n",
-                   database_id_.c_str(), status.ToString().c_str());
-      std::abort();
-    }
-  }
   return absl::OkStatus();
 }
 

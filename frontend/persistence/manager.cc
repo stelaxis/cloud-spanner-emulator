@@ -204,20 +204,28 @@ absl::Status LoadRows(const DatabaseImage& image, absl::Time data_timestamp,
     for (const StorageOp& stored : *ops) {
       auto columns = live.find(stored.table_id());
       if (columns == live.end()) continue;
-      GOOGLESQL_ASSIGN_OR_RETURN(backend::StorageOp op,
-                                 DecodeOp(stored, type_factory, bundle));
-      if (auto* write = std::get_if<backend::StorageWrite>(&op)) {
-        backend::StorageWrite kept{write->table_id, write->key, {}, {}};
-        for (size_t i = 0; i < write->column_ids.size(); ++i) {
-          if (columns->second.contains(write->column_ids[i])) {
-            kept.column_ids.push_back(write->column_ids[i]);
-            kept.values.push_back(write->values[i]);
+      // Drop the values of columns that are gone before decoding: their
+      // types (a proto or enum) may be gone from the schema too.
+      StorageOp kept;
+      const StorageOp* op = &stored;
+      if (stored.has_write()) {
+        kept.set_table_id(stored.table_id());
+        StorageOp::Write* write = kept.mutable_write();
+        *write->mutable_key() = stored.write().key();
+        for (int i = 0; i < stored.write().column_ids_size() &&
+                        i < stored.write().values_size();
+             ++i) {
+          if (columns->second.contains(stored.write().column_ids(i))) {
+            write->add_column_ids(stored.write().column_ids(i));
+            *write->add_values() = stored.write().values(i);
           }
         }
-        op = std::move(kept);
+        op = &kept;
       }
+      GOOGLESQL_ASSIGN_OR_RETURN(backend::StorageOp decoded,
+                                 DecodeOp(*op, type_factory, bundle));
       GOOGLESQL_RETURN_IF_ERROR(
-          backend::ApplyStorageOps(timestamp, {op}, storage));
+          backend::ApplyStorageOps(timestamp, {decoded}, storage));
     }
   }
   return absl::OkStatus();
@@ -453,12 +461,16 @@ absl::Status PersistenceManager::Recover(const LogContents& contents,
   return absl::OkStatus();
 }
 
-PersistenceManager::~PersistenceManager() {
+void PersistenceManager::StopCheckpoints() {
   {
     absl::MutexLock lock(thread_mu_);
     stop_ = true;
   }
   if (thread_.joinable()) thread_.join();
+}
+
+PersistenceManager::~PersistenceManager() {
+  StopCheckpoints();
   backend::Sequence::SetReservationHook(nullptr);
   clock_->SetLease(absl::InfiniteFuture(), nullptr);
 }
@@ -520,7 +532,12 @@ absl::Status PersistenceManager::Checkpoint() {
     }
     for (const auto& [incarnation, live] : databases_) {
       std::shared_ptr<Database> database = live.database.lock();
-      if (database == nullptr) continue;
+      if (database == nullptr) {
+        // Only a teardown in the wrong order gets here. Skipping the
+        // database would checkpoint it, and its log, out of existence.
+        return absl::FailedPreconditionError(absl::StrCat(
+            "Database ", live.state.uri(), " is gone but was not dropped"));
+      }
       DatabaseCheckpoint* out = checkpoint.add_databases();
       *out->mutable_database() = live.state;
       backend::PersistedSchema schema =

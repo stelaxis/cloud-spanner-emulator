@@ -74,6 +74,10 @@ class PersistenceManager : public CatalogPersistence {
   // Stops the checkpoint thread and detaches from the clock and sequences.
   ~PersistenceManager() override;
 
+  // Stops and joins the checkpoint thread. Call before destroying the
+  // databases: logging keeps working meanwhile.
+  void StopCheckpoints() ABSL_LOCKS_EXCLUDED(thread_mu_);
+
   // Writes a checkpoint and removes the log it covers.
   absl::Status Checkpoint() ABSL_LOCKS_EXCLUDED(checkpoint_mu_, gate_);
 

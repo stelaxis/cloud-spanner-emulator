@@ -186,6 +186,7 @@ cc_test(
         "//frontend/collections:database_manager",
         "//frontend/collections:instance_manager",
         "//frontend/entities:database",
+        "//frontend/server:environment",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -198,5 +199,6 @@ cc_test(
         "@com_google_googlesql//googlesql/public:json_value",
         "@com_google_googlesql//googlesql/public:value",
         "@com_google_googletest//:gtest_main",
+        "@com_google_protobuf//:protobuf",
     ],
 )

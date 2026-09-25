@@ -26,6 +26,8 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/cord.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/synchronization/mutex.h"
@@ -50,7 +52,10 @@
 #include "frontend/entities/database.h"
 #include "frontend/persistence/manager.h"
 #include "frontend/persistence/mem_file_system.h"
+#include "frontend/server/environment.h"
 #include "gmock/gmock.h"
+#include "google/protobuf/descriptor.pb.h"
+#include "google/protobuf/text_format.h"
 #include "google/spanner/admin/database/v1/common.pb.h"
 #include "google/spanner/admin/instance/v1/spanner_instance_admin.pb.h"
 #include "googlesql/base/testing/status_matchers.h"
@@ -579,17 +584,39 @@ TEST_F(PersistenceTest, FailedSyncFailsTheCommitAndEveryLaterOne) {
   EXPECT_THAT(rows[0], ::testing::HasSubstr("durable"));
 }
 
+// One checkpoint stage: the operation that fails and the file it acts on.
+struct CheckpointStage {
+  std::string name;
+  Op op;
+  std::string path;  // substring of the path
+  // Whether the checkpoint is published (renamed into place and the
+  // directory synced) before the stage fails.
+  bool published;
+};
+
 TEST_F(PersistenceTest, CrashAtAnyCheckpointStageKeepsAcknowledgedData) {
-  for (Op failing :
-       {Op::kOpen, Op::kSync, Op::kRename, Op::kSyncDir, Op::kRemove}) {
-    SCOPED_TRACE(static_cast<int>(failing));
+  const std::vector<CheckpointStage> stages = {
+      {"segment open", Op::kOpen, "/wal-", false},
+      {"segment header write", Op::kAppend, "/wal-", false},
+      {"segment sync", Op::kSync, "/wal-", false},
+      {"segment directory sync", Op::kSyncDir, "/data", false},
+      {"temporary file open", Op::kOpen, "checkpoint.tmp", false},
+      {"temporary file write", Op::kAppend, "checkpoint.tmp", false},
+      {"temporary file sync", Op::kSync, "checkpoint.tmp", false},
+      {"rename", Op::kRename, "checkpoint.tmp", false},
+      {"publishing directory sync", Op::kSyncDir, "/data", false},
+      {"truncation", Op::kRemove, "/wal-", true},
+  };
+  for (const CheckpointStage& stage : stages) {
+    SCOPED_TRACE(stage.name);
     fs_.SetHook(nullptr);
     fs_.Crash();
     auto names = fs_.ListDir("/data");
     GOOGLESQL_ASSERT_OK(names.status());
     for (const std::string& name : *names) {
-      if (name != "LOCK")
+      if (name != "LOCK") {
         GOOGLESQL_ASSERT_OK(fs_.Remove(absl::StrCat("/data/", name)));
+      }
     }
     GOOGLESQL_ASSERT_OK(fs_.SyncDir("/data"));
     auto emulator = StartOrDie(FrozenSystemClock);
@@ -597,9 +624,25 @@ TEST_F(PersistenceTest, CrashAtAnyCheckpointStageKeepsAcknowledgedData) {
     GOOGLESQL_ASSERT_OK(Commit(db.get(), InsertAccount("before", 1)).status());
     GOOGLESQL_ASSERT_OK(emulator->persistence->Checkpoint());
     GOOGLESQL_ASSERT_OK(Commit(db.get(), InsertAccount("between", 2)).status());
-    FailOn(failing);
-    (void)emulator->persistence->Checkpoint();
+
+    // Fail the first operation of the stage; the publishing directory sync
+    // is the one after the rename.
+    auto fired = std::make_shared<std::atomic<bool>>(false);
+    auto renamed = std::make_shared<std::atomic<bool>>(false);
+    fs_.SetHook([stage, fired, renamed](Op op, const std::string& path) {
+      if (op == Op::kRename) *renamed = true;
+      bool matches = op == stage.op && absl::StrContains(path, stage.path) &&
+                     !*fired &&
+                     (stage.name != "publishing directory sync" || *renamed);
+      if (matches) {
+        *fired = true;
+        return absl::InternalError("injected I/O error");
+      }
+      return absl::OkStatus();
+    });
+    EXPECT_FALSE(emulator->persistence->Checkpoint().ok());
     fs_.SetHook(nullptr);
+    EXPECT_TRUE(*fired) << "the checkpoint never reached " << stage.name;
     GOOGLESQL_ASSERT_OK(Commit(db.get(), InsertAccount("after", 3)).status());
     const auto storage = DumpStorage(db.get());
     db.reset();
@@ -611,6 +654,236 @@ TEST_F(PersistenceTest, CrashAtAnyCheckpointStageKeepsAcknowledgedData) {
     db.reset();
     emulator.reset();
   }
+}
+
+TEST_F(PersistenceTest, AFailedSequenceDropKeepsItsState) {
+  auto emulator = StartOrDie();
+  auto db = CreateDatabase(emulator.get());
+  for (int i = 0; i < 5; ++i) {
+    GOOGLESQL_ASSERT_OK(
+        Commit(db.get(), InsertAccount(absl::StrCat("a", i), 0)).status());
+  }
+  // Accounts.Id's default uses the sequence, so dropping it fails.
+  EXPECT_FALSE(UpdateSchema(db.get(), {"DROP SEQUENCE seq"}).ok());
+  for (int i = 5; i < 8; ++i) {
+    GOOGLESQL_EXPECT_OK(
+        Commit(db.get(), InsertAccount(absl::StrCat("a", i), 0)).status());
+  }
+  // The checkpoint covers the log that held the sequence's reservation.
+  GOOGLESQL_ASSERT_OK(emulator->persistence->Checkpoint());
+  db.reset();
+  Crash(emulator);
+  emulator = StartOrDie();
+  db = GetDatabase(emulator.get());
+  for (int i = 8; i < 11; ++i) {
+    GOOGLESQL_EXPECT_OK(
+        Commit(db.get(), InsertAccount(absl::StrCat("a", i), 0)).status());
+  }
+  auto rows = ReadTable(db.get(), "Accounts");
+  absl::flat_hash_set<std::string> ids;
+  for (const auto& row : rows) ids.insert(row.substr(0, row.find(',')));
+  EXPECT_EQ(rows.size(), 11);
+  EXPECT_EQ(ids.size(), rows.size());
+}
+
+TEST_F(PersistenceTest, CheckpointFailsOnADatabaseItCannotReach) {
+  auto emulator = StartOrDie();
+  auto db = CreateDatabase(emulator.get());
+  GOOGLESQL_ASSERT_OK(Commit(db.get(), InsertAccount("kept", 1)).status());
+  db.reset();
+  // The databases are gone while persistence still runs, as in a teardown
+  // in the wrong order.
+  emulator->databases.reset();
+  EXPECT_FALSE(emulator->persistence->Checkpoint().ok());
+  Crash(emulator);
+  emulator = StartOrDie();
+  db = GetDatabase(emulator.get());
+  ASSERT_NE(db, nullptr);
+  EXPECT_EQ(ReadTable(db.get(), "Accounts").size(), 1);
+}
+
+TEST_F(PersistenceTest, TeardownStopsCheckpointsBeforeDroppingDatabases) {
+  PersistenceOptions options;
+  options.fs = &fs_;
+  options.dir = "/data";
+  options.checkpoint_bytes = 1;  // every record asks for a checkpoint
+  auto env = std::make_unique<ServerEnv>();
+  GOOGLESQL_ASSERT_OK(env->EnablePersistence(options));
+  admin::instance::v1::Instance instance;
+  instance.set_config("projects/p/instanceConfigs/emulator-config");
+  instance.set_node_count(1);
+  GOOGLESQL_ASSERT_OK(
+      env->instance_manager()->CreateInstance(kInstance, instance).status());
+  auto db = env->database_manager()->CreateDatabase(
+      kDatabase, backend::SchemaChangeOperation{
+                     .statements = kSchema,
+                     .database_dialect =
+                         database_api::DatabaseDialect::GOOGLE_STANDARD_SQL});
+  GOOGLESQL_ASSERT_OK(db.status());
+  std::weak_ptr<Database> weak = *db;
+
+  // Hold the next background checkpoint right after it starts, until the
+  // databases are destroyed (or two seconds pass), then let it capture.
+  std::atomic<bool> armed = true;
+  std::atomic<bool> entered = false;
+  fs_.SetHook([&](Op op, const std::string& path) {
+    if (op == Op::kOpen && absl::StrContains(path, "/wal-") &&
+        armed.exchange(false)) {
+      entered = true;
+      for (int i = 0; i < 200 && !weak.expired(); ++i) {
+        absl::SleepFor(absl::Milliseconds(10));
+      }
+    }
+    return absl::OkStatus();
+  });
+  GOOGLESQL_ASSERT_OK(Commit(db->get(), InsertAccount("kept", 1)).status());
+  db->reset();
+  for (int i = 0; i < 1000 && !entered; ++i) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  ASSERT_TRUE(entered);
+  env.reset();
+  fs_.SetHook(nullptr);
+  fs_.Crash();
+
+  auto emulator = StartOrDie();
+  auto recovered = GetDatabase(emulator.get());
+  ASSERT_NE(recovered, nullptr);
+  EXPECT_EQ(ReadTable(recovered.get(), "Accounts").size(), 1);
+}
+
+TEST_F(PersistenceTest, ExposedReadTimestampsAreCoveredAcrossARestart) {
+  auto emulator = StartOrDie();
+  auto db = CreateDatabase(emulator.get());
+  // What BeginTransaction(read_only{read_timestamp: T,
+  // return_read_timestamp: true}) returns to the client.
+  const absl::Time future = emulator->clock->Now() + absl::Seconds(2);
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto txn,
+      db->backend()->CreateReadOnlyTransaction(backend::ReadOnlyOptions{
+          .bound = backend::TimestampBound::kExactTimestamp,
+          .timestamp = future}));
+  EXPECT_EQ(txn->read_timestamp(), future);
+  txn.reset();
+  db.reset();
+  Crash(emulator);
+  emulator = StartOrDie();
+  db = GetDatabase(emulator.get());
+  EXPECT_GT(emulator->persistence->restart_floor(), future);
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(absl::Time after,
+                                 Commit(db.get(), InsertAccount("b", 1)));
+  EXPECT_GT(after, future);
+}
+
+TEST_F(PersistenceTest, SchemaChangesAreInvisibleUntilTheirRecordIsSynced) {
+  // A frozen system clock: no lease extension shares the blocked sync.
+  auto emulator = StartOrDie(FrozenSystemClock);
+  auto db = CreateDatabase(emulator.get());
+  absl::Mutex mu;
+  bool armed = true, blocked = false, released = false;
+  fs_.SetHook([&](Op op, const std::string& path) {
+    if (op != Op::kSync || !absl::StrContains(path, "/wal-")) {
+      return absl::OkStatus();
+    }
+    absl::MutexLock lock(mu);
+    if (!armed) return absl::OkStatus();
+    armed = false;
+    blocked = true;
+    mu.AwaitWithTimeout(absl::Condition(&released), absl::Seconds(10));
+    return absl::OkStatus();
+  });
+  std::thread ddl([&] {
+    GOOGLESQL_EXPECT_OK(UpdateSchema(
+        db.get(), {"CREATE TABLE Later (K INT64 NOT NULL) PRIMARY KEY (K)"}));
+  });
+  {
+    absl::MutexLock lock(mu);
+    ASSERT_TRUE(
+        mu.AwaitWithTimeout(absl::Condition(&blocked), absl::Seconds(10)));
+  }
+  // What GetDatabaseDdl, queries and new transactions would see.
+  EXPECT_EQ(db->backend()->GetLatestSchemaShared()->FindTable("Later"),
+            nullptr);
+  EXPECT_EQ(db->backend()->GetLatestSchema()->FindTable("Later"), nullptr);
+  for (const std::string& statement : Ddl(db.get())) {
+    EXPECT_THAT(statement, ::testing::Not(::testing::HasSubstr("Later")));
+  }
+  {
+    absl::MutexLock lock(mu);
+    released = true;
+  }
+  ddl.join();
+  fs_.SetHook(nullptr);
+  EXPECT_NE(db->backend()->GetLatestSchemaShared()->FindTable("Later"),
+            nullptr);
+}
+
+TEST_F(PersistenceTest, RecoveryIgnoresValuesOfDroppedProtoAndEnumColumns) {
+  google::protobuf::FileDescriptorProto file;
+  ASSERT_TRUE(google::protobuf::TextFormat::ParseFromString(
+      R"pb(
+        syntax: "proto2"
+        name: "user.proto"
+        package: "customer.app"
+        message_type {
+          name: "User"
+          field {
+            name: "name"
+            number: 1
+            label: LABEL_OPTIONAL
+            type: TYPE_STRING
+          }
+        }
+        enum_type {
+          name: "State"
+          value { name: "UNSPECIFIED" number: 0 }
+          value { name: "ACTIVE" number: 1 }
+        }
+      )pb",
+      &file));
+  google::protobuf::FileDescriptorSet files;
+  *files.add_file() = file;
+  auto emulator = StartOrDie();
+  auto db = CreateDatabase(emulator.get(), kDatabase, {});
+  int successful;
+  absl::Time timestamp;
+  absl::Status backfill;
+  GOOGLESQL_ASSERT_OK(db->backend()->UpdateSchema(
+      backend::SchemaChangeOperation{
+          .statements =
+              {"CREATE PROTO BUNDLE (customer.app.User, "
+               "customer.app.State)",
+               "CREATE TABLE P (K INT64 NOT NULL, U customer.app.User, "
+               "S customer.app.State) PRIMARY KEY (K)"},
+          .proto_descriptor_bytes = files.SerializeAsString(),
+          .database_dialect =
+              database_api::DatabaseDialect::GOOGLE_STANDARD_SQL},
+      &successful, &timestamp, &backfill));
+  GOOGLESQL_ASSERT_OK(backfill);
+  const backend::Table* table =
+      db->backend()->GetLatestSchema()->FindTable("P");
+  const googlesql::Type* user = table->FindColumn("U")->GetType();
+  const googlesql::Type* state = table->FindColumn("S")->GetType();
+  backend::Mutation m;
+  m.AddWriteOp(backend::MutationOpType::kInsert, "P", {"K", "U", "S"},
+               {{Int64(1),
+                 googlesql::Value::Proto(user->AsProto(), absl::Cord("\x0a\x03"
+                                                                     "ann")),
+                 googlesql::Value::Enum(state->AsEnum(), 1)}});
+  GOOGLESQL_ASSERT_OK(Commit(db.get(), m).status());
+  GOOGLESQL_ASSERT_OK(UpdateSchema(
+      db.get(), {"ALTER TABLE P DROP COLUMN U", "ALTER TABLE P DROP COLUMN S",
+                 "DROP PROTO BUNDLE"}));
+  const auto storage = DumpStorage(db.get());
+  db.reset();
+  // No checkpoint: recovery replays the log, whose insert still holds the
+  // values of the dropped proto and enum types.
+  Crash(emulator);
+  emulator = StartOrDie();
+  db = GetDatabase(emulator.get());
+  ASSERT_NE(db, nullptr);
+  EXPECT_EQ(DumpStorage(db.get()), storage);
+  EXPECT_EQ(ReadTable(db.get(), "P").size(), 1);
 }
 
 TEST_F(PersistenceTest, ConcurrentCommitsCheckpointsAndACrash) {
