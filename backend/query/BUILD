@@ -697,6 +697,7 @@ cc_test(
     name = "key_narrowing_test",
     srcs = ["key_narrowing_test.cc"],
     deps = [
+        "@com_google_absl//absl/algorithm:container",
         "@com_google_googlesql//googlesql/public:type",
         ":key_narrowing",
         ":query_context",

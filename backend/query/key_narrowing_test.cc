@@ -27,6 +27,7 @@
 #include "googlesql/public/types/type_factory.h"
 #include "googlesql/public/value.h"
 #include "tests/common/proto_matchers.h"
+#include "absl/algorithm/container.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
@@ -206,15 +207,16 @@ class KeyNarrowingTest : public testing::Test {
     if (result.ok() && result->rows != nullptr) {
       while (result->rows->Next()) {
       }
+      GOOGLESQL_EXPECT_OK(result->rows->Status()) << query.sql;
     }
     return recorder.KeySetsOf(table);
   }
 
-  // Runs `query` and renders its rows (or error) as a string.
-  std::string Run(const Query& query) {
+  // Runs `query` to completion and renders its row count and rows.
+  absl::StatusOr<std::string> Run(const Query& query) {
     auto txn = NewTransaction();
     absl::StatusOr<QueryResult> result = Execute(txn.get(), query);
-    if (!result.ok()) return result.status().ToString();
+    if (!result.ok()) return result.status();
     std::vector<std::string> rows;
     if (result->rows != nullptr) {
       while (result->rows->Next()) {
@@ -224,9 +226,32 @@ class KeyNarrowingTest : public testing::Test {
         }
         rows.push_back(absl::StrJoin(values, ","));
       }
+      if (!result->rows->Status().ok()) return result->rows->Status();
     }
     return absl::StrCat(result->modified_row_count, ":",
                         absl::StrJoin(rows, ";"));
+  }
+
+  // Runs each query with pushdown off and on. Both runs must succeed with the
+  // same results, except for the queries in `expected_errors`, which must
+  // fail the same way.
+  void ExpectPushdownPreservesResults(
+      const std::vector<Query>& queries,
+      const std::vector<std::string>& expected_errors = {}) {
+    for (const Query& query : queries) {
+      config::set_query_key_pushdown_enabled(false);
+      absl::StatusOr<std::string> without = Run(query);
+      config::set_query_key_pushdown_enabled(true);
+      absl::StatusOr<std::string> with = Run(query);
+      if (absl::c_linear_search(expected_errors, query.sql)) {
+        EXPECT_FALSE(without.ok()) << query.sql;
+        EXPECT_EQ(with.status(), without.status()) << query.sql;
+        continue;
+      }
+      GOOGLESQL_ASSERT_OK(without) << query.sql;
+      GOOGLESQL_ASSERT_OK(with) << query.sql;
+      EXPECT_EQ(*with, *without) << query.sql;
+    }
   }
 
   Clock clock_;
@@ -400,16 +425,8 @@ TEST_F(KeyNarrowingTest, PushdownPreservesResults) {
       {.sql = "INSERT OR UPDATE INTO T (k, v) VALUES (3, 7)"},
       {.sql = "INSERT INTO T (k, v) SELECT k + 100, v FROM T WHERE k < 3"},
   };
-  for (const Query& query : queries) {
-    config::set_query_key_pushdown_enabled(false);
-    std::string without = Run(query);
-    config::set_query_key_pushdown_enabled(true);
-    std::string with = Run(query);
-    EXPECT_EQ(with, without) << query.sql;
-    // Only the duplicate INSERT is expected to fail.
-    EXPECT_FALSE(absl::StrContains(without, "INVALID_ARGUMENT"))
-        << query.sql << ": " << without;
-  }
+  ExpectPushdownPreservesResults(
+      queries, /*expected_errors=*/{"INSERT INTO T (k, v) VALUES (3, 1)"});
 }
 
 // The same on/off comparison for the other key types that qualify, and for
@@ -455,15 +472,7 @@ TEST_F(KeyNarrowingTest, PushdownPreservesResultsForOtherKeyTypes) {
       {.sql = "DELETE FROM Nullable WHERE a IS NULL"},
       {.sql = "DELETE FROM Types WHERE bt = b'a' AND bo = TRUE"},
   };
-  for (const Query& query : queries) {
-    config::set_query_key_pushdown_enabled(false);
-    std::string without = Run(query);
-    config::set_query_key_pushdown_enabled(true);
-    std::string with = Run(query);
-    EXPECT_EQ(with, without) << query.sql;
-    EXPECT_FALSE(absl::StrContains(without, "INVALID_ARGUMENT"))
-        << query.sql << ": " << without;
-  }
+  ExpectPushdownPreservesResults(queries);
 
   // These key types are narrowed, not read in full.
   for (const char* sql :
