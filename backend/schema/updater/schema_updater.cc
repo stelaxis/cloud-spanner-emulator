@@ -6989,22 +6989,28 @@ SchemaUpdater::ValidateSchemaFromDDL(
 absl::Status SchemaUpdater::RunPendingActions(int* num_succesful,
                                               Storage* storage,
                                               absl::Time timestamp) {
+  absl::Status status;
   for (const auto& pending_statement : pending_work_) {
     // All statements write at the change's one commit timestamp, so a failed
     // statement's partial backfill is undone by restoring the versions at it
-    // from before the statement. Upstream left them, under a schema that
-    // never has the failed statement.
+    // from before the statement (storage keeps an undo journal of the cells
+    // written meanwhile). Upstream left them, under a schema that never has
+    // the failed statement.
     std::unique_ptr<StorageSavepoint> savepoint =
-        storage != nullptr ? storage->SaveVersionsAt(timestamp) : nullptr;
-    absl::Status status = pending_statement.RunSchemaChangeActions();
+        storage != nullptr && pending_statement.num_actions() > 0
+            ? storage->SaveVersionsAt(timestamp)
+            : nullptr;
+    status = pending_statement.RunSchemaChangeActions();
     if (!status.ok()) {
-      if (savepoint != nullptr)
+      if (savepoint != nullptr) {
         storage->RestoreVersionsAt(timestamp, *savepoint);
-      return status;
+      }
+      break;
     }
     ++(*num_succesful);
   }
-  return absl::OkStatus();
+  if (storage != nullptr) storage->DiscardSavepoints(timestamp);
+  return status;
 }
 
 absl::StatusOr<SchemaChangeResult> SchemaUpdater::UpdateSchemaFromDDL(

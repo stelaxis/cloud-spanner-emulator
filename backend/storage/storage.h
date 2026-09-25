@@ -116,7 +116,7 @@ class Storage {
   // marks reached storage.
   virtual void RollBackVersionsAt(absl::Time timestamp) = 0;
 
-  // Saves the versions written at `timestamp` so far; RestoreVersionsAt then
+  // Marks the versions written at `timestamp` so far; RestoreVersionsAt then
   // puts back exactly those, undoing later writes at `timestamp`. A schema
   // change undoes a statement whose backfill failed this way: all of its
   // statements write at its one commit timestamp.
@@ -124,6 +124,9 @@ class Storage {
       absl::Time timestamp) = 0;
   virtual void RestoreVersionsAt(absl::Time timestamp,
                                  const StorageSavepoint& savepoint) = 0;
+
+  // Ends the savepoints at `timestamp`; they can no longer be restored.
+  virtual void DiscardSavepoints(absl::Time timestamp) = 0;
 
   // Forgets the drop marks made at `timestamp` for tables and columns that
   // are still live, so cleanup never deletes them.

@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -202,6 +203,7 @@ absl::Status InMemoryStorage::Write(
   // A write of no columns to an existing row must still leave a version.
   if (!Exists(row, timestamp) || column_ids.empty()) {
     Cell& cell = row[kExistsColumn];
+    JournalLocked(timestamp, table_id, key, kExistsColumn, cell);
     cell[timestamp] = googlesql::values::Bool(true);
     RemoveExpiredVersions(cell, timestamp);
   }
@@ -209,6 +211,7 @@ absl::Status InMemoryStorage::Write(
   // Add the values for the given columns.
   for (int i = 0; i < column_ids.size(); ++i) {
     Cell& cell = row[column_ids[i]];
+    JournalLocked(timestamp, table_id, key, column_ids[i], cell);
     cell[timestamp] = values[i];
     RemoveExpiredVersions(cell, timestamp);
   }
@@ -231,6 +234,7 @@ absl::Status InMemoryStorage::MarkWritten(absl::Time timestamp,
   absl::MutexLock lock(mu_);
   Row& row = tables_[table_id][key];
   Cell& cell = row[kExistsColumn];
+  JournalLocked(timestamp, table_id, key, kExistsColumn, cell);
   cell[timestamp] = googlesql::values::Bool(Exists(row, timestamp));
   RemoveExpiredVersions(cell, timestamp);
   NoteVersion(table_id, timestamp);
@@ -305,12 +309,14 @@ absl::Status InMemoryStorage::Delete(absl::Time timestamp,
     for (const auto& columns : itr->second) {
       if (columns.first == kExistsColumn) {
         Cell& cell = itr->second[kExistsColumn];
+        JournalLocked(timestamp, table_id, itr->first, kExistsColumn, cell);
         cell[timestamp] = googlesql::values::Bool(false);
         RemoveExpiredVersions(cell, timestamp);
       } else {
         // Column values are marked invalid googlesql::Value to avoid reading
         // the value of the cell before the delete.
         Cell& cell = itr->second[columns.first];
+        JournalLocked(timestamp, table_id, itr->first, columns.first, cell);
         cell[timestamp] = googlesql::Value();
         RemoveExpiredVersions(cell, timestamp);
       }
@@ -402,43 +408,91 @@ void InMemoryStorage::RollBackVersionsAt(absl::Time timestamp) {
 namespace {
 
 struct InMemorySavepoint : public StorageSavepoint {
-  struct Version {
-    TableID table_id;
-    Key key;
-    ColumnID column_id;
-    googlesql::Value value;
-  };
-  std::vector<Version> versions;
+  size_t journal_size = 0;
 };
 
 }  // namespace
 
-std::unique_ptr<StorageSavepoint> InMemoryStorage::SaveVersionsAt(
-    absl::Time timestamp) {
-  absl::MutexLock lock(mu_);
-  auto savepoint = std::make_unique<InMemorySavepoint>();
-  for (const auto& [table_id, table] : tables_) {
-    for (const auto& [key, row] : table) {
+void InMemoryStorage::JournalLocked(absl::Time timestamp,
+                                    const TableID& table_id, const Key& key,
+                                    const ColumnID& column_id,
+                                    const Cell& cell) {
+  if (journal_timestamp_ != timestamp) return;
+  auto version = cell.find(timestamp);
+  journal_.push_back({table_id, key, column_id,
+                      version == cell.end()
+                          ? std::nullopt
+                          : std::optional<googlesql::Value>(version->second)});
+}
+
+void InMemoryStorage::RecomputeLatestVersionLocked(const TableID& table_id) {
+  auto table = tables_.find(table_id);
+  absl::Time latest = absl::InfinitePast();
+  if (table != tables_.end()) {
+    for (const auto& [key, row] : table->second) {
       for (const auto& [column_id, cell] : row) {
-        if (auto it = cell.find(timestamp); it != cell.end()) {
-          savepoint->versions.push_back({table_id, key, column_id, it->second});
-        }
+        if (!cell.empty()) latest = std::max(latest, cell.rbegin()->first);
       }
     }
   }
+  if (latest == absl::InfinitePast()) {
+    latest_version_.erase(table_id);
+  } else {
+    latest_version_[table_id] = latest;
+  }
+}
+
+std::unique_ptr<StorageSavepoint> InMemoryStorage::SaveVersionsAt(
+    absl::Time timestamp) {
+  absl::MutexLock lock(mu_);
+  if (journal_timestamp_ != timestamp) {
+    journal_timestamp_ = timestamp;
+    journal_.clear();
+  }
+  auto savepoint = std::make_unique<InMemorySavepoint>();
+  savepoint->journal_size = journal_.size();
   return savepoint;
 }
 
 void InMemoryStorage::RestoreVersionsAt(absl::Time timestamp,
                                         const StorageSavepoint& savepoint) {
   absl::MutexLock lock(mu_);
-  RemoveVersionsAtLocked(timestamp);
-  for (const auto& version :
-       static_cast<const InMemorySavepoint&>(savepoint).versions) {
-    tables_[version.table_id][version.key][version.column_id][timestamp] =
-        version.value;
-    NoteVersion(version.table_id, timestamp);
+  if (journal_timestamp_ != timestamp) return;
+  const size_t keep =
+      static_cast<const InMemorySavepoint&>(savepoint).journal_size;
+  absl::flat_hash_set<TableID> touched;
+  // Newest first, so a cell written twice ends at its oldest prior version.
+  for (size_t i = journal_.size(); i > keep; --i) {
+    const UndoEntry& entry = journal_[i - 1];
+    touched.insert(entry.table_id);
+    if (entry.prior.has_value()) {
+      tables_[entry.table_id][entry.key][entry.column_id][timestamp] =
+          *entry.prior;
+      continue;
+    }
+    auto table = tables_.find(entry.table_id);
+    if (table == tables_.end()) continue;
+    auto row = table->second.find(entry.key);
+    if (row == table->second.end()) continue;
+    if (auto cell = row->second.find(entry.column_id);
+        cell != row->second.end()) {
+      cell->second.erase(timestamp);
+      if (cell->second.empty()) row->second.erase(cell);
+    }
+    if (row->second.empty()) table->second.erase(row);
+    if (table->second.empty()) tables_.erase(table);
   }
+  journal_.resize(keep);
+  for (const TableID& table_id : touched) {
+    RecomputeLatestVersionLocked(table_id);
+  }
+}
+
+void InMemoryStorage::DiscardSavepoints(absl::Time timestamp) {
+  absl::MutexLock lock(mu_);
+  if (journal_timestamp_ != timestamp) return;
+  journal_timestamp_.reset();
+  journal_ = {};
 }
 
 void InMemoryStorage::UnmarkDroppedAt(

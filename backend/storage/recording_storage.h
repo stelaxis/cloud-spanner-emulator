@@ -124,6 +124,10 @@ class RecordingStorage : public Storage {
   void RestoreVersionsAt(absl::Time timestamp,
                          const StorageSavepoint& savepoint) override;
 
+  void DiscardSavepoints(absl::Time timestamp) override {
+    base_->DiscardSavepoints(timestamp);
+  }
+
   void UnmarkDroppedAt(
       absl::Time timestamp, const absl::flat_hash_set<TableID>& live_tables,
       const absl::flat_hash_set<ColumnID>& live_columns) override {
