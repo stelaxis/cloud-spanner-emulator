@@ -190,6 +190,35 @@ TEST_F(ReadWriteTransactionTest, CanReadAfterFlush) {
                                 {Int64(3), String("value3")}}));
 }
 
+TEST_F(ReadWriteTransactionTest, EmptyRangeDeletesPreserveBufferedWrites) {
+  auto txn = CreateReadWriteTransaction();
+  Mutation insert;
+  insert.AddWriteOp(MutationOpType::kInsert, "test_table",
+                    {"int64_col", "string_col"},
+                    {{Int64(1), String("one")}, {Int64(2), String("two")},
+                     {Int64(3), String("three")}});
+  GOOGLESQL_ASSERT_OK(txn->Write(insert));
+
+  for (const KeyRange& range : {
+           KeyRange::OpenOpen(Key({Int64(2)}), Key({Int64(2)})),
+           KeyRange::ClosedOpen(Key({Int64(3)}), Key({Int64(1)})),
+           KeyRange::OpenClosed(Key({Int64(2)}), Key({Int64(2)}))}) {
+    SCOPED_TRACE(range.DebugString());
+    Mutation remove;
+    remove.AddDeleteOp("test_table", KeySet(range));
+    GOOGLESQL_ASSERT_OK(txn->Write(remove));
+    EXPECT_THAT(ReadUsingIndex(txn.get(), KeySet(range), "", {"int64_col"}),
+                IsOkAndHoldsRows({}));
+  }
+  GOOGLESQL_ASSERT_OK(txn->Commit());
+
+  auto verify_txn = CreateReadWriteTransaction();
+  EXPECT_THAT(ReadAll(verify_txn.get(), {"int64_col", "string_col"}),
+              IsOkAndHoldsRows({{Int64(1), String("one")},
+                               {Int64(2), String("two")},
+                               {Int64(3), String("three")}}));
+}
+
 TEST_F(ReadWriteTransactionTest, ReadEmptyDatabase) {
   auto txn1 = CreateReadWriteTransaction();
   EXPECT_THAT(ReadAll(txn1.get(), {"int64_col", "string_col"}),

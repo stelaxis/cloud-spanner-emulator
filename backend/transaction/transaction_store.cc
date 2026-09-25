@@ -250,7 +250,10 @@ absl::Status TransactionStore::Read(
   auto table_itr = buffered_ops_.find(table);
   typename absl::btree_map<Key, RowOp>::const_iterator buffer_it, buffer_end;
   bool has_buffer = false;
-  if (table_itr != buffered_ops_.end()) {
+  // Empty normalized ranges may have start > limit (for example, (k, k)).
+  // In that case lower_bound(limit) can precede lower_bound(start).
+  if (table_itr != buffered_ops_.end() &&
+      key_range.start_key() < key_range.limit_key()) {
     const auto& key_to_row_op_map = table_itr->second;
     // Key range lookup.
     auto begin_itr = key_to_row_op_map.lower_bound(key_range.start_key());

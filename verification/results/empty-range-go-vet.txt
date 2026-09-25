@@ -1,0 +1,4 @@
+$ go vet ./...
+ok
+$ gofmt -l .
+(no files)
