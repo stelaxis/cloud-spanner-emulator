@@ -62,6 +62,11 @@ absl::Status ReadOnlyTransaction::Read(const ReadArg& read_arg,
   // Wait for any concurrent schema change or read-write transactions to commit
   // before accessing database state to perform a read.
   lock_handle_->WaitForSafeRead(read_timestamp_);
+  // With --data_dir, no data is served at a timestamp the durable clock lease
+  // does not cover, so after a crash every commit lands above it. By now the
+  // timestamp has passed, so this never moves the lease beyond the present;
+  // a future bound handed out by BeginTransaction alone never moves it.
+  GOOGLESQL_RETURN_IF_ERROR(clock_->CoverWithLease(read_timestamp_));
   auto now = clock_->Now();
   if (now - read_timestamp_ >= version_retention_period_) {
     return error::ReadTimestampPastVersionGCLimit(read_timestamp_);

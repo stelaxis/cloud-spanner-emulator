@@ -760,29 +760,6 @@ TEST_F(PersistenceTest, TeardownStopsCheckpointsBeforeDroppingDatabases) {
   EXPECT_EQ(ReadTable(recovered.get(), "Accounts").size(), 1);
 }
 
-TEST_F(PersistenceTest, ExposedReadTimestampsAreCoveredAcrossARestart) {
-  auto emulator = StartOrDie();
-  auto db = CreateDatabase(emulator.get());
-  // What BeginTransaction(read_only{read_timestamp: T,
-  // return_read_timestamp: true}) returns to the client.
-  const absl::Time future = emulator->clock->Now() + absl::Seconds(2);
-  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
-      auto txn,
-      db->backend()->CreateReadOnlyTransaction(backend::ReadOnlyOptions{
-          .bound = backend::TimestampBound::kExactTimestamp,
-          .timestamp = future}));
-  EXPECT_EQ(txn->read_timestamp(), future);
-  txn.reset();
-  db.reset();
-  Crash(emulator);
-  emulator = StartOrDie();
-  db = GetDatabase(emulator.get());
-  EXPECT_GT(emulator->persistence->restart_floor(), future);
-  GOOGLESQL_ASSERT_OK_AND_ASSIGN(absl::Time after,
-                                 Commit(db.get(), InsertAccount("b", 1)));
-  EXPECT_GT(after, future);
-}
-
 TEST_F(PersistenceTest, SchemaChangesAreInvisibleUntilTheirRecordIsSynced) {
   // A frozen system clock: no lease extension shares the blocked sync.
   auto emulator = StartOrDie(FrozenSystemClock);
@@ -933,27 +910,6 @@ TEST_F(PersistenceTest, ARejectedSchemaChangeIsNotLogged) {
   EXPECT_EQ(Ddl(db.get()), ddl);
   ASSERT_NE(db->backend()->GetLatestSchema()->FindTable("Transfers"), nullptr);
   EXPECT_EQ(ReadTable(db.get(), "Transfers").size(), 1);
-}
-
-TEST_F(PersistenceTest, FarFutureReadTimestampsAreCoveredAcrossARestart) {
-  auto emulator = StartOrDie();
-  auto db = CreateDatabase(emulator.get());
-  // Past the int64 nanosecond range (year 2262), within Spanner's.
-  const absl::Time year3000 = absl::FromCivil(
-      absl::CivilSecond(3000, 1, 1, 0, 0, 0), absl::UTCTimeZone());
-  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
-      auto txn,
-      db->backend()->CreateReadOnlyTransaction(backend::ReadOnlyOptions{
-          .bound = backend::TimestampBound::kExactTimestamp,
-          .timestamp = year3000}));
-  EXPECT_EQ(txn->read_timestamp(), year3000);
-  txn.reset();
-  db.reset();
-  Crash(emulator);
-  emulator = StartOrDie();
-  // Nothing may read or commit now: that would wait until the year 3000.
-  EXPECT_GT(emulator->persistence->restart_floor(), year3000);
-  EXPECT_GT(emulator->clock->Now(), year3000);
 }
 
 TEST_F(PersistenceTest, SequencesCreatedAndDroppedInOneBatchLeaveNoState) {
@@ -1261,39 +1217,109 @@ TEST_F(PersistenceTest, ARejectedSchemaChangeHasNoEffectInMemory) {
       absl::InfiniteFuture(), u->id(), backend::Key({Int64(1)}), {}, nullptr));
 }
 
-TEST_F(PersistenceTest, ReadTimestampsThatWouldOverflowTheClockAreRefused) {
-  auto emulator = StartOrDie();
-  auto db = CreateDatabase(emulator.get());
-  const absl::Time spanner_max =
-      absl::FromUnixSeconds(253402300799) + absl::Nanoseconds(999999999);
-  const absl::Time latest = emulator->persistence->latest_read_timestamp();
-  EXPECT_LT(latest, spanner_max);
-  for (absl::Time refused : {spanner_max, latest + absl::Nanoseconds(1)}) {
-    EXPECT_THAT(db->backend()
-                    ->CreateReadOnlyTransaction(backend::ReadOnlyOptions{
-                        .bound = backend::TimestampBound::kExactTimestamp,
-                        .timestamp = refused})
-                    .status(),
-                StatusIs(absl::StatusCode::kInvalidArgument));
+// The timestamp of a strong read that served rows of Accounts.
+absl::Time ServeAStrongRead(Database* database) {
+  auto txn = database->backend()->CreateReadOnlyTransaction(
+      backend::ReadOnlyOptions());
+  EXPECT_TRUE(txn.ok()) << txn.status();
+  std::unique_ptr<backend::RowCursor> cursor;
+  EXPECT_TRUE((*txn)
+                  ->Read(backend::ReadArg{.table = "Accounts",
+                                          .key_set = backend::KeySet::All(),
+                                          .columns = {"Id"}},
+                         &cursor)
+                  .ok());
+  while (cursor->Next()) {
   }
-  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
-      auto txn,
-      db->backend()->CreateReadOnlyTransaction(backend::ReadOnlyOptions{
-          .bound = backend::TimestampBound::kExactTimestamp,
-          .timestamp = latest}));
-  txn.reset();
+  return (*txn)->read_timestamp();
+}
+
+TEST_F(PersistenceTest, ServedReadTimestampsAreCoveredAcrossARestart) {
+  // A read at a future timestamp serves data only once that timestamp has
+  // passed; the lease then covers it. After a crash, with the system clock an
+  // hour back, no commit may land at or below it.
+  absl::Mutex mu;
+  absl::Duration offset = absl::ZeroDuration();
+  auto system_now = [&]() {
+    absl::MutexLock lock(mu);
+    return absl::Now() + offset;
+  };
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto emulator, Start(system_now));
+  auto db = CreateDatabase(emulator.get());
+  GOOGLESQL_ASSERT_OK(Commit(db.get(), InsertAccount("a", 1)).status());
+  const absl::Time served = emulator->clock->Now() + absl::Seconds(2);
+  {
+    GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+        auto txn,
+        db->backend()->CreateReadOnlyTransaction(backend::ReadOnlyOptions{
+            .bound = backend::TimestampBound::kExactTimestamp,
+            .timestamp = served}));
+    std::unique_ptr<backend::RowCursor> cursor;
+    GOOGLESQL_ASSERT_OK(
+        txn->Read(backend::ReadArg{.table = "Accounts",
+                                   .key_set = backend::KeySet::All(),
+                                   .columns = {"Id"}},
+                  &cursor));
+    int rows = 0;
+    while (cursor->Next()) ++rows;
+    EXPECT_EQ(rows, 1);
+  }
   db.reset();
   Crash(emulator);
-  emulator = StartOrDie();
+  {
+    absl::MutexLock lock(mu);
+    offset = -absl::Hours(1);
+  }
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(emulator, Start(system_now));
   db = GetDatabase(emulator.get());
-  EXPECT_GT(emulator->clock->Now(), latest);
-  // The clock is still usable: sessions get timestamps clients accept.
-  SessionManager sessions(emulator->clock.get());
-  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
-      auto session, sessions.CreateSession({}, /*multiplexed=*/false, db,
-                                           /*mux_txn_manager=*/nullptr));
-  ::google::spanner::v1::Session proto;
-  GOOGLESQL_EXPECT_OK(session->ToProto(&proto, /*include_labels=*/true));
+  EXPECT_GT(emulator->persistence->restart_floor(), served);
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(absl::Time after,
+                                 Commit(db.get(), InsertAccount("b", 1)));
+  EXPECT_GT(after, served);
+}
+
+TEST_F(PersistenceTest, FutureReadBoundsDoNotStallTheRestartedClock) {
+  // A read-only transaction at a future bound returns that timestamp but
+  // serves nothing before it passes, so it must not move the durable clock.
+  const absl::Time spanner_max =
+      absl::FromUnixSeconds(253402300799) + absl::Nanoseconds(999999999);
+  const std::vector<absl::Time> bounds = {
+      absl::Now() + absl::Hours(24),
+      spanner_max - absl::Milliseconds(250) - absl::Hours(1), spanner_max};
+  auto emulator = StartOrDie();
+  auto db = CreateDatabase(emulator.get());
+  for (absl::Time bound : bounds) {
+    SCOPED_TRACE(absl::FormatTime(bound));
+    const absl::Time served = ServeAStrongRead(db.get());
+    for (auto bound_kind : {backend::TimestampBound::kExactTimestamp,
+                            backend::TimestampBound::kMinTimestamp}) {
+      GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+          auto txn,
+          db->backend()->CreateReadOnlyTransaction(backend::ReadOnlyOptions{
+              .bound = bound_kind, .timestamp = bound}));
+      EXPECT_EQ(txn->read_timestamp(), bound);
+    }
+    db.reset();
+    Crash(emulator);
+    emulator = StartOrDie();
+    db = GetDatabase(emulator.get());
+    // The clock resumes near the system clock, not at the bound, ...
+    ASSERT_LT(emulator->clock->Now(), absl::Now() + absl::Seconds(1));
+    // ... so reads and commits do not wait for the bound to pass.
+    const absl::Time start = absl::Now();
+    EXPECT_GT(ServeAStrongRead(db.get()), served);
+    GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+        absl::Time committed,
+        Commit(db.get(), InsertAccount(absl::FormatTime(bound), 1)));
+    EXPECT_GT(committed, served);
+    EXPECT_LT(absl::Now() - start, absl::Seconds(3));
+    SessionManager sessions(emulator->clock.get());
+    GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+        auto session, sessions.CreateSession({}, /*multiplexed=*/false, db,
+                                             /*mux_txn_manager=*/nullptr));
+    ::google::spanner::v1::Session proto;
+    GOOGLESQL_EXPECT_OK(session->ToProto(&proto, /*include_labels=*/true));
+  }
 }
 
 TEST_F(PersistenceTest, TimestampsOutsideSpannersRangeAreNeverWritten) {
@@ -1457,31 +1483,6 @@ TEST_F(PersistenceTest, APartlyPublishedBatchKeepsOnlyItsPublishedStatements) {
   ASSERT_NE(db, nullptr);
   EXPECT_EQ(Ddl(db.get()), ddl);
   check(db->backend(), tables);
-}
-
-TEST_F(PersistenceTest, TheReadTimestampCutoffIgnoresEarlierRequests) {
-  auto emulator = StartOrDie();
-  auto db = CreateDatabase(emulator.get());
-  const absl::Time latest = emulator->persistence->latest_read_timestamp();
-  auto exact = [](absl::Time timestamp) {
-    return backend::ReadOnlyOptions{
-        .bound = backend::TimestampBound::kExactTimestamp,
-        .timestamp = timestamp};
-  };
-  // The first request moves the lease past the cutoff.
-  GOOGLESQL_EXPECT_OK(
-      db->backend()->CreateReadOnlyTransaction(exact(latest)).status());
-  EXPECT_THAT(
-      db->backend()
-          ->CreateReadOnlyTransaction(exact(latest + absl::Nanoseconds(1)))
-          .status(),
-      StatusIs(absl::StatusCode::kInvalidArgument));
-  EXPECT_THAT(db->backend()
-                  ->CreateReadOnlyTransaction(backend::ReadOnlyOptions{
-                      .bound = backend::TimestampBound::kMinTimestamp,
-                      .timestamp = latest + absl::Nanoseconds(1)})
-                  .status(),
-              StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 TEST_F(PersistenceTest, ConcurrentCommitsCheckpointsAndACrash) {

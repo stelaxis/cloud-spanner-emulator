@@ -214,25 +214,12 @@ absl::StatusOr<std::unique_ptr<Database>> Database::Create(
 }
 absl::StatusOr<std::unique_ptr<ReadOnlyTransaction>>
 Database::CreateReadOnlyTransaction(const ReadOnlyOptions& options) {
-  if (log_ != nullptr && (options.bound == TimestampBound::kExactTimestamp ||
-                          options.bound == TimestampBound::kMinTimestamp)) {
-    // A bound the caller chose is checked whatever the lease already covers;
-    // timestamps the clock picks are not.
-    GOOGLESQL_RETURN_IF_ERROR(clock_->CheckCoverable(options.timestamp));
-  }
   auto transaction = std::make_unique<ReadOnlyTransaction>(
       options, transaction_id_generator_.NextId(), clock_, storage_.get(),
       lock_manager_.get(), versioned_catalog_.get());
   if (transaction->read_timestamp() < restart_floor_) {
     return error::ReadTimestampBeforeRestart(transaction->read_timestamp(),
                                              restart_floor_);
-  }
-  if (log_ != nullptr) {
-    // A caller-chosen timestamp (exact or minimum bound) can be past the
-    // clock's lease, and BeginTransaction returns it. Cover it durably, so
-    // that after a crash the clock resumes above it.
-    GOOGLESQL_RETURN_IF_ERROR(
-        clock_->CoverWithLease(transaction->read_timestamp()));
   }
   return transaction;
 }

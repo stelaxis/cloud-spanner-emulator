@@ -62,29 +62,18 @@ class Clock {
   // cannot.
   using LeaseExtender =
       std::function<absl::StatusOr<absl::Time>(absl::Time needed)>;
-  //
-  // CoverWithLease refuses (INVALID_ARGUMENT) timestamps after
-  // `latest_coverable`, so that the clock's restart point stays within range.
-  void SetLease(absl::Time lease, LeaseExtender extend,
-                absl::Time latest_coverable = absl::InfiniteFuture())
+  void SetLease(absl::Time lease, LeaseExtender extend)
       ABSL_LOCKS_EXCLUDED(mu_);
 
   // Extends the lease, durably, to cover `timestamp` if it does not already:
-  // for timestamps a caller chose rather than Now() handed out. OK without a
-  // lease.
+  // for a read timestamp a caller chose, before data is served at it. OK
+  // without a lease.
   absl::Status CoverWithLease(absl::Time timestamp) ABSL_LOCKS_EXCLUDED(mu_);
-
-  // INVALID_ARGUMENT if `timestamp` is after the latest coverable one (see
-  // SetLease), whatever the lease already covers.
-  absl::Status CheckCoverable(absl::Time timestamp) ABSL_LOCKS_EXCLUDED(mu_);
 
   // The current lease, or InfiniteFuture without one.
   absl::Time lease() ABSL_LOCKS_EXCLUDED(mu_);
 
  private:
-  absl::Status CheckCoverableLocked(absl::Time timestamp) const
-      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-
   // Returns the system time at microsecond granularity.
   absl::Time SystemNowMicros() const;
 
@@ -102,7 +91,6 @@ class Clock {
 
   absl::Time lease_ ABSL_GUARDED_BY(mu_) = absl::InfiniteFuture();
   LeaseExtender extend_lease_ ABSL_GUARDED_BY(mu_);
-  absl::Time latest_coverable_ ABSL_GUARDED_BY(mu_) = absl::InfiniteFuture();
 };
 
 }  // namespace emulator

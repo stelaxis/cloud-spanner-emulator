@@ -390,16 +390,14 @@ absl::Status PersistenceManager::Recover(const LogContents& contents,
   // No timestamp after `restart` is handed out before a durable lease covers
   // it.
   clock_->SetLease(
-      restart,
-      [this](absl::Time needed) -> absl::StatusOr<absl::Time> {
+      restart, [this](absl::Time needed) -> absl::StatusOr<absl::Time> {
         absl::Time lease = needed + options_.lease_window;
         Record record;
         GOOGLESQL_RETURN_IF_ERROR(
             EncodeTime(lease, record.mutable_clock_lease()));
         GOOGLESQL_RETURN_IF_ERROR(Append(record));
         return lease;
-      },
-      latest_read_timestamp());
+      });
 
   for (const auto& [incarnation, instance] : instances) {
     instance_api::Instance proto;

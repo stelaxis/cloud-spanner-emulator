@@ -100,14 +100,6 @@ class PersistenceManager : public CatalogPersistence {
   // OK unless a record has failed.
   absl::Status health() { return log_->health(); }
 
-  // The latest read timestamp a client may choose (--data_dir). The clock
-  // lease must cover it, and after a crash the clock resumes above that
-  // lease, which must leave room below Spanner's maximum timestamp.
-  absl::Time latest_read_timestamp() const {
-    return absl::FromUnixSeconds(253402300799) + absl::Nanoseconds(999999999) -
-           options_.lease_window - absl::Hours(1);
-  }
-
   // The first timestamp at which recovered databases can be read.
   absl::Time restart_floor() const { return restart_floor_; }
 
