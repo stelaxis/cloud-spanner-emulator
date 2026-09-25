@@ -108,7 +108,8 @@ RUN find third_party/spanner_pg -name "nodes.h" -exec sed -i 's/enum NodeTag : i
 ENV EXTRA_BAZEL_ARGS="--tool_java_runtime_version=local_jdk"
 RUN bazel build -c opt --jobs="${BAZEL_JOBS}" \
     //binaries:emulator_main \
-    //binaries:gateway_main
+    //binaries:gateway_main \
+    && bazel shutdown
 
 # Generate licenses file.
 RUN for file in $(find -L bazel-src/external                               \
@@ -120,6 +121,21 @@ RUN for file in $(find -L bazel-src/external                               \
       cat $file                                                              ; \
     done > licenses.txt                                                     && \
     gzip licenses.txt
+
+# CI exports this amd64 image from the same builder that compiled the emulator.
+# Keep /src and /root/.cache/bazel in ordinary layers: shards need both the
+# compiled outputs and Bazel's action cache, with the same paths and build flags.
+FROM build AS test-builder
+RUN test -s /src/bazel-bin/binaries/emulator_main \
+    && test -d /root/.cache/bazel \
+    && curl --fail --location --retry 3 \
+       https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-586.0.0-linux-x86_64.tar.gz \
+       --output /tmp/gcloud.tar.gz \
+    && echo '6c774c76793eedd501150b59da653610fbe3eaac169e822965b722de75a2f001  /tmp/gcloud.tar.gz' | sha256sum --check - \
+    && tar -xzf /tmp/gcloud.tar.gz -C /opt \
+    && rm /tmp/gcloud.tar.gz
+ENV GCLOUD_DIR=/opt/google-cloud-sdk/bin
+RUN /opt/google-cloud-sdk/bin/gcloud version
 
 ################################################################################
 #                                   RELEASE                                    #
