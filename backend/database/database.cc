@@ -26,6 +26,8 @@
 #include "google/spanner/admin/database/v1/common.pb.h"
 #include "googlesql/public/types/type_factory.h"
 #include "absl/functional/bind_front.h"
+#include "absl/cleanup/cleanup.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/memory/memory.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -319,6 +321,25 @@ absl::Status Database::ApplySchemaChangeLocked(
   // Owned: the sequences it drops are cleaned up after it is replaced.
   std::shared_ptr<const Schema> existing_schema =
       versioned_catalog_->GetLatestSchemaShared();
+  std::vector<std::string> created_sequence_ids;
+  context.created_sequence_ids = &created_sequence_ids;
+  // Whatever the outcome, forget the counters of sequences missing from the
+  // published schema: dropped ones, and ones this change created but that
+  // did not survive it. A DROP SEQUENCE that fails keeps its state.
+  absl::Cleanup forget_sequences = [&] {
+    std::shared_ptr<const Schema> latest =
+        versioned_catalog_->GetLatestSchemaShared();
+    absl::flat_hash_set<std::string> live;
+    for (const Sequence* sequence : latest->sequences()) {
+      live.insert(sequence->id());
+    }
+    for (const Sequence* sequence : existing_schema->sequences()) {
+      if (!live.contains(sequence->id())) Sequence::ForgetState(sequence->id());
+    }
+    for (const std::string& id : created_sequence_ids) {
+      if (!live.contains(id)) Sequence::ForgetState(id);
+    }
+  };
   SchemaUpdater updater;
   GOOGLESQL_ASSIGN_OR_RETURN(
       auto result,
@@ -328,12 +349,22 @@ absl::Status Database::ApplySchemaChangeLocked(
   *num_succesful_statements = result.num_successful_statements;
   *backfill_status = result.backfill_status;
 
+  // Every check AddSchema makes runs here, before the record is written, so
+  // that installing a logged schema cannot fail.
+  absl::Status rejected;
+  if (result.updated_schema != nullptr) {
+    rejected = versioned_catalog_->CheckSchema(update_timestamp,
+                                               *result.updated_schema);
+    if (!rejected.ok()) result.updated_schema.reset();
+  }
+
   // With --data_dir, the new schema is published only once its record is
   // synced: nothing (GetDatabaseDdl, queries, new transactions) can see it
   // before. Its backfill writes are already in storage but invisible, since
-  // reads at or after its timestamp wait until it is marked committed. They
-  // cannot be undone, so if the record fails the emulator stops; restarting
-  // recovers what the log holds.
+  // reads at or after its timestamp wait until it is marked committed; they
+  // are logged even if the schema is rejected. They cannot be undone, so if
+  // the record fails the emulator stops; restarting recovers what the log
+  // holds.
   if (log_ != nullptr &&
       (result.updated_schema != nullptr || !recorded->ops().empty())) {
     PersistedSchema persisted = GetPersistedSchema();
@@ -350,26 +381,26 @@ absl::Status Database::ApplySchemaChangeLocked(
       std::abort();
     }
   }
+  GOOGLESQL_RETURN_IF_ERROR(rejected);
 
   // We update the schema even if the backfill status was not OK, the returned
   // schema will be the schema for the last valid statement before the statement
   // for which the backfill/verification failed.
   if (result.updated_schema != nullptr) {
-    GOOGLESQL_RETURN_IF_ERROR(versioned_catalog_->AddSchema(
-        update_timestamp, std::move(result.updated_schema)));
+    absl::Status added = versioned_catalog_->AddSchema(
+        update_timestamp, std::move(result.updated_schema));
+    if (!added.ok()) {
+      if (log_ != nullptr) {
+        // Checked above, so unreachable; the log already holds the schema.
+        std::fprintf(stderr, "Cannot install a logged schema of %s: %s\n",
+                     database_id_.c_str(), added.ToString().c_str());
+        std::abort();
+      }
+      return added;
+    }
     action_manager_->AddActionsForSchema(versioned_catalog_->GetLatestSchema(),
                                          query_engine_->function_catalog(),
                                          query_engine_->type_factory());
-    // Forget the counters of dropped sequences only now that the drop has
-    // taken effect: a DROP SEQUENCE that fails validation keeps its state.
-    const Schema* latest = versioned_catalog_->GetLatestSchema();
-    for (const Sequence* sequence : existing_schema->sequences()) {
-      bool kept = false;
-      for (const Sequence* current : latest->sequences()) {
-        if (current->id() == sequence->id()) kept = true;
-      }
-      if (!kept) sequence->RemoveSequenceFromLastValuesMap();
-    }
   }
   // Some functions need to access the schema (e.g. sequence functions), so
   // set the latest schema to the function catalog here.

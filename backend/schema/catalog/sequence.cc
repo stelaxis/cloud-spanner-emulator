@@ -170,14 +170,12 @@ void Sequence::ResetSequenceLastValue() const {
   }
 }
 
-void Sequence::RemoveSequenceFromLastValuesMap() const {
+void Sequence::RemoveSequenceFromLastValuesMap() const { ForgetState(id_); }
+
+void Sequence::ForgetState(const std::string& sequence_id) {
   absl::MutexLock lock(SequenceMutex);
-  absl::flat_hash_map<std::string, int64_t>::iterator it =
-      Sequence::SequenceLastValues.find(id_);
-  if (it != Sequence::SequenceLastValues.end()) {
-    Sequence::SequenceLastValues.erase(it);
-  }
-  reservation_ends_.erase(id_);
+  Sequence::SequenceLastValues.erase(sequence_id);
+  reservation_ends_.erase(sequence_id);
 }
 
 }  // namespace backend

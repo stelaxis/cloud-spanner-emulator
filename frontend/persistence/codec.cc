@@ -188,6 +188,47 @@ backend::DatabaseRestore DecodeRestore(const SchemaState& schema) {
   return restore;
 }
 
+void EncodeTime(absl::Time time, google::protobuf::Timestamp* out) {
+  int64_t seconds = absl::ToUnixSeconds(time);  // rounds down
+  out->set_seconds(seconds);
+  out->set_nanos(static_cast<int32_t>(
+      absl::ToInt64Nanoseconds(time - absl::FromUnixSeconds(seconds))));
+}
+
+absl::Time DecodeTime(const google::protobuf::Timestamp& in) {
+  return absl::FromUnixSeconds(in.seconds()) + absl::Nanoseconds(in.nanos());
+}
+
+absl::Time RecordTimestamp(const Record& record) {
+  if (record.has_timestamp()) return DecodeTime(record.timestamp());
+  if (record.timestamp_nanos() != 0) {
+    return absl::FromUnixNanos(record.timestamp_nanos());
+  }
+  return absl::InfinitePast();
+}
+
+absl::Time LeaseOf(const Record& record) {
+  if (record.has_clock_lease()) return DecodeTime(record.clock_lease());
+  return absl::FromUnixNanos(record.clock_lease_nanos());
+}
+
+absl::Time CreateTimeOf(const DatabaseState& database) {
+  if (database.has_create_time()) return DecodeTime(database.create_time());
+  return absl::FromUnixNanos(database.create_time_nanos());
+}
+
+absl::Time ClockHighOf(const Checkpoint& checkpoint) {
+  if (checkpoint.has_clock_high()) return DecodeTime(checkpoint.clock_high());
+  return absl::FromUnixNanos(checkpoint.clock_high_nanos());
+}
+
+absl::Time DataTimestampOf(const Checkpoint& checkpoint) {
+  if (checkpoint.has_data_timestamp()) {
+    return DecodeTime(checkpoint.data_timestamp());
+  }
+  return absl::FromUnixNanos(checkpoint.data_timestamp_nanos());
+}
+
 }  // namespace persistence
 }  // namespace frontend
 }  // namespace emulator

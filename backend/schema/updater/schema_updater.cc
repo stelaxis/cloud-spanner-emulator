@@ -245,6 +245,10 @@ class SchemaUpdaterImpl {
     sequence_ids_ = sequence_ids;
   }
 
+  void set_created_sequence_ids(std::vector<std::string>* ids) {
+    created_sequence_ids_ = ids;
+  }
+
  private:
   SchemaUpdaterImpl(googlesql::TypeFactory* type_factory,
                     TableIDGenerator* table_id_generator,
@@ -761,8 +765,9 @@ class SchemaUpdaterImpl {
   // is owned by the database and is shared across all schema changes.
   PgOidAssigner* pg_oid_assigner_;
 
-  // See SchemaChangeContext::sequence_ids.
+  // See SchemaChangeContext::sequence_ids and created_sequence_ids.
   const absl::flat_hash_map<std::string, std::string>* sequence_ids_ = nullptr;
+  std::vector<std::string>* created_sequence_ids_ = nullptr;
 
   // Holds the database id for this schema updater.
   std::string database_id_;
@@ -5006,6 +5011,9 @@ absl::StatusOr<const Sequence*> SchemaUpdaterImpl::CreateSequence(
     builder.set_internal_use();
   }
   const Sequence* sequence = builder.get();
+  if (created_sequence_ids_ != nullptr) {
+    created_sequence_ids_->push_back(sequence->id());
+  }
 
   // Validate and set sequence options.
   const auto& set_options =
@@ -6960,6 +6968,7 @@ SchemaUpdater::ValidateSchemaFromDDL(
                        context.schema_change_timestamp, context.pg_oid_assigner,
                        existing_schema, context.database_id));
   updater.set_sequence_ids(context.sequence_ids);
+  updater.set_created_sequence_ids(context.created_sequence_ids);
   context.pg_oid_assigner->BeginAssignment();
   GOOGLESQL_ASSIGN_OR_RETURN(pending_work_,
                    updater.ApplyDDLStatements(schema_change_operation));
@@ -6996,6 +7005,7 @@ absl::StatusOr<SchemaChangeResult> SchemaUpdater::UpdateSchemaFromDDL(
                        context.schema_change_timestamp, context.pg_oid_assigner,
                        existing_schema, context.database_id));
   updater.set_sequence_ids(context.sequence_ids);
+  updater.set_created_sequence_ids(context.created_sequence_ids);
   context.pg_oid_assigner->BeginAssignment();
   GOOGLESQL_ASSIGN_OR_RETURN(pending_work_,
                    updater.ApplyDDLStatements(schema_change_operation));

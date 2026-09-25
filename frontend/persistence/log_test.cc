@@ -234,21 +234,50 @@ TEST_F(LogTest, DamagedFileHeaderFailsLoud) {
               googlesql_base::testing::StatusIs(absl::StatusCode::kDataLoss));
 }
 
+// Rewrites the format version in the header of `path`, with a valid checksum.
+void SetFormatVersion(MemFileSystem& fs, const std::string& path,
+                      uint8_t version) {
+  std::string data = *fs.Contents(path);
+  data[8] = static_cast<char>(version);
+  uint32_t crc = static_cast<uint32_t>(
+      absl::ComputeCrc32c(absl::string_view(data).substr(0, 12)));
+  for (int i = 0; i < 4; ++i) data[12 + i] = static_cast<char>(crc >> (8 * i));
+  fs.Overwrite(path, data);
+}
+
 TEST_F(LogTest, UnknownFormatVersionFailsLoud) {
   LogContents contents;
   auto log = Open(&contents);
   GOOGLESQL_ASSERT_OK(log->Append("a").status());
   Crash(log);
-  std::string data = *fs_->Contents(SegmentPath(0));
-  data[8] = 2;  // version 2, with a valid header checksum
-  uint32_t crc = static_cast<uint32_t>(
-      absl::ComputeCrc32c(absl::string_view(data).substr(0, 12)));
-  for (int i = 0; i < 4; ++i) data[12 + i] = static_cast<char>(crc >> (8 * i));
-  fs_->Overwrite(SegmentPath(0), data);
-  absl::Status status = OpenStatus();
-  EXPECT_THAT(status, googlesql_base::testing::StatusIs(
-                          absl::StatusCode::kFailedPrecondition));
-  EXPECT_THAT(status.message(), HasSubstr("format version 2"));
+  for (uint8_t version : {0, 3}) {
+    SetFormatVersion(*fs_, SegmentPath(0), version);
+    absl::Status status = OpenStatus();
+    EXPECT_THAT(status, googlesql_base::testing::StatusIs(
+                            absl::StatusCode::kFailedPrecondition));
+    EXPECT_THAT(status.message(),
+                HasSubstr(absl::StrCat("format version ", version)));
+  }
+}
+
+TEST_F(LogTest, OlderFormatIsReadButNotAppendedTo) {
+  LogContents contents;
+  auto log = Open(&contents);
+  GOOGLESQL_ASSERT_OK(log->Append("a").status());
+  GOOGLESQL_ASSERT_OK(log->Append("b").status());
+  Crash(log);
+  SetFormatVersion(*fs_, SegmentPath(0), 1);
+  const std::string version1 = *fs_->Contents(SegmentPath(0));
+  log = Open(&contents);
+  EXPECT_THAT(contents.records, ElementsAre("a", "b"));
+  GOOGLESQL_ASSERT_OK(log->Append("c").status());
+  Crash(log);
+  // "c" went to a new segment of the current format; the old file is as it
+  // was.
+  EXPECT_EQ(*fs_->Contents(SegmentPath(0)), version1);
+  EXPECT_EQ((*fs_->Contents(SegmentPath(2)))[8], kFormatVersion);
+  Open(&contents);
+  EXPECT_THAT(contents.records, ElementsAre("a", "b", "c"));
 }
 
 TEST_F(LogTest, SecondOpenOfTheSameDirectoryIsRefused) {

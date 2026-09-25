@@ -28,6 +28,7 @@
 #include "backend/schema/catalog/proto_bundle.h"
 #include "backend/storage/recording_storage.h"
 #include "frontend/persistence/persistence.pb.h"
+#include "google/protobuf/timestamp.pb.h"
 #include "googlesql/public/types/type_factory.h"
 #include "googlesql/public/value.h"
 
@@ -61,8 +62,18 @@ absl::Status EncodeSchema(const backend::PersistedSchema& schema,
 // What rebuilding the schema needs to give its objects their IDs back.
 backend::DatabaseRestore DecodeRestore(const SchemaState& schema);
 
-inline int64_t ToNanos(absl::Time t) { return absl::ToUnixNanos(t); }
-inline absl::Time FromNanos(int64_t n) { return absl::FromUnixNanos(n); }
+// Lossless for every timestamp Spanner accepts.
+void EncodeTime(absl::Time time, google::protobuf::Timestamp* out);
+absl::Time DecodeTime(const google::protobuf::Timestamp& in);
+
+// The timestamps of a record or checkpoint, from the current field or, in
+// format version 1 files, the int64 nanosecond one. A record without a
+// commit timestamp gives InfinitePast.
+absl::Time RecordTimestamp(const Record& record);
+absl::Time LeaseOf(const Record& record);
+absl::Time CreateTimeOf(const DatabaseState& database);
+absl::Time ClockHighOf(const Checkpoint& checkpoint);
+absl::Time DataTimestampOf(const Checkpoint& checkpoint);
 
 }  // namespace persistence
 }  // namespace frontend

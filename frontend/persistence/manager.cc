@@ -89,7 +89,7 @@ class DatabaseLogImpl : public backend::DatabaseLog {
   absl::Status LogCommit(absl::Time commit_timestamp,
                          const std::vector<backend::StorageOp>& ops) override {
     Record record;
-    record.set_timestamp_nanos(ToNanos(commit_timestamp));
+    EncodeTime(commit_timestamp, record.mutable_timestamp());
     Commit* commit = record.mutable_commit();
     commit->set_database(incarnation_);
     for (const auto& op : ops) {
@@ -102,7 +102,7 @@ class DatabaseLogImpl : public backend::DatabaseLog {
       absl::Time commit_timestamp, const backend::PersistedSchema& schema,
       const std::vector<backend::StorageOp>& ops) override {
     Record record;
-    record.set_timestamp_nanos(ToNanos(commit_timestamp));
+    EncodeTime(commit_timestamp, record.mutable_timestamp());
     SchemaChange* change = record.mutable_schema_change();
     change->set_database(incarnation_);
     GOOGLESQL_RETURN_IF_ERROR(EncodeSchema(schema, change->mutable_schema()));
@@ -286,8 +286,8 @@ absl::Status PersistenceManager::Recover(const LogContents& contents,
   absl::flat_hash_map<std::string, int64_t> reservations;
   uint64_t next_incarnation =
       std::max<uint64_t>(1, checkpoint.next_incarnation());
-  int64_t high = std::max(checkpoint.clock_high_nanos(),
-                          checkpoint.data_timestamp_nanos());
+  absl::Time high =
+      std::max(ClockHighOf(checkpoint), DataTimestampOf(checkpoint));
   for (const InstanceState& instance : checkpoint.instances()) {
     instances[instance.incarnation()] = instance;
   }
@@ -299,11 +299,11 @@ absl::Status PersistenceManager::Recover(const LogContents& contents,
   for (const auto& [id, end] : checkpoint.sequence_reservations()) {
     reservations[id] = end;
   }
-  int64_t last_timestamp = checkpoint.data_timestamp_nanos();
+  absl::Time last_timestamp = DataTimestampOf(checkpoint);
   for (size_t i = 0; i < records.size(); ++i) {
     const Record& record = records[i];
-    int64_t ts = record.timestamp_nanos();
-    if (ts != 0) {
+    absl::Time ts = RecordTimestamp(record);
+    if (ts != absl::InfinitePast()) {
       if (ts <= last_timestamp) {
         return absl::DataLossError(
             absl::StrCat("log record ", contents.boundary + i,
@@ -316,15 +316,14 @@ absl::Status PersistenceManager::Recover(const LogContents& contents,
       case Record::kCommit:
         if (auto it = databases.find(record.commit().database());
             it != databases.end()) {
-          it->second.ops.emplace_back(FromNanos(ts), &record.commit().ops());
+          it->second.ops.emplace_back(ts, &record.commit().ops());
         }
         break;
       case Record::kSchemaChange:
         if (auto it = databases.find(record.schema_change().database());
             it != databases.end()) {
           *it->second.state.mutable_schema() = record.schema_change().schema();
-          it->second.ops.emplace_back(FromNanos(ts),
-                                      &record.schema_change().ops());
+          it->second.ops.emplace_back(ts, &record.schema_change().ops());
         }
         break;
       case Record::kCreateInstance:
@@ -359,8 +358,9 @@ absl::Status PersistenceManager::Recover(const LogContents& contents,
         end = std::max(end, record.sequence_reservation().end());
         break;
       }
+      case Record::kClockLease:
       case Record::kClockLeaseNanos:
-        high = std::max(high, record.clock_lease_nanos());
+        high = std::max(high, LeaseOf(record));
         break;
       default:
         return absl::DataLossError(absl::StrCat(
@@ -370,7 +370,7 @@ absl::Status PersistenceManager::Recover(const LogContents& contents,
 
   // Restart above every timestamp handed out before: commit timestamps,
   // leases (which bound served read timestamps) and the wall clock.
-  absl::Time restart = std::max(FromNanos(high), clock_->Now());
+  absl::Time restart = std::max(high, clock_->Now());
   clock_->AdvanceTo(restart);
   restart_floor_ = restart + absl::Microseconds(1);
   // No timestamp after `restart` is handed out before a durable lease covers
@@ -379,7 +379,7 @@ absl::Status PersistenceManager::Recover(const LogContents& contents,
                    [this](absl::Time needed) -> absl::StatusOr<absl::Time> {
                      absl::Time lease = needed + options_.lease_window;
                      Record record;
-                     record.set_clock_lease_nanos(ToNanos(lease));
+                     EncodeTime(lease, record.mutable_clock_lease());
                      GOOGLESQL_RETURN_IF_ERROR(Append(record));
                      return lease;
                    });
@@ -421,15 +421,14 @@ absl::Status PersistenceManager::Recover(const LogContents& contents,
                        backend_database.status().message()));
     }
     GOOGLESQL_RETURN_IF_ERROR(
-        LoadRows(image, FromNanos(checkpoint.data_timestamp_nanos()),
-                 backend_database->get()));
+        LoadRows(image, DataTimestampOf(checkpoint), backend_database->get()));
     (*backend_database)->SetRestartFloor(restart_floor_);
     for (const auto& [name, id] : restore.ids.sequences) {
       live_sequences.insert(id);
     }
-    auto database = std::make_shared<Database>(
-        image.state.uri(), *std::move(backend_database),
-        FromNanos(image.state.create_time_nanos()));
+    auto database = std::make_shared<Database>(image.state.uri(),
+                                               *std::move(backend_database),
+                                               CreateTimeOf(image.state));
     GOOGLESQL_RETURN_IF_ERROR(database_manager->RestoreDatabase(database));
     absl::MutexLock lock(catalog_mu_);
     LiveDatabase& live = databases_[incarnation];
@@ -517,11 +516,11 @@ absl::Status PersistenceManager::Checkpoint() {
     GOOGLESQL_RETURN_IF_ERROR(log_->health());
     GOOGLESQL_ASSIGN_OR_RETURN(boundary, log_->StartSegment());
     absl::Time data_timestamp = clock_->Now();
-    checkpoint.set_data_timestamp_nanos(ToNanos(data_timestamp));
+    EncodeTime(data_timestamp, checkpoint.mutable_data_timestamp());
     // Read after StartSegment: a lease or sequence reservation logged before
     // the boundary is reflected here, and any later one is after it.
-    checkpoint.set_clock_high_nanos(
-        ToNanos(std::max(data_timestamp, clock_->lease())));
+    EncodeTime(std::max(data_timestamp, clock_->lease()),
+               checkpoint.mutable_clock_high());
     absl::flat_hash_map<std::string, int64_t> reservations =
         backend::Sequence::ReservationEnds();
 
@@ -601,7 +600,7 @@ absl::Status PersistenceManager::LogCreateInstance(
   state.mutable_labels()->insert(instance.labels().begin(),
                                  instance.labels().end());
   Record record;
-  record.set_timestamp_nanos(ToNanos(clock_->Now()));
+  EncodeTime(clock_->Now(), record.mutable_timestamp());
   *record.mutable_create_instance() = state;
   GOOGLESQL_RETURN_IF_ERROR(Append(record));
   absl::MutexLock lock(catalog_mu_);
@@ -620,7 +619,7 @@ absl::Status PersistenceManager::LogDeleteInstance(
     incarnation = it->second.incarnation();
   }
   Record record;
-  record.set_timestamp_nanos(ToNanos(clock_->Now()));
+  EncodeTime(clock_->Now(), record.mutable_timestamp());
   record.set_drop_instance(incarnation);
   GOOGLESQL_RETURN_IF_ERROR(Append(record));
   absl::MutexLock lock(catalog_mu_);
@@ -649,9 +648,9 @@ absl::Status PersistenceManager::LogCreateDatabase(
   }
   state.set_incarnation(IncarnationOf(*database));
   state.set_uri(database->database_uri());
-  state.set_create_time_nanos(ToNanos(create_time));
+  EncodeTime(create_time, state.mutable_create_time());
   Record record;
-  record.set_timestamp_nanos(ToNanos(clock_->Now()));
+  EncodeTime(clock_->Now(), record.mutable_timestamp());
   *record.mutable_create_database() = state;
   GOOGLESQL_RETURN_IF_ERROR(
       EncodeSchema(database->backend()->GetPersistedSchema(),
@@ -666,7 +665,7 @@ absl::Status PersistenceManager::LogDropDatabase(const Database& database) {
   absl::MutexLock gate_lock(gate_);
   uint64_t incarnation = IncarnationOf(database);
   Record record;
-  record.set_timestamp_nanos(ToNanos(clock_->Now()));
+  EncodeTime(clock_->Now(), record.mutable_timestamp());
   record.set_drop_database(incarnation);
   GOOGLESQL_RETURN_IF_ERROR(Append(record));
   absl::MutexLock lock(catalog_mu_);

@@ -45,6 +45,8 @@ cc_library(
         "database.h",
     ],
     deps = [
+        "@com_google_absl//absl/cleanup",
+        "@com_google_absl//absl/container:flat_hash_set",
         ":database_log",
         "//backend/storage:recording_storage",
         "@com_google_absl//absl/container:flat_hash_map",

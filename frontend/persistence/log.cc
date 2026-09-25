@@ -91,19 +91,22 @@ std::string FileHeader(absl::string_view magic) {
 }
 
 absl::Status CheckFileHeader(absl::string_view data, absl::string_view magic,
-                             const std::string& path) {
+                             const std::string& path,
+                             uint32_t* version_out = nullptr) {
   if (data.size() < kFileHeaderSize || data.substr(0, magic.size()) != magic ||
       GetFixed32(data, 12) != Crc(data.substr(0, 12))) {
     return absl::DataLossError(
         absl::StrCat(path, " is not an emulator data file or is damaged"));
   }
   uint32_t version = GetFixed32(data, 8);
-  if (version != kFormatVersion) {
+  if (version < kOldestReadableFormatVersion || version > kFormatVersion) {
     return absl::FailedPreconditionError(
         absl::StrCat(path, " has data format version ", version,
-                     "; this emulator reads only version ", kFormatVersion,
+                     "; this emulator reads versions ",
+                     kOldestReadableFormatVersion, " to ", kFormatVersion,
                      ". Use a matching emulator, or wipe the data directory."));
   }
+  if (version_out != nullptr) *version_out = version;
   return absl::OkStatus();
 }
 
@@ -161,6 +164,7 @@ struct Segment {
   std::vector<absl::string_view> records;
   size_t valid_end = kFileHeaderSize;  // after the last intact record
   bool header_torn = false;
+  uint32_t version = kFormatVersion;
 };
 
 // Parses the records of `segment`. A damaged record is a torn write only at
@@ -171,7 +175,8 @@ absl::Status ScanSegment(Segment& segment, bool is_last) {
     segment.header_torn = true;
     return absl::OkStatus();
   }
-  if (auto status = CheckFileHeader(data, kSegmentMagic, segment.path);
+  if (auto status =
+          CheckFileHeader(data, kSegmentMagic, segment.path, &segment.version);
       !status.ok()) {
     return status;
   }
@@ -352,8 +357,15 @@ absl::StatusOr<std::unique_ptr<Log>> Log::Open(FileSystem* fs,
     log->segments_.push_back(segment.first_lsn);
   }
   log->next_lsn_ = next_lsn;
+  // Appends go to a new segment if the last one is of an older format.
   if (segments.empty() ||
-      segments.back().first_lsn + segments.back().records.size() != next_lsn) {
+      segments.back().first_lsn + segments.back().records.size() != next_lsn ||
+      segments.back().version != kFormatVersion) {
+    // An empty segment of an older format is replaced under the same name.
+    if (!segments.empty() && segments.back().records.empty() &&
+        segments.back().first_lsn == next_lsn) {
+      log->segments_.pop_back();
+    }
     if (auto status = log->CreateSegment(next_lsn); !status.ok()) {
       return status;
     }

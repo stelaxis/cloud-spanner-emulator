@@ -109,6 +109,10 @@ class Sequence : public SchemaNode {
   void RemoveSequenceFromLastValuesMap() const
       ABSL_LOCKS_EXCLUDED(SequenceMutex);
 
+  // Forgets the counter and reservation of the sequence with this ID.
+  static void ForgetState(const std::string& sequence_id)
+      ABSL_LOCKS_EXCLUDED(SequenceMutex);
+
   // SchemaNode interface implementation.
   // ------------------------------------
   std::optional<SchemaNameInfo> GetSchemaNameInfo() const override {

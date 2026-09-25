@@ -31,6 +31,7 @@ proto_library(
     deps = [
         "@com_google_googleapis//google/spanner/v1:spanner_proto",
         "@com_google_protobuf//:struct_proto",
+        "@com_google_protobuf//:timestamp_proto",
     ],
 )
 
@@ -168,6 +169,10 @@ cc_test(
     size = "medium",
     srcs = ["persistence_test.cc"],
     deps = [
+        ":codec",
+        ":log",
+        ":persistence_cc_proto",
+        "@com_google_absl//absl/crc:crc32c",
         ":manager",
         ":mem_file_system",
         "//backend/access:read",

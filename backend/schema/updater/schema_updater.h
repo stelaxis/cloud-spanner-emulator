@@ -78,6 +78,10 @@ struct SchemaChangeContext {
   // Sequence IDs by sequence name, used instead of fresh ones when a schema
   // is rebuilt from its DDL on recovery (--data_dir).
   const absl::flat_hash_map<std::string, std::string>* sequence_ids = nullptr;
+
+  // If set, receives the ID of every sequence the change creates, including
+  // ones a later statement of the same change drops.
+  std::vector<std::string>* created_sequence_ids = nullptr;
 };
 
 // The result of processing a set of DDL statements for a schema change request.

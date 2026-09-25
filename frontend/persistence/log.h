@@ -36,8 +36,12 @@ namespace emulator {
 namespace frontend {
 namespace persistence {
 
-// The on-disk format version. Files of any other version are refused.
-inline constexpr uint32_t kFormatVersion = 1;
+// The on-disk format version written. Files of versions from
+// kOldestReadableFormatVersion up to it are read (version 1 stored timestamps
+// as int64 nanoseconds); any other version is refused. Records are never
+// appended to a file of an older version.
+inline constexpr uint32_t kFormatVersion = 2;
+inline constexpr uint32_t kOldestReadableFormatVersion = 1;
 
 // What a data directory held when it was opened.
 struct LogContents {

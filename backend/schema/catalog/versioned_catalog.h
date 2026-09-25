@@ -63,6 +63,12 @@ class VersionedCatalog {
   std::shared_ptr<const Schema> GetLatestSchemaShared() const
       ABSL_LOCKS_EXCLUDED(mu_);
 
+  // Returns the error AddSchema(creation_time, schema) would return, without
+  // adding it. AddSchema cannot fail after this succeeds unless another
+  // schema is added in between.
+  absl::Status CheckSchema(absl::Time creation_time, const Schema& schema) const
+      ABSL_LOCKS_EXCLUDED(mu_);
+
   // Adds a schema at a given timestamp. Returns an error if creation_time is
   // the same or prior to the largest timestamp in all of the schemas. In this
   // case, the new schema will not be added.

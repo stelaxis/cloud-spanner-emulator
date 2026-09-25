@@ -19,6 +19,7 @@ syntax = "proto3";
 package google.spanner.emulator.frontend.persistence;
 
 import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
 import "google/spanner/v1/type.proto";
 
 // The payloads of log records and of the checkpoint (--data_dir). Records
@@ -26,6 +27,11 @@ import "google/spanner/v1/type.proto";
 // generated columns or backfills. Databases and instances are identified by
 // incarnation, never reused, so a dropped database stays dropped even if one
 // with the same name is created later.
+//
+// Timestamps are google.protobuf.Timestamp (seconds and nanos): Spanner
+// accepts read timestamps up to the year 9999, beyond int64 nanoseconds
+// (year 2262). Format version 1 wrote int64 Unix nanoseconds in the fields
+// marked "version 1"; they are still read when the new field is absent.
 
 // A stored value in the client wire encoding. No type means an unset value.
 message StoredValue {
@@ -83,8 +89,9 @@ message DatabaseState {
   uint64 incarnation = 1;
   uint64 instance_incarnation = 2;
   string uri = 3;
-  int64 create_time_nanos = 4;
+  int64 create_time_nanos = 4;  // version 1
   SchemaState schema = 5;
+  google.protobuf.Timestamp create_time = 6;
 }
 
 message Commit {
@@ -106,9 +113,10 @@ message SequenceReservation {
 }
 
 message Record {
-  // The commit timestamp. Zero for sequence reservations and clock leases,
+  // The commit timestamp. Absent for sequence reservations and clock leases,
   // whose effect (a maximum) does not depend on their order.
-  int64 timestamp_nanos = 1;
+  google.protobuf.Timestamp timestamp = 10;
+  int64 timestamp_nanos = 1;  // version 1; zero if absent
   oneof effect {
     Commit commit = 2;
     SchemaChange schema_change = 3;
@@ -118,7 +126,8 @@ message Record {
     uint64 drop_database = 7;
     SequenceReservation sequence_reservation = 8;
     // No timestamp above this was handed out before it was extended.
-    int64 clock_lease_nanos = 9;
+    google.protobuf.Timestamp clock_lease = 11;
+    int64 clock_lease_nanos = 9;  // version 1
   }
 }
 
@@ -140,9 +149,11 @@ message DatabaseCheckpoint {
 
 message Checkpoint {
   // At or above every timestamp handed out before the capture.
-  int64 clock_high_nanos = 1;
+  google.protobuf.Timestamp clock_high = 7;
+  int64 clock_high_nanos = 1;  // version 1
   // The rows are as of this timestamp.
-  int64 data_timestamp_nanos = 2;
+  google.protobuf.Timestamp data_timestamp = 8;
+  int64 data_timestamp_nanos = 2;  // version 1
   uint64 next_incarnation = 3;
   repeated InstanceState instances = 4;
   repeated DatabaseCheckpoint databases = 5;

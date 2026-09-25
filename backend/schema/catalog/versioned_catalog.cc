@@ -30,6 +30,7 @@
 #include "backend/common/utils.h"
 #include "backend/schema/catalog/schema.h"
 #include "googlesql/base/ret_check.h"
+#include "googlesql/base/status_macros.h"
 
 namespace google {
 namespace spanner {
@@ -93,19 +94,23 @@ std::shared_ptr<const Schema> VersionedCatalog::GetLatestSchemaShared() const {
   return GetSchemaShared(absl::InfiniteFuture());
 }
 
-absl::Status VersionedCatalog::AddSchema(absl::Time creation_time,
-                                         std::unique_ptr<const Schema> schema) {
+absl::Status VersionedCatalog::CheckSchema(absl::Time creation_time,
+                                           const Schema& schema) const {
   absl::MutexLock lock(mu_);
   GOOGLESQL_RET_CHECK(creation_time > schemas_.rbegin()->first)
       << "Failed to insert schema at " << absl::FormatTime(creation_time)
       << ": the latest schema creation timestamp is "
       << absl::FormatTime(schemas_.rbegin()->first);
-  auto version_retention_period =
-      ParseVersionRetentionPeriod(schema->version_retention_period());
-  if (!version_retention_period.ok()) {
-    return version_retention_period.status();
-  }
-  version_retention_period_ = *version_retention_period;
+  return ParseVersionRetentionPeriod(schema.version_retention_period())
+      .status();
+}
+
+absl::Status VersionedCatalog::AddSchema(absl::Time creation_time,
+                                         std::unique_ptr<const Schema> schema) {
+  GOOGLESQL_RETURN_IF_ERROR(CheckSchema(creation_time, *schema));
+  absl::MutexLock lock(mu_);
+  version_retention_period_ =
+      *ParseVersionRetentionPeriod(schema->version_retention_period());
   schemas_[creation_time] = std::move(schema);
   return absl::OkStatus();
 }

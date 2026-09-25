@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
+#include "absl/crc/crc32c.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/cord.h"
@@ -31,6 +32,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/civil_time.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "backend/access/read.h"
@@ -41,6 +43,7 @@
 #include "backend/datamodel/key_set.h"
 #include "backend/schema/catalog/index.h"
 #include "backend/schema/catalog/schema.h"
+#include "backend/schema/catalog/sequence.h"
 #include "backend/schema/catalog/table.h"
 #include "backend/schema/printer/print_ddl.h"
 #include "backend/schema/updater/schema_updater.h"
@@ -50,8 +53,11 @@
 #include "frontend/collections/database_manager.h"
 #include "frontend/collections/instance_manager.h"
 #include "frontend/entities/database.h"
+#include "frontend/persistence/codec.h"
+#include "frontend/persistence/log.h"
 #include "frontend/persistence/manager.h"
 #include "frontend/persistence/mem_file_system.h"
+#include "frontend/persistence/persistence.pb.h"
 #include "frontend/server/environment.h"
 #include "gmock/gmock.h"
 #include "google/protobuf/descriptor.pb.h"
@@ -884,6 +890,200 @@ TEST_F(PersistenceTest, RecoveryIgnoresValuesOfDroppedProtoAndEnumColumns) {
   ASSERT_NE(db, nullptr);
   EXPECT_EQ(DumpStorage(db.get()), storage);
   EXPECT_EQ(ReadTable(db.get(), "P").size(), 1);
+}
+
+TEST_F(PersistenceTest, ARejectedSchemaChangeIsNotLogged) {
+  auto emulator = StartOrDie();
+  auto db = CreateDatabase(emulator.get());
+  // The updater accepts both statements; installing the schema then rejects
+  // the retention period (at most 7 days).
+  EXPECT_FALSE(UpdateSchema(db.get(), {"DROP TABLE Transfers",
+                                       "ALTER DATABASE db1 SET OPTIONS "
+                                       "(version_retention_period = '8d')"})
+                   .ok());
+  ASSERT_NE(db->backend()->GetLatestSchema()->FindTable("Transfers"), nullptr);
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(absl::Time unused,
+                                 Commit(db.get(), InsertAccount("a", 1)));
+  (void)unused;
+  auto txn =
+      db->backend()->CreateReadOnlyTransaction(backend::ReadOnlyOptions());
+  GOOGLESQL_ASSERT_OK(txn.status());
+  std::unique_ptr<backend::RowCursor> cursor;
+  GOOGLESQL_ASSERT_OK(
+      (*txn)->Read(backend::ReadArg{.table = "Accounts",
+                                    .key_set = backend::KeySet::All(),
+                                    .columns = {"Id"}},
+                   &cursor));
+  ASSERT_TRUE(cursor->Next());
+  backend::Mutation m;
+  m.AddWriteOp(backend::MutationOpType::kInsert, "Transfers",
+               {"TransferId", "FromId"},
+               {{String("t1"), cursor->ColumnValue(0)}});
+  GOOGLESQL_ASSERT_OK(Commit(db.get(), m).status());
+  const auto ddl = Ddl(db.get());
+  txn->reset();
+  cursor.reset();
+  db.reset();
+  Crash(emulator);
+  emulator = StartOrDie();
+  db = GetDatabase(emulator.get());
+  ASSERT_NE(db, nullptr);
+  EXPECT_EQ(Ddl(db.get()), ddl);
+  ASSERT_NE(db->backend()->GetLatestSchema()->FindTable("Transfers"), nullptr);
+  EXPECT_EQ(ReadTable(db.get(), "Transfers").size(), 1);
+}
+
+TEST_F(PersistenceTest, FarFutureReadTimestampsAreCoveredAcrossARestart) {
+  auto emulator = StartOrDie();
+  auto db = CreateDatabase(emulator.get());
+  // Past the int64 nanosecond range (year 2262), within Spanner's.
+  const absl::Time year3000 = absl::FromCivil(
+      absl::CivilSecond(3000, 1, 1, 0, 0, 0), absl::UTCTimeZone());
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto txn,
+      db->backend()->CreateReadOnlyTransaction(backend::ReadOnlyOptions{
+          .bound = backend::TimestampBound::kExactTimestamp,
+          .timestamp = year3000}));
+  EXPECT_EQ(txn->read_timestamp(), year3000);
+  txn.reset();
+  db.reset();
+  Crash(emulator);
+  emulator = StartOrDie();
+  // Nothing may read or commit now: that would wait until the year 3000.
+  EXPECT_GT(emulator->persistence->restart_floor(), year3000);
+  EXPECT_GT(emulator->clock->Now(), year3000);
+}
+
+TEST_F(PersistenceTest, SequencesCreatedAndDroppedInOneBatchLeaveNoState) {
+  auto emulator = StartOrDie();
+  auto db = CreateDatabase(emulator.get());
+  for (int i = 0; i < 3; ++i) {
+    GOOGLESQL_ASSERT_OK(
+        Commit(db.get(), InsertAccount(absl::StrCat("a", i), 0)).status());
+  }
+  const auto before = backend::Sequence::ReservationEnds();
+  // The backfill of Tmp draws values from tmp, which is gone by the end.
+  GOOGLESQL_ASSERT_OK(UpdateSchema(
+      db.get(),
+      {"CREATE SEQUENCE tmp OPTIONS (sequence_kind = 'bit_reversed_positive')",
+       "ALTER TABLE Accounts ADD COLUMN Tmp INT64 NOT NULL DEFAULT "
+       "(GET_NEXT_SEQUENCE_VALUE(SEQUENCE tmp))",
+       "ALTER TABLE Accounts DROP COLUMN Tmp", "DROP SEQUENCE tmp"}));
+  EXPECT_EQ(backend::Sequence::ReservationEnds(), before);
+}
+
+// Rewrites a data file as format version 1 wrote it: version 1 in the header
+// and int64 nanosecond timestamps in the payloads, which `convert` produces.
+void RewriteAsVersion1(
+    MemFileSystem& fs, const std::string& path,
+    const std::function<std::string(absl::string_view)>& convert) {
+  std::string data = *fs.Contents(path);
+  std::string header = data.substr(0, 16);
+  header[8] = 1;
+  uint32_t crc = static_cast<uint32_t>(
+      absl::ComputeCrc32c(absl::string_view(header).substr(0, 12)));
+  for (int i = 0; i < 4; ++i)
+    header[12 + i] = static_cast<char>(crc >> (8 * i));
+  std::string out = header;
+  for (size_t pos = 16; pos + 24 <= data.size();) {
+    auto fixed = [&](size_t at, int bytes) {
+      uint64_t v = 0;
+      for (int i = 0; i < bytes; ++i) {
+        v |= static_cast<uint64_t>(static_cast<uint8_t>(data[at + i]))
+             << (8 * i);
+      }
+      return v;
+    };
+    uint64_t length = fixed(pos + 4, 4);
+    uint64_t lsn = fixed(pos + 8, 8);
+    out += FrameRecord(
+        lsn, convert(absl::string_view(data).substr(pos + 24, length)));
+    pos += 24 + length;
+  }
+  fs.Overwrite(path, out);
+}
+
+void ToVersion1(google::protobuf::Timestamp* time, int64_t* nanos) {
+  *nanos = absl::ToUnixNanos(DecodeTime(*time));
+  time->Clear();
+}
+
+TEST_F(PersistenceTest, Version1DataDirectoriesStayReadable) {
+  // Timestamps 3 s ahead of the restarted emulator's system clock: only the
+  // version 1 timestamp fields can put its clock above them.
+  auto emulator = StartOrDie([] { return absl::Now() + absl::Seconds(3); });
+  auto db = CreateDatabase(emulator.get());
+  GOOGLESQL_ASSERT_OK(Commit(db.get(), InsertAccount("a", 1)).status());
+  GOOGLESQL_ASSERT_OK(emulator->persistence->Checkpoint());
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(absl::Time last,
+                                 Commit(db.get(), InsertAccount("b", 2)));
+  GOOGLESQL_ASSERT_OK(UpdateSchema(
+      db.get(), {"CREATE TABLE Later (K INT64 NOT NULL) PRIMARY KEY (K)"}));
+  const auto storage = DumpStorage(db.get());
+  const auto ddl = Ddl(db.get());
+  db.reset();
+  Crash(emulator);
+
+  auto names = fs_.ListDir("/data");
+  GOOGLESQL_ASSERT_OK(names.status());
+  for (const std::string& name : *names) {
+    const std::string path = absl::StrCat("/data/", name);
+    if (name == "checkpoint") {
+      RewriteAsVersion1(fs_, path, [](absl::string_view payload) {
+        persistence::Checkpoint checkpoint;
+        EXPECT_TRUE(checkpoint.ParseFromString(payload));
+        int64_t nanos;
+        ToVersion1(checkpoint.mutable_clock_high(), &nanos);
+        checkpoint.set_clock_high_nanos(nanos);
+        checkpoint.clear_clock_high();
+        ToVersion1(checkpoint.mutable_data_timestamp(), &nanos);
+        checkpoint.set_data_timestamp_nanos(nanos);
+        checkpoint.clear_data_timestamp();
+        for (auto& database : *checkpoint.mutable_databases()) {
+          ToVersion1(database.mutable_database()->mutable_create_time(),
+                     &nanos);
+          database.mutable_database()->set_create_time_nanos(nanos);
+          database.mutable_database()->clear_create_time();
+        }
+        return checkpoint.SerializeAsString();
+      });
+    } else if (absl::StartsWith(name, "wal-")) {
+      RewriteAsVersion1(fs_, path, [](absl::string_view payload) {
+        Record record;
+        EXPECT_TRUE(record.ParseFromString(payload));
+        int64_t nanos = 0;
+        if (record.has_timestamp()) {
+          ToVersion1(record.mutable_timestamp(), &nanos);
+          record.set_timestamp_nanos(nanos);
+          record.clear_timestamp();
+        }
+        if (record.has_clock_lease()) {
+          ToVersion1(record.mutable_clock_lease(), &nanos);
+          record.set_clock_lease_nanos(nanos);
+        }
+        if (record.has_create_database()) {
+          ToVersion1(record.mutable_create_database()->mutable_create_time(),
+                     &nanos);
+          record.mutable_create_database()->set_create_time_nanos(nanos);
+          record.mutable_create_database()->clear_create_time();
+        }
+        return record.SerializeAsString();
+      });
+    }
+  }
+
+  emulator = StartOrDie();
+  EXPECT_GT(emulator->persistence->restart_floor(), last);
+  db = GetDatabase(emulator.get());
+  ASSERT_NE(db, nullptr);
+  EXPECT_EQ(Ddl(db.get()), ddl);
+  EXPECT_EQ(DumpStorage(db.get()), storage);
+  GOOGLESQL_EXPECT_OK(Commit(db.get(), InsertAccount("c", 3)).status());
+  db.reset();
+  Crash(emulator);
+  emulator = StartOrDie();
+  db = GetDatabase(emulator.get());
+  EXPECT_EQ(ReadTable(db.get(), "Accounts").size(), 3);
 }
 
 TEST_F(PersistenceTest, ConcurrentCommitsCheckpointsAndACrash) {
