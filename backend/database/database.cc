@@ -214,6 +214,12 @@ absl::StatusOr<std::unique_ptr<Database>> Database::Create(
 }
 absl::StatusOr<std::unique_ptr<ReadOnlyTransaction>>
 Database::CreateReadOnlyTransaction(const ReadOnlyOptions& options) {
+  if (log_ != nullptr && (options.bound == TimestampBound::kExactTimestamp ||
+                          options.bound == TimestampBound::kMinTimestamp)) {
+    // A bound the caller chose is checked whatever the lease already covers;
+    // timestamps the clock picks are not.
+    GOOGLESQL_RETURN_IF_ERROR(clock_->CheckCoverable(options.timestamp));
+  }
   auto transaction = std::make_unique<ReadOnlyTransaction>(
       options, transaction_id_generator_.NextId(), clock_, storage_.get(),
       lock_manager_.get(), versioned_catalog_.get());
@@ -366,6 +372,18 @@ absl::Status Database::ApplySchemaChangeLocked(
       storage_->RollBackVersionsAt(update_timestamp);
       return rejected;
     }
+    // Drop marks come from validating every statement, including ones whose
+    // backfill failed or never ran; only the published drops may clean up.
+    SchemaIds live = CollectSchemaIds(result.updated_schema.get());
+    absl::flat_hash_set<TableID> live_tables;
+    for (const auto& [name, id] : live.tables) live_tables.insert(id);
+    absl::flat_hash_set<ColumnID> live_columns;
+    for (const auto& [name, id] : live.columns) live_columns.insert(id);
+    storage_->UnmarkDroppedAt(update_timestamp, live_tables, live_columns);
+  } else {
+    // Nothing is published (the first statement's backfill failed): its
+    // writes are already undone, and so are the drops of every statement.
+    storage_->RollBackVersionsAt(update_timestamp);
   }
 
   // With --data_dir, the new schema is published only once its record is
@@ -373,14 +391,11 @@ absl::Status Database::ApplySchemaChangeLocked(
   // before. Its backfill writes are already in storage but invisible, since
   // reads at or after its timestamp wait until it is marked committed. If the
   // record fails the emulator stops; restarting recovers what the log holds.
-  if (log_ != nullptr &&
-      (result.updated_schema != nullptr || !recorded->ops().empty())) {
+  if (log_ != nullptr && result.updated_schema != nullptr) {
     PersistedSchema persisted = GetPersistedSchema();
-    if (result.updated_schema != nullptr) {
-      // Borrowed for the call; `result` owns it.
-      persisted.schema = std::shared_ptr<const Schema>(
-          std::shared_ptr<const Schema>(), result.updated_schema.get());
-    }
+    // Borrowed for the call; `result` owns it.
+    persisted.schema = std::shared_ptr<const Schema>(
+        std::shared_ptr<const Schema>(), result.updated_schema.get());
     absl::Status status =
         log_->LogSchemaChange(update_timestamp, persisted, recorded->ops());
     if (!status.ok()) {

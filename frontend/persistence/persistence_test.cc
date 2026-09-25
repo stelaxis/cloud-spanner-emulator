@@ -47,6 +47,7 @@
 #include "backend/schema/catalog/table.h"
 #include "backend/schema/printer/print_ddl.h"
 #include "backend/schema/updater/schema_updater.h"
+#include "backend/storage/in_memory_storage.h"
 #include "backend/storage/iterator.h"
 #include "backend/transaction/options.h"
 #include "common/clock.h"
@@ -1306,6 +1307,181 @@ TEST_F(PersistenceTest, TimestampsOutsideSpannersRangeAreNeverWritten) {
       EncodeTime(absl::FromUnixSeconds(-62135596800) - absl::Nanoseconds(1),
                  &out)
           .ok());
+}
+
+const std::vector<std::string> kTwoTables = {
+    "CREATE TABLE T (K INT64 NOT NULL, V INT64) PRIMARY KEY (K)",
+    "CREATE TABLE U (K INT64 NOT NULL) PRIMARY KEY (K)"};
+
+absl::Status CommitTo(backend::Database* database,
+                      const backend::Mutation& mutation) {
+  auto txn = database->CreateReadWriteTransaction(backend::ReadWriteOptions(),
+                                                  backend::RetryState());
+  if (!txn.ok()) return txn.status();
+  if (auto status = (*txn)->Write(mutation); !status.ok()) return status;
+  return (*txn)->Commit();
+}
+
+// T holds a duplicate V, so a unique index on it fails its backfill after
+// writing some index rows. U has a row.
+void PopulateTwoTables(backend::Database* database) {
+  backend::Mutation m;
+  m.AddWriteOp(backend::MutationOpType::kInsert, "T", {"K", "V"},
+               {{Int64(1), Int64(5)}, {Int64(2), Int64(5)}});
+  m.AddWriteOp(backend::MutationOpType::kInsert, "U", {"K"}, {{Int64(1)}});
+  GOOGLESQL_EXPECT_OK(CommitTo(database, m));
+}
+
+absl::Status Apply(backend::Database* database,
+                   std::vector<std::string> statements) {
+  int successful;
+  absl::Time timestamp;
+  absl::Status backfill;
+  absl::Status status = database->UpdateSchema(
+      backend::SchemaChangeOperation{
+          .statements = std::move(statements),
+          .database_dialect =
+              database_api::DatabaseDialect::GOOGLE_STANDARD_SQL},
+      &successful, &timestamp, &backfill);
+  return status.ok() ? backfill : status;
+}
+
+std::vector<backend::TableID> StorageTables(backend::Database* database) {
+  return static_cast<backend::InMemoryStorage*>(database->storage())
+      ->TableIdsForTesting();
+}
+
+bool RowExists(backend::Database* database, const std::string& table,
+               int64_t key) {
+  const backend::Table* t = database->GetLatestSchema()->FindTable(table);
+  return t != nullptr && database->storage()
+                             ->Lookup(absl::InfiniteFuture(), t->id(),
+                                      backend::Key({Int64(key)}), {}, nullptr)
+                             .ok();
+}
+
+// Checks that a batch whose backfill failed left only its published prefix
+// in `database`: no orphan index rows, and U's rows outlive the retention
+// period of any drop mark.
+void ExpectOnlyThePrefix(backend::Database* database,
+                         const std::vector<backend::TableID>& tables) {
+  EXPECT_EQ(StorageTables(database), tables);
+  EXPECT_EQ(database->GetLatestSchema()->FindIndex("I"), nullptr);
+  database->storage()->CleanUpDeletedTables(absl::Now() + absl::Hours(24));
+  EXPECT_TRUE(RowExists(database, "U", 1));
+  EXPECT_TRUE(RowExists(database, "T", 1));
+  EXPECT_TRUE(RowExists(database, "T", 2));
+}
+
+TEST_F(PersistenceTest, AFailedFirstBackfillLeavesNothingBehind) {
+  const std::vector<std::string> batch = {"CREATE UNIQUE INDEX I ON T(V)",
+                                          "DROP TABLE U"};
+  {
+    // Without --data_dir.
+    Clock clock;
+    GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+        auto database,
+        backend::Database::Create(
+            &clock, "db1",
+            backend::SchemaChangeOperation{
+                .statements = kTwoTables,
+                .database_dialect =
+                    database_api::DatabaseDialect::GOOGLE_STANDARD_SQL}));
+    PopulateTwoTables(database.get());
+    const auto tables = StorageTables(database.get());
+    EXPECT_FALSE(Apply(database.get(), batch).ok());
+    ExpectOnlyThePrefix(database.get(), tables);
+  }
+  auto emulator = StartOrDie();
+  auto db = CreateDatabase(emulator.get(), kDatabase, kTwoTables);
+  PopulateTwoTables(db->backend());
+  const auto tables = StorageTables(db->backend());
+  const auto ddl = Ddl(db.get());
+  EXPECT_FALSE(Apply(db->backend(), batch).ok());
+  ExpectOnlyThePrefix(db->backend(), tables);
+  // The cleanup above, checkpointed, would have made a loss permanent.
+  GOOGLESQL_ASSERT_OK(emulator->persistence->Checkpoint());
+  db.reset();
+  Crash(emulator);
+  emulator = StartOrDie();
+  db = GetDatabase(emulator.get());
+  ASSERT_NE(db, nullptr);
+  EXPECT_EQ(Ddl(db.get()), ddl);
+  ExpectOnlyThePrefix(db->backend(), tables);
+}
+
+TEST_F(PersistenceTest, APartlyPublishedBatchKeepsOnlyItsPublishedStatements) {
+  // The first statement is published, the second fails in its backfill, the
+  // third never runs.
+  const std::vector<std::string> batch = {
+      "ALTER TABLE T ADD COLUMN W INT64 NOT NULL DEFAULT (7)",
+      "CREATE UNIQUE INDEX I ON T(V)", "DROP TABLE U"};
+  auto check = [](backend::Database* database,
+                  const std::vector<backend::TableID>& tables) {
+    ExpectOnlyThePrefix(database, tables);
+    const backend::Table* t = database->GetLatestSchema()->FindTable("T");
+    ASSERT_NE(t->FindColumn("W"), nullptr);
+    std::vector<googlesql::Value> values;
+    GOOGLESQL_ASSERT_OK(database->storage()->Lookup(
+        absl::InfiniteFuture(), t->id(), backend::Key({Int64(2)}),
+        {t->FindColumn("W")->id()}, &values));
+    EXPECT_EQ(values[0], Int64(7));
+  };
+  {
+    Clock clock;
+    GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+        auto database,
+        backend::Database::Create(
+            &clock, "db1",
+            backend::SchemaChangeOperation{
+                .statements = kTwoTables,
+                .database_dialect =
+                    database_api::DatabaseDialect::GOOGLE_STANDARD_SQL}));
+    PopulateTwoTables(database.get());
+    const auto tables = StorageTables(database.get());
+    EXPECT_FALSE(Apply(database.get(), batch).ok());
+    check(database.get(), tables);
+  }
+  auto emulator = StartOrDie();
+  auto db = CreateDatabase(emulator.get(), kDatabase, kTwoTables);
+  PopulateTwoTables(db->backend());
+  const auto tables = StorageTables(db->backend());
+  EXPECT_FALSE(Apply(db->backend(), batch).ok());
+  check(db->backend(), tables);
+  const auto ddl = Ddl(db.get());
+  GOOGLESQL_ASSERT_OK(emulator->persistence->Checkpoint());
+  db.reset();
+  Crash(emulator);
+  emulator = StartOrDie();
+  db = GetDatabase(emulator.get());
+  ASSERT_NE(db, nullptr);
+  EXPECT_EQ(Ddl(db.get()), ddl);
+  check(db->backend(), tables);
+}
+
+TEST_F(PersistenceTest, TheReadTimestampCutoffIgnoresEarlierRequests) {
+  auto emulator = StartOrDie();
+  auto db = CreateDatabase(emulator.get());
+  const absl::Time latest = emulator->persistence->latest_read_timestamp();
+  auto exact = [](absl::Time timestamp) {
+    return backend::ReadOnlyOptions{
+        .bound = backend::TimestampBound::kExactTimestamp,
+        .timestamp = timestamp};
+  };
+  // The first request moves the lease past the cutoff.
+  GOOGLESQL_EXPECT_OK(
+      db->backend()->CreateReadOnlyTransaction(exact(latest)).status());
+  EXPECT_THAT(
+      db->backend()
+          ->CreateReadOnlyTransaction(exact(latest + absl::Nanoseconds(1)))
+          .status(),
+      StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(db->backend()
+                  ->CreateReadOnlyTransaction(backend::ReadOnlyOptions{
+                      .bound = backend::TimestampBound::kMinTimestamp,
+                      .timestamp = latest + absl::Nanoseconds(1)})
+                  .status(),
+              StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 TEST_F(PersistenceTest, ConcurrentCommitsCheckpointsAndACrash) {

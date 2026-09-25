@@ -17,7 +17,11 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_IN_MEMORY_STORAGE_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_IN_MEMORY_STORAGE_H_
 
+#include <memory>
+#include <vector>
+
 #include "googlesql/public/value.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/time/time.h"
 #include "backend/common/ids.h"
 #include "backend/datamodel/key.h"
@@ -88,6 +92,19 @@ class InMemoryStorage : public Storage {
   void RollBackVersionsAt(absl::Time timestamp) override
       ABSL_LOCKS_EXCLUDED(mu_);
 
+  std::unique_ptr<StorageSavepoint> SaveVersionsAt(
+      absl::Time timestamp) override ABSL_LOCKS_EXCLUDED(mu_);
+  void RestoreVersionsAt(absl::Time timestamp,
+                         const StorageSavepoint& savepoint) override
+      ABSL_LOCKS_EXCLUDED(mu_);
+  void UnmarkDroppedAt(
+      absl::Time timestamp, const absl::flat_hash_set<TableID>& live_tables,
+      const absl::flat_hash_set<ColumnID>& live_columns) override
+      ABSL_LOCKS_EXCLUDED(mu_);
+
+  // The IDs of the tables holding any version. For tests.
+  std::vector<TableID> TableIdsForTesting() const ABSL_LOCKS_EXCLUDED(mu_);
+
  private:
   using Cell = std::map<absl::Time, googlesql::Value>;
   using Row = absl::flat_hash_map<ColumnID, Cell>;
@@ -105,6 +122,10 @@ class InMemoryStorage : public Storage {
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   void RemoveExpiredVersions(Cell& cell, absl::Time timestamp);
+
+  // Removes the versions at `timestamp`, and rows and tables left empty.
+  void RemoveVersionsAtLocked(absl::Time timestamp)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   // Raises the table's latest version timestamp to `timestamp`.
   void NoteVersion(const TableID& table_id, absl::Time timestamp)

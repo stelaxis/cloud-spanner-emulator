@@ -17,7 +17,10 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_STORAGE_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_STORAGE_H_
 
+#include <memory>
+
 #include "googlesql/public/value.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/time/time.h"
 #include "backend/common/ids.h"
@@ -36,6 +39,12 @@ namespace backend {
 // There will be a Storage instance for each database created. The current
 // interface is grow-only, i.e. once data is added, it will not be deleted.
 // Storage is thread-safe.
+// The versions at one timestamp, saved by Storage::SaveVersionsAt.
+class StorageSavepoint {
+ public:
+  virtual ~StorageSavepoint() = default;
+};
+
 class Storage {
  public:
   virtual ~Storage() {}
@@ -106,6 +115,21 @@ class Storage {
   // so this undoes a change that is rejected after its backfills and drop
   // marks reached storage.
   virtual void RollBackVersionsAt(absl::Time timestamp) = 0;
+
+  // Saves the versions written at `timestamp` so far; RestoreVersionsAt then
+  // puts back exactly those, undoing later writes at `timestamp`. A schema
+  // change undoes a statement whose backfill failed this way: all of its
+  // statements write at its one commit timestamp.
+  virtual std::unique_ptr<StorageSavepoint> SaveVersionsAt(
+      absl::Time timestamp) = 0;
+  virtual void RestoreVersionsAt(absl::Time timestamp,
+                                 const StorageSavepoint& savepoint) = 0;
+
+  // Forgets the drop marks made at `timestamp` for tables and columns that
+  // are still live, so cleanup never deletes them.
+  virtual void UnmarkDroppedAt(
+      absl::Time timestamp, const absl::flat_hash_set<TableID>& live_tables,
+      const absl::flat_hash_set<ColumnID>& live_columns) = 0;
 };
 
 }  // namespace backend

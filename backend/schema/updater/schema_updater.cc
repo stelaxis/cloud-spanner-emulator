@@ -6986,9 +6986,22 @@ SchemaUpdater::ValidateSchemaFromDDL(
 
 // TODO : These should run in a ReadWriteTransaction with rollback
 // capability so that changes to the database can be reversed.
-absl::Status SchemaUpdater::RunPendingActions(int* num_succesful) {
+absl::Status SchemaUpdater::RunPendingActions(int* num_succesful,
+                                              Storage* storage,
+                                              absl::Time timestamp) {
   for (const auto& pending_statement : pending_work_) {
-    GOOGLESQL_RETURN_IF_ERROR(pending_statement.RunSchemaChangeActions());
+    // All statements write at the change's one commit timestamp, so a failed
+    // statement's partial backfill is undone by restoring the versions at it
+    // from before the statement. Upstream left them, under a schema that
+    // never has the failed statement.
+    std::unique_ptr<StorageSavepoint> savepoint =
+        storage != nullptr ? storage->SaveVersionsAt(timestamp) : nullptr;
+    absl::Status status = pending_statement.RunSchemaChangeActions();
+    if (!status.ok()) {
+      if (savepoint != nullptr)
+        storage->RestoreVersionsAt(timestamp, *savepoint);
+      return status;
+    }
     ++(*num_succesful);
   }
   return absl::OkStatus();
@@ -7015,7 +7028,8 @@ absl::StatusOr<SchemaChangeResult> SchemaUpdater::UpdateSchemaFromDDL(
   int num_successful = 0;
   std::unique_ptr<const Schema> new_schema = nullptr;
 
-  absl::Status backfill_status = RunPendingActions(&num_successful);
+  absl::Status backfill_status = RunPendingActions(
+      &num_successful, context.storage, context.schema_change_timestamp);
   if (num_successful > 0) {
     new_schema = std::move(intermediate_schemas_[num_successful - 1]);
     GOOGLESQL_RETURN_IF_ERROR(context.pg_oid_assigner->EndAssignmentAtIntermediateSchema(

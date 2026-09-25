@@ -374,8 +374,10 @@ absl::Status PersistenceManager::Recover(const LogContents& contents,
   // old field; later checkpoints write the current one only.
   for (auto& [incarnation, image] : databases) {
     if (!image.state.has_create_time()) {
-      GOOGLESQL_RETURN_IF_ERROR(EncodeTime(CreateTimeOf(image.state),
-                                           image.state.mutable_create_time()));
+      // Read before mutable_create_time() creates the field it prefers.
+      const absl::Time create_time = CreateTimeOf(image.state);
+      GOOGLESQL_RETURN_IF_ERROR(
+          EncodeTime(create_time, image.state.mutable_create_time()));
       image.state.clear_create_time_nanos();
     }
   }

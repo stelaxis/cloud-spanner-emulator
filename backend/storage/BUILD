@@ -41,6 +41,7 @@ cc_library(
         "storage.h",
     ],
     deps = [
+        "@com_google_absl//absl/container:flat_hash_set",
         ":iterator",
         "//backend/common:ids",
         "//backend/datamodel:key",
@@ -74,6 +75,7 @@ cc_library(
         "in_memory_storage.h",
     ],
     deps = [
+        "@com_google_absl//absl/container:flat_hash_set",
         ":in_memory_iterator",
         ":iterator",
         ":storage",

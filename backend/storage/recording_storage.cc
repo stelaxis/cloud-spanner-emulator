@@ -16,6 +16,7 @@
 
 #include "backend/storage/recording_storage.h"
 
+#include <memory>
 #include <variant>
 #include <vector>
 
@@ -42,6 +43,30 @@ absl::Status ApplyStorageOps(absl::Time timestamp,
     if (!status.ok()) return status;
   }
   return absl::OkStatus();
+}
+
+namespace {
+
+struct RecordingSavepoint : public StorageSavepoint {
+  std::unique_ptr<StorageSavepoint> base;
+  size_t num_ops;
+};
+
+}  // namespace
+
+std::unique_ptr<StorageSavepoint> RecordingStorage::SaveVersionsAt(
+    absl::Time timestamp) {
+  auto savepoint = std::make_unique<RecordingSavepoint>();
+  savepoint->base = base_->SaveVersionsAt(timestamp);
+  savepoint->num_ops = ops_.size();
+  return savepoint;
+}
+
+void RecordingStorage::RestoreVersionsAt(absl::Time timestamp,
+                                         const StorageSavepoint& savepoint) {
+  const auto& recorded = static_cast<const RecordingSavepoint&>(savepoint);
+  base_->RestoreVersionsAt(timestamp, *recorded.base);
+  ops_.erase(ops_.begin() + recorded.num_ops, ops_.end());
 }
 
 absl::Status RecordingStorage::Write(

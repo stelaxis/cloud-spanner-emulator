@@ -185,6 +185,7 @@ cc_test(
         "//backend/schema/catalog:schema",
         "//backend/schema/printer:print_ddl",
         "//backend/schema/updater:schema_updater",
+        "//backend/storage:in_memory_storage",
         "//backend/storage:iterator",
         "//backend/transaction:read_only_transaction",
         "//backend/transaction:read_write_transaction",

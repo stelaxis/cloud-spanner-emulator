@@ -74,10 +74,17 @@ class Clock {
   // lease.
   absl::Status CoverWithLease(absl::Time timestamp) ABSL_LOCKS_EXCLUDED(mu_);
 
+  // INVALID_ARGUMENT if `timestamp` is after the latest coverable one (see
+  // SetLease), whatever the lease already covers.
+  absl::Status CheckCoverable(absl::Time timestamp) ABSL_LOCKS_EXCLUDED(mu_);
+
   // The current lease, or InfiniteFuture without one.
   absl::Time lease() ABSL_LOCKS_EXCLUDED(mu_);
 
  private:
+  absl::Status CheckCoverableLocked(absl::Time timestamp) const
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
   // Returns the system time at microsecond granularity.
   absl::Time SystemNowMicros() const;
 

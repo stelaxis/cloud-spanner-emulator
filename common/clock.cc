@@ -86,14 +86,24 @@ void Clock::SetLease(absl::Time lease, LeaseExtender extend,
   latest_coverable_ = latest_coverable;
 }
 
+absl::Status Clock::CheckCoverable(absl::Time timestamp) {
+  absl::MutexLock lock(mu_);
+  return CheckCoverableLocked(timestamp);
+}
+
+absl::Status Clock::CheckCoverableLocked(absl::Time timestamp) const {
+  if (timestamp <= latest_coverable_) return absl::OkStatus();
+  return absl::InvalidArgumentError(
+      absl::StrCat("Timestamp ", absl::FormatTime(timestamp),
+                   " is too far in the future: with --data_dir the latest is ",
+                   absl::FormatTime(latest_coverable_)));
+}
+
 absl::Status Clock::CoverWithLease(absl::Time timestamp) {
   absl::MutexLock lock(mu_);
   if (!extend_lease_ || timestamp <= lease_) return absl::OkStatus();
-  if (timestamp > latest_coverable_) {
-    return absl::InvalidArgumentError(absl::StrCat(
-        "Timestamp ", absl::FormatTime(timestamp),
-        " is too far in the future: with --data_dir the latest is ",
-        absl::FormatTime(latest_coverable_)));
+  if (absl::Status status = CheckCoverableLocked(timestamp); !status.ok()) {
+    return status;
   }
   absl::StatusOr<absl::Time> lease = extend_lease_(timestamp);
   if (!lease.ok()) return lease.status();

@@ -141,7 +141,10 @@ class SchemaUpdater {
       const Schema* existing_schema = nullptr);
 
  private:
-  absl::Status RunPendingActions(int* num_succesful);
+  // Runs each statement's actions in turn. A statement whose actions fail
+  // has its writes to `storage` at `timestamp` undone.
+  absl::Status RunPendingActions(int* num_succesful, Storage* storage,
+                                 absl::Time timestamp);
 
   std::vector<SchemaValidationContext> pending_work_;
 

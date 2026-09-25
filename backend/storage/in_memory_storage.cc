@@ -354,8 +354,15 @@ void InMemoryStorage::CleanUpDeletedColumns(absl::Time timestamp) {
   }
 }
 
-void InMemoryStorage::RollBackVersionsAt(absl::Time timestamp) {
+std::vector<TableID> InMemoryStorage::TableIdsForTesting() const {
   absl::MutexLock lock(mu_);
+  std::vector<TableID> ids;
+  for (const auto& [table_id, table] : tables_) ids.push_back(table_id);
+  std::sort(ids.begin(), ids.end());
+  return ids;
+}
+
+void InMemoryStorage::RemoveVersionsAtLocked(absl::Time timestamp) {
   std::vector<TableID> emptied_tables;
   for (auto table = tables_.begin(); table != tables_.end(); ++table) {
     bool touched = false;
@@ -383,8 +390,70 @@ void InMemoryStorage::RollBackVersionsAt(absl::Time timestamp) {
     if (table->second.empty()) emptied_tables.push_back(table->first);
   }
   for (const TableID& table_id : emptied_tables) tables_.erase(table_id);
+}
+
+void InMemoryStorage::RollBackVersionsAt(absl::Time timestamp) {
+  absl::MutexLock lock(mu_);
+  RemoveVersionsAtLocked(timestamp);
   dropped_tables_.erase(timestamp);
   dropped_columns_.erase(timestamp);
+}
+
+namespace {
+
+struct InMemorySavepoint : public StorageSavepoint {
+  struct Version {
+    TableID table_id;
+    Key key;
+    ColumnID column_id;
+    googlesql::Value value;
+  };
+  std::vector<Version> versions;
+};
+
+}  // namespace
+
+std::unique_ptr<StorageSavepoint> InMemoryStorage::SaveVersionsAt(
+    absl::Time timestamp) {
+  absl::MutexLock lock(mu_);
+  auto savepoint = std::make_unique<InMemorySavepoint>();
+  for (const auto& [table_id, table] : tables_) {
+    for (const auto& [key, row] : table) {
+      for (const auto& [column_id, cell] : row) {
+        if (auto it = cell.find(timestamp); it != cell.end()) {
+          savepoint->versions.push_back({table_id, key, column_id, it->second});
+        }
+      }
+    }
+  }
+  return savepoint;
+}
+
+void InMemoryStorage::RestoreVersionsAt(absl::Time timestamp,
+                                        const StorageSavepoint& savepoint) {
+  absl::MutexLock lock(mu_);
+  RemoveVersionsAtLocked(timestamp);
+  for (const auto& version :
+       static_cast<const InMemorySavepoint&>(savepoint).versions) {
+    tables_[version.table_id][version.key][version.column_id][timestamp] =
+        version.value;
+    NoteVersion(version.table_id, timestamp);
+  }
+}
+
+void InMemoryStorage::UnmarkDroppedAt(
+    absl::Time timestamp, const absl::flat_hash_set<TableID>& live_tables,
+    const absl::flat_hash_set<ColumnID>& live_columns) {
+  absl::MutexLock lock(mu_);
+  if (auto it = dropped_tables_.find(timestamp);
+      it != dropped_tables_.end() && live_tables.contains(it->second)) {
+    dropped_tables_.erase(it);
+  }
+  if (auto it = dropped_columns_.find(timestamp);
+      it != dropped_columns_.end() &&
+      live_columns.contains(it->second.second)) {
+    dropped_columns_.erase(it);
+  }
 }
 
 void InMemoryStorage::MarkDroppedTable(absl::Time timestamp,

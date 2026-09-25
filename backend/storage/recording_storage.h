@@ -118,6 +118,18 @@ class RecordingStorage : public Storage {
     base_->RollBackVersionsAt(timestamp);
   }
 
+  // Also forgets the ops recorded after the savepoint.
+  std::unique_ptr<StorageSavepoint> SaveVersionsAt(
+      absl::Time timestamp) override;
+  void RestoreVersionsAt(absl::Time timestamp,
+                         const StorageSavepoint& savepoint) override;
+
+  void UnmarkDroppedAt(
+      absl::Time timestamp, const absl::flat_hash_set<TableID>& live_tables,
+      const absl::flat_hash_set<ColumnID>& live_columns) override {
+    base_->UnmarkDroppedAt(timestamp, live_tables, live_columns);
+  }
+
  private:
   Storage* const base_;
   const bool forward_;
