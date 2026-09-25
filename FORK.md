@@ -47,11 +47,14 @@ git fetch upstream --tags && git merge vX.Y.Z
 
 PRs to master build both architectures without publishing. PRs and master pushes
 run the full upstream unit/conformance selection on native amd64 in eight parallel
-area shards. Each shard downloads the compiled amd64 builder from the current run,
+area shards. They depend only on `Build (amd64)`; `Build (arm64)` continues in
+parallel. Each shard downloads the compiled amd64 builder from the current run,
 with a six-hour job budget: up to 20 minutes to download, 30 to load, 285 for tests,
 and 25 for setup/log cleanup. Loading is only `docker load`, with no build fallback.
 The required `Upstream unit and conformance tests` aggregate fails unless **every
-shard succeeds**, including when the matrix is skipped by a failed build.
+shard succeeds**, including when the matrix is skipped by a failed amd64 build.
+Its `always()` condition also evaluates cancelled runs and rejects non-success.
+Publishing requires both native Build jobs and this aggregate.
 
 Each shard runs `bazel test -c opt --jobs="$BAZEL_JOBS" --test_output=errors
 --nocache_test_results --` followed by its target patterns:
@@ -86,14 +89,16 @@ is shut down before export. Build and test use the same working directory, user,
 Bazel version, `-c opt` and `BAZEL_JOBS`. Only test-specific actions need compiling.
 There is no separate Bazel disk cache or per-shard Docker build.
 
-Native jobs build gRPC/protobuf (`rpc-deps`), GoogleSQL (`deps`), and the runtime,
-each with a six-hour budget. GoogleSQL still builds value, parser, resolved AST,
-resolver and analyzer in order on one runner. RPC and GoogleSQL jobs each export
-one complete BuildKit local cache (`mode=max`, zstd) as an artifact for the next
+Separate native jobs per architecture build gRPC/protobuf, GoogleSQL, and the
+runtime, each with a six-hour budget. GoogleSQL still builds value, parser,
+resolved AST, resolver and analyzer in order on one runner. RPC and GoogleSQL jobs
+each export one complete BuildKit local cache (`mode=max`, zstd) as an artifact for the next
 job. Export/upload failure fails the producer; artifacts contain both the manifest
 and every referenced layer. `Build (amd64)` also exports `test-builder` from its
-live BuildKit builder, adds the pinned Google Cloud CLI, and uploads a gzip image
-archive. All eight test shards load that same archive, retaining compiled outputs.
+live BuildKit builder, adds the pinned Google Cloud CLI, and uploads the Docker
+export `.tar` directly, without another gzip pass. All eight test shards load that
+same archive, retaining compiled outputs. The amd64 BuildKit OCI worker has GC
+disabled so it retains the `build` stage until the test-builder export finishes.
 
 This replaces all `type=gha` layer caches. Run
 [36067621737](https://github.com/stelaxis/cloud-spanner-emulator/actions/runs/36067621737)
@@ -104,8 +109,9 @@ Dockerfile had no cache mounts. The repository was near its 10-GB cache limit;
 
 This workflow writes **zero compilation data to the Actions cache quota**;
 Buildx binary caching is disabled too. Dependency/builder artifacts use separate
-Actions artifact storage, expire after one day, and are replaced on job reruns.
-Cache directories
+Actions artifact storage, expire after three days, and are replaced on job reruns.
+This allows next-day retries of failed downstream jobs. Runtime image artifacts
+retain their one-day lifetime; failure logs retain seven days. Cache directories
 are fresh per job, with no cross-run accumulation or prefix restore. This costs
 artifact storage/transfer and rebuilds dependencies on each new workflow run.
 Rerun all producer jobs if their artifacts have expired. A partial GoogleSQL job
@@ -118,6 +124,18 @@ amd64 / 260–285 arm64. These allow transfer/export overhead beyond observed
 31/35, 45/90 and 141/255-minute jobs respectively. Test shards are unmeasured:
 allow roughly 45–210 minutes each for transfer and test-only compilation/execution,
 with a 285-minute test-step ceiling. The next CI run must confirm those estimates.
+
+The independent job chains are `rpc-deps-amd64` → `deps-amd64` → `Build (amd64)`
+and `rpc-deps-arm64` → `deps-arm64` → `Build (arm64)`. Only the amd64 Build leads
+to the eight shards and their aggregate; publishing still joins both Builds and
+the aggregate. No amd64 job or shard waits for any arm64 job. The observed amd64
+durations total **3h37 (31 + 45 + 141 minutes)**, giving a target of about **3h40
+from push to shard jobs starting**, plus queue and artifact transfer/export
+overhead. The planning allowances above put this at roughly 3h55–5h05 excluding
+queue time; the next run must measure the overhead. All dependency and Build jobs
+are ordinary jobs, preserving the exact `Build (amd64)` and `Build (arm64)` check
+names without reusable-workflow prefixes. Tag promotion remains independent and
+does not compile.
 
 CI sets `BAZEL_JOBS=2` once for all builds and tests. Observed generated C++ files
 exceed 5 GiB per compiler; two workers leave room for Bazel, linking, and the OS
