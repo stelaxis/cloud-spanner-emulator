@@ -24,6 +24,7 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "googlesql/base/testing/status_matchers.h"
+#include "googlesql/public/types/type_factory.h"
 #include "googlesql/public/value.h"
 #include "tests/common/proto_matchers.h"
 #include "absl/status/status.h"
@@ -110,6 +111,23 @@ class KeyNarrowingTest : public testing::Test {
             f FLOAT64 NOT NULL,
             v INT64,
           ) PRIMARY KEY (f)
+        )",
+                                                        R"(
+          CREATE TABLE Types (
+            bt BYTES(MAX) NOT NULL,
+            bo BOOL NOT NULL,
+            d DATE NOT NULL,
+            ts TIMESTAMP NOT NULL,
+            n NUMERIC NOT NULL,
+            v INT64,
+          ) PRIMARY KEY (bt, bo, d DESC, ts, n)
+        )",
+                                                        R"(
+          CREATE TABLE Nullable (
+            a INT64,
+            b STRING(MAX),
+            v INT64,
+          ) PRIMARY KEY (a, b DESC)
         )"}}));
     std::vector<std::string> seed;
     for (int k = 0; k < 20; ++k) {
@@ -124,6 +142,28 @@ class KeyNarrowingTest : public testing::Test {
     }
     for (double f : {-1.5, 0.0, 0.5, 2.0}) {
       seed.push_back(absl::StrCat("INSERT INTO Floats (f, v) VALUES (", f, ", 1)"));
+    }
+    int v = 0;
+    for (const char* bt : {"b''", "b'a'", "b'b'"}) {
+      for (const char* bo : {"false", "true"}) {
+        for (const char* d : {"'2024-01-01'", "'2024-06-30'"}) {
+          for (const char* ts :
+               {"'2024-01-01T00:00:00Z'", "'2024-01-01T00:00:00.000001Z'"}) {
+            for (const char* n : {"-1.5", "0", "2.25"}) {
+              seed.push_back(absl::StrCat(
+                  "INSERT INTO Types (bt, bo, d, ts, n, v) VALUES (", bt, ", ",
+                  bo, ", DATE ", d, ", TIMESTAMP ", ts, ", NUMERIC '", n,
+                  "', ", v++, ")"));
+            }
+          }
+        }
+      }
+    }
+    for (const char* a : {"NULL", "0", "1"}) {
+      for (const char* b : {"NULL", "'x'", "'y'"}) {
+        seed.push_back(absl::StrCat("INSERT INTO Nullable (a, b, v) VALUES (",
+                                    a, ", ", b, ", ", v++, ")"));
+      }
     }
     auto txn = NewTransaction();
     for (const std::string& sql : seed) {
@@ -369,6 +409,72 @@ TEST_F(KeyNarrowingTest, PushdownPreservesResults) {
     // Only the duplicate INSERT is expected to fail.
     EXPECT_FALSE(absl::StrContains(without, "INVALID_ARGUMENT"))
         << query.sql << ": " << without;
+  }
+}
+
+// The same on/off comparison for the other key types that qualify, and for
+// nullable key columns holding NULLs.
+TEST_F(KeyNarrowingTest, PushdownPreservesResultsForOtherKeyTypes) {
+  const std::vector<Query> queries = {
+      {.sql = "SELECT v FROM Types WHERE bt = b'a' ORDER BY v"},
+      {.sql = "SELECT v FROM Types WHERE bt > b'' AND bt <= b'b' ORDER BY v"},
+      {.sql = "SELECT v FROM Types WHERE bt IN (b'', b'zz') ORDER BY v"},
+      {.sql = "SELECT v FROM Types WHERE bt = @bt AND bo = TRUE ORDER BY v",
+       .declared_params = {{"bt", googlesql::values::Bytes("b")}}},
+      {.sql = "SELECT v FROM Types WHERE bt = b'a' AND bo < TRUE ORDER BY v"},
+      {.sql = "SELECT v FROM Types WHERE bt = b'a' AND bo = FALSE "
+              "AND d = DATE '2024-06-30' ORDER BY v"},
+      {.sql = "SELECT v FROM Types WHERE bt = b'b' AND bo = TRUE "
+              "AND d > DATE '2024-01-01' ORDER BY v"},
+      {.sql = "SELECT v FROM Types WHERE bt = b'' AND bo = TRUE "
+              "AND d = DATE '2024-01-01' "
+              "AND ts > TIMESTAMP '2024-01-01T00:00:00Z' ORDER BY v"},
+      {.sql = "SELECT v FROM Types WHERE bt = b'' AND bo = FALSE "
+              "AND d = DATE '2024-01-01' "
+              "AND ts = TIMESTAMP '2024-01-01T00:00:00Z' "
+              "AND n BETWEEN NUMERIC '-1.5' AND NUMERIC '0' ORDER BY v"},
+      {.sql = "SELECT v FROM Types WHERE n = NUMERIC '2.25' ORDER BY v"},
+      {.sql = "SELECT v FROM Types WHERE d < DATE '2024-03-01' ORDER BY v"},
+      {.sql = "SELECT v FROM Nullable WHERE a = 0 ORDER BY v"},
+      {.sql = "SELECT v FROM Nullable WHERE a IS NULL ORDER BY v"},
+      {.sql = "SELECT v FROM Nullable WHERE a IS NULL AND b = 'x' ORDER BY v"},
+      {.sql = "SELECT v FROM Nullable WHERE a < 1 ORDER BY v"},
+      {.sql = "SELECT v FROM Nullable WHERE a >= 0 ORDER BY v"},
+      {.sql = "SELECT v FROM Nullable WHERE a IN (0, 1) AND b IS NULL "
+              "ORDER BY v"},
+      {.sql = "SELECT v FROM Nullable WHERE a = 1 AND b > 'x' ORDER BY v"},
+      {.sql = "SELECT v FROM Nullable WHERE a = 1 AND b < 'y' ORDER BY v"},
+      {.sql = "SELECT v FROM Nullable WHERE a = @n ORDER BY v",
+       .declared_params = {{"n", googlesql::values::NullInt64()}}},
+      {.sql = "SELECT v FROM Nullable WHERE a IN UNNEST(@ns) ORDER BY v",
+       .declared_params = {{"ns", googlesql::values::Array(
+                                      googlesql::types::Int64ArrayType(),
+                                      {googlesql::values::NullInt64(),
+                                       Int64(1)})}}},
+      {.sql = "UPDATE Nullable SET v = 0 WHERE a = 0 AND b = 'y'"},
+      {.sql = "DELETE FROM Nullable WHERE a IS NULL"},
+      {.sql = "DELETE FROM Types WHERE bt = b'a' AND bo = TRUE"},
+  };
+  for (const Query& query : queries) {
+    config::set_query_key_pushdown_enabled(false);
+    std::string without = Run(query);
+    config::set_query_key_pushdown_enabled(true);
+    std::string with = Run(query);
+    EXPECT_EQ(with, without) << query.sql;
+    EXPECT_FALSE(absl::StrContains(without, "INVALID_ARGUMENT"))
+        << query.sql << ": " << without;
+  }
+
+  // These key types are narrowed, not read in full.
+  for (const char* sql :
+       {"SELECT v FROM Types WHERE bt = b'a'",
+        "SELECT v FROM Types WHERE bt = b'a' AND bo = TRUE "
+        "AND d = DATE '2024-01-01' AND ts > TIMESTAMP '2024-01-01T00:00:00Z'",
+        "SELECT v FROM Nullable WHERE a = 1"}) {
+    std::string table = absl::StrContains(sql, "Types") ? "Types" : "Nullable";
+    std::vector<KeySet> reads = KeySetsRead(Query{.sql = sql}, table);
+    ASSERT_EQ(reads.size(), 1) << sql;
+    EXPECT_FALSE(IsAll(reads[0])) << sql;
   }
 }
 
