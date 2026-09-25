@@ -220,6 +220,47 @@ TEST_F(LockManagerTest, SnapshotWaitsForCommitInFlight) {
   EXPECT_EQ(ValueAt(snapshot, 1), 7);
 }
 
+// A read at exactly a pending commit's timestamp waits for the whole commit:
+// the commit pauses between its two row writes, and the reader must see both
+// rows, never one.
+TEST_F(LockManagerTest, ReadAtPendingCommitTimestampSeesWholeCommit) {
+  std::unique_ptr<LockHandle> writer = Handle(1);
+  absl::Notification first_row_written, release;
+  absl::Time commit_ts;
+  std::thread commit([&]() {
+    ASSERT_TRUE(writer
+                    ->Commit([]() { return absl::OkStatus(); },
+                             [&](absl::Time ts) -> absl::Status {
+                               absl::Status s = storage()->Write(
+                                   ts, kTable, IntKey(1), {kColumn},
+                                   {googlesql::values::Int64(1)});
+                               if (!s.ok()) return s;
+                               commit_ts = ts;
+                               first_row_written.Notify();
+                               release.WaitForNotification();
+                               return storage()->Write(
+                                   ts, kTable, IntKey(2), {kColumn},
+                                   {googlesql::values::Int64(2)});
+                             })
+                    .ok());
+  });
+  first_row_written.WaitForNotification();
+
+  absl::Notification read_done;
+  int64_t rows_seen = 0;
+  std::thread read([&]() {
+    manager()->WaitForSafeRead(commit_ts);
+    rows_seen = (ValueAt(commit_ts, 1) != 0) + (ValueAt(commit_ts, 2) != 0);
+    read_done.Notify();
+  });
+  // Without the wait, the reader finishes here having seen one row.
+  read_done.WaitForNotificationWithTimeout(absl::Milliseconds(200));
+  release.Notify();
+  commit.join();
+  read.join();
+  EXPECT_EQ(rows_seen, 2);
+}
+
 TEST_F(LockManagerTest, ExclusiveCommitSectionBlocksCommits) {
   manager()->BeginExclusiveCommit();
   absl::Time schema_ts = manager()->ReserveCommitTimestamp();

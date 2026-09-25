@@ -62,8 +62,10 @@ void LockManager::WaitForSafeRead(absl::Time read_time) {
   bool f = false;
   mu_.AwaitWithDeadline(absl::Condition(&f), read_time);
 
+  // A read at a pending commit's own timestamp would see the commit's versions
+  // as they are flushed, so it waits for that commit too.
   while (!pending_commit_timestamps_.empty() &&
-         *pending_commit_timestamps_.begin() < read_time) {
+         *pending_commit_timestamps_.begin() <= read_time) {
     pending_commit_cvar_.Wait(&mu_);
   }
 }

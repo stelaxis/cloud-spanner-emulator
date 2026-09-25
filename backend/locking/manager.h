@@ -80,8 +80,8 @@ class LockManager {
   // Marks the commit that reserved `commit_timestamp` as complete.
   void MarkCommitted(absl::Time commit_timestamp) ABSL_LOCKS_EXCLUDED(mu_);
 
-  // Waits until `read_time` has passed and no commit with an earlier timestamp
-  // is still pending.
+  // Waits until `read_time` has passed and no commit with a timestamp at or
+  // before `read_time` is still pending.
   void WaitForSafeRead(absl::Time read_time) ABSL_LOCKS_EXCLUDED(mu_);
 
  private:
