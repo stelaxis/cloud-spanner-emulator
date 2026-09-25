@@ -49,13 +49,27 @@ func main() {
 		duration  = flag.Duration("duration", 15*time.Second, "duration of each workload")
 		workloads = flag.String("workloads", "contended,disjoint,mux282", "comma-separated workloads to run")
 		useDML    = flag.Bool("dml", true, "write with DML (UPDATE ... WHERE id = @id) instead of mutations")
+		binary    = flag.String("emulator-binary", "", "run this emulator_main natively instead of an image")
+		dataDir   = flag.String("data-dir", "", "with -emulator-binary: --data_dir for the emulator (the crash workload needs it)")
+		port      = flag.Int("port", 19220, "with -emulator-binary: the emulator's port")
+		killAfter = flag.Duration("kill-after", 0, "crash workload: when to kill -9 and restart the emulator (default: half the duration)")
 	)
 	flag.Parse()
 	log.SetFlags(log.Ltime)
 	ctx := context.Background()
 
 	addr := os.Getenv("SPANNER_EMULATOR_HOST")
-	if addr == "" {
+	var native *nativeEmulator
+	if *binary != "" {
+		var err error
+		native, err = startNative(*binary, *dataDir, *port, *abortProb)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer native.stop()
+		addr = native.addr
+		log.Printf("started %s at %s (data dir %q)", *binary, addr, *dataDir)
+	} else if addr == "" {
 		a, stop, err := startDocker(*image, *abortProb)
 		if err != nil {
 			log.Fatal(err)
@@ -71,6 +85,24 @@ func main() {
 	}
 	failed := false
 	for _, w := range strings.Split(*workloads, ",") {
+		if w == "crash" {
+			if native == nil || *dataDir == "" {
+				log.Fatal("the crash workload needs -emulator-binary and -data-dir")
+			}
+			kill := *killAfter
+			if kill == 0 {
+				kill = *duration / 2
+			}
+			res, err := crashTransfers(ctx, opts, native, *workers, *accounts, *duration, kill)
+			if err != nil {
+				log.Printf("%s: FAILED: %v", w, err)
+				failed = true
+				continue
+			}
+			fmt.Printf("%-9s workers=%d committed=%d aborted_attempts=%d ambiguous=%d ambiguous_committed=%d txn/s=%.1f\n",
+				w, *workers, res.committed, res.aborts, res.unfinished, res.recovered, float64(res.committed)/res.elapsed.Seconds())
+			continue
+		}
 		db, err := createDatabase(ctx, opts)
 		if err != nil {
 			log.Fatal(err)
@@ -120,7 +152,9 @@ type result struct {
 	// Transactions still retrying at the hard deadline: their outcome is
 	// unknown, so the checks allow for either.
 	unfinished int64
-	elapsed    time.Duration
+	// crash workload: ambiguous transfers found committed after the restart.
+	recovered int64
+	elapsed   time.Duration
 }
 
 // grace is how long a transaction may keep retrying after the workload's
@@ -338,7 +372,7 @@ func mux282(ctx context.Context, client *spanner.Client, workers int, d time.Dur
 	return result{committed: committed.Load(), aborts: aborts.Load(), unfinished: unfinished.Load(), elapsed: elapsed}, nil
 }
 
-func createDatabase(ctx context.Context, opts []option.ClientOption) (string, error) {
+func createDatabase(ctx context.Context, opts []option.ClientOption, extraDDL ...string) (string, error) {
 	const project = "projects/stress"
 	ia, err := instance.NewInstanceAdminClient(ctx, opts...)
 	if err != nil {
@@ -370,7 +404,7 @@ func createDatabase(ctx context.Context, opts []option.ClientOption) (string, er
 	op, err := da.CreateDatabase(ctx, &databasepb.CreateDatabaseRequest{
 		Parent:          project + "/instances/stress",
 		CreateStatement: "CREATE DATABASE `" + id + "`",
-		ExtraStatements: []string{"CREATE TABLE Accounts (Id INT64 NOT NULL, Balance INT64 NOT NULL) PRIMARY KEY (Id)"},
+		ExtraStatements: append([]string{"CREATE TABLE Accounts (Id INT64 NOT NULL, Balance INT64 NOT NULL) PRIMARY KEY (Id)"}, extraDDL...),
 	})
 	if err != nil {
 		return "", err

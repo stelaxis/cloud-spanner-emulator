@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	databasepb "cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
@@ -45,12 +46,21 @@ func (p *commitProbe) HandleConn(context.Context, stats.ConnStats)              
 // restartDriver owns exactly one container and one data directory. It never
 // discovers or kills containers by image/name patterns. A restart starts the
 // same container, mount, command, and host port, after a real SIGKILL.
+//
+// In native mode it instead owns one emulator_main process (binary != ""):
+// a restart runs the same command line, on the same port and data
+// directory, after the previous process died of SIGKILL.
 type restartDriver struct {
 	command                                                           func(...string) (string, error) // test lifecycle; RPC path is unchanged
 	engine                                                            *http.Client
 	probe                                                             *commitProbe
 	id, addr, dir, mode, checkpointCommand                            string
 	kills, commitAttempts, interrupted, completed, checkpointAttempts int
+
+	binary, logPath string
+	pushdown        bool
+	proc            *exec.Cmd
+	exited          chan error
 }
 
 func (d *restartDriver) docker(args ...string) (string, error) {
@@ -119,7 +129,82 @@ func newRestartDriver(image, mode, checkpoint string) (*restartDriver, error) {
 	return d, nil
 }
 
+// newNativeRestartDriver runs `binary` (emulator_main) directly on `port`.
+func newNativeRestartDriver(binary, mode, checkpoint string, port int, pushdown bool) (*restartDriver, error) {
+	dir, err := os.MkdirTemp("", "spanner-l2-")
+	if err != nil {
+		return nil, err
+	}
+	logs, err := os.CreateTemp("", "spanner-l2-log-")
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, err
+	}
+	_ = logs.Close()
+	d := &restartDriver{probe: &commitProbe{sent: make(chan struct{}, 1)}, addr: net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), dir: dir, mode: mode, checkpointCommand: checkpoint, binary: binary, logPath: logs.Name(), pushdown: pushdown}
+	if err := d.startNative(); err != nil {
+		d.close()
+		return nil, err
+	}
+	return d, nil
+}
+
+func (d *restartDriver) startNative() error {
+	args := []string{"--host_port", d.addr, "--abort_current_transaction_probability=0", fmt.Sprintf("--enable_query_key_pushdown=%v", d.pushdown)}
+	if d.mode == "persistent" {
+		args = append(args, "--data_dir="+d.dir)
+	}
+	logs, err := os.OpenFile(d.logPath, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(d.binary, args...)
+	cmd.Stdout, cmd.Stderr = logs, logs
+	if err := cmd.Start(); err != nil {
+		_ = logs.Close()
+		return err
+	}
+	d.proc, d.exited = cmd, make(chan error, 1)
+	go func() {
+		d.exited <- cmd.Wait()
+		_ = logs.Close()
+	}()
+	return nil
+}
+
+func (d *restartDriver) nativeLogs() string {
+	data, _ := os.ReadFile(d.logPath)
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	return strings.Join(lines[max(0, len(lines)-12):], "\n")
+}
+
+func (d *restartDriver) killNative() error {
+	if err := d.proc.Process.Signal(syscall.SIGKILL); err != nil {
+		return err
+	}
+	select {
+	case <-d.exited:
+	case <-time.After(30 * time.Second):
+		return fmt.Errorf("emulator did not exit after SIGKILL")
+	}
+	ws, ok := d.proc.ProcessState.Sys().(syscall.WaitStatus)
+	if !ok || !ws.Signaled() || ws.Signal() != syscall.SIGKILL {
+		return fmt.Errorf("SIGKILL not confirmed: %v; logs: %s", d.proc.ProcessState, d.nativeLogs())
+	}
+	d.kills++
+	return nil
+}
+
 func (d *restartDriver) close() {
+	if d.binary != "" {
+		if d.proc != nil && d.proc.ProcessState == nil {
+			_ = d.proc.Process.Signal(syscall.SIGKILL)
+			<-d.exited
+		}
+		_ = os.Remove(d.logPath)
+		_ = os.RemoveAll(d.dir)
+		return
+	}
 	if d.engine != nil {
 		d.engine.CloseIdleConnections()
 	}
@@ -130,6 +215,9 @@ func (d *restartDriver) close() {
 }
 
 func (d *restartDriver) kill() error {
+	if d.binary != "" {
+		return d.killNative()
+	}
 	if d.engine != nil {
 		resp, err := d.engine.Post("http://docker/containers/"+d.id+"/kill?signal=KILL", "", nil)
 		if err != nil {
@@ -157,7 +245,11 @@ func (d *restartDriver) kill() error {
 func (d *restartDriver) restart(ctx context.Context, e *emulator) error {
 	oldDB := e.database
 	_ = e.conn.Close()
-	if _, err := d.docker("start", d.id); err != nil {
+	if d.binary != "" {
+		if err := d.startNative(); err != nil {
+			return err
+		}
+	} else if _, err := d.docker("start", d.id); err != nil {
 		return err
 	}
 	fresh, err := dialEmulator(d.addr, grpc.WithStatsHandler(d.probe))
@@ -191,6 +283,9 @@ func (d *restartDriver) restart(ctx context.Context, e *emulator) error {
 			return nil
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+	if d.binary != "" {
+		return fmt.Errorf("restart did not become ready; last RPC: %v; logs: %s", lastErr, d.nativeLogs())
 	}
 	state, _ := d.docker("inspect", "--format", "{{.State.Status}} exit={{.State.ExitCode}}", d.id)
 	logs, _ := d.docker("logs", "--tail", "12", d.id)
@@ -339,7 +434,17 @@ func (e *emulator) runCrashSchedule(ctx context.Context, d *restartDriver, steps
 			if d.checkpointCommand != "" && !st.DuringCommit {
 				// Future Phase 2 checkpoint trigger; must return after requesting a
 				// checkpoint. Kill delay spans its asynchronous write/publication stages.
-				if _, err := d.docker("exec", d.id, "sh", "-c", d.checkpointCommand); err != nil {
+				var err error
+				if d.binary != "" {
+					cmd := exec.Command("sh", "-c", d.checkpointCommand)
+					cmd.Env = append(os.Environ(), fmt.Sprintf("EMULATOR_PID=%d", d.proc.Process.Pid))
+					if out, cerr := cmd.CombinedOutput(); cerr != nil {
+						err = fmt.Errorf("checkpoint command: %w: %s", cerr, out)
+					}
+				} else {
+					_, err = d.docker("exec", d.id, "sh", "-c", d.checkpointCommand)
+				}
+				if err != nil {
 					<-done
 					return nil, nil, err
 				}
@@ -437,7 +542,7 @@ func (e *emulator) runCrashSchedule(ctx context.Context, d *restartDriver, steps
 	return out, candidates, nil
 }
 
-func runRestarts(mode, image, checkpoint, modelPath, modelName string, pushdown, mustMatch bool, seeds int, first uint64, cfg genConfig, replay, dump string) int {
+func runRestarts(mode, image, binary string, port int, checkpoint, modelPath, modelName string, pushdown, mustMatch bool, seeds int, first uint64, cfg genConfig, replay, dump string) int {
 	if mode != "no-persistence" && mode != "persistent" {
 		log.Printf("invalid persistence mode %q", mode)
 		return 2
@@ -446,13 +551,23 @@ func runRestarts(mode, image, checkpoint, modelPath, modelName string, pushdown,
 		log.Print("crash mode requires its own container; unset SPANNER_EMULATOR_HOST")
 		return 2
 	}
-	d, err := newRestartDriver(image, mode, checkpoint)
+	var d *restartDriver
+	var err error
+	if binary != "" {
+		d, err = newNativeRestartDriver(binary, mode, checkpoint, port, pushdown && modelName == "target")
+	} else {
+		d, err = newRestartDriver(image, mode, checkpoint)
+	}
 	if err != nil {
 		log.Print(err)
 		return 2
 	}
 	defer d.close()
-	log.Printf("crash driver image=%s mode=%s address=%s container=%s", image, mode, d.addr, d.id)
+	if binary != "" {
+		log.Printf("crash driver binary=%s mode=%s address=%s data_dir=%s", binary, mode, d.addr, d.dir)
+	} else {
+		log.Printf("crash driver image=%s mode=%s address=%s container=%s", image, mode, d.addr, d.id)
+	}
 	e, err := dialEmulator(d.addr, grpc.WithStatsHandler(d.probe))
 	if err != nil {
 		log.Print(err)

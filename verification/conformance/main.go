@@ -23,7 +23,9 @@ func main() { os.Exit(run()) }
 func run() int {
 	var (
 		persistence = flag.String("persistence", "", "crash driver: no-persistence | persistent")
-		checkpoint  = flag.String("checkpoint-command", "", "optional asynchronous checkpoint trigger inside owned container")
+		checkpoint  = flag.String("checkpoint-command", "", "optional asynchronous checkpoint trigger inside owned container (native: run by sh with $EMULATOR_PID)")
+		binary      = flag.String("emulator-binary", "", "crash driver: run this emulator_main natively instead of a container")
+		port        = flag.Int("port", 19210, "crash driver: the native emulator's port")
 	)
 	var (
 		seeds      = flag.Int("seeds", 2000, "number of random schedules")
@@ -68,7 +70,7 @@ func run() int {
 		}
 	}
 	if *persistence != "" {
-		return runRestarts(*persistence, *image, *checkpoint, *modelPath, *modelName, *pushdown, *mustMatch, *seeds, *firstSeed, cfg, *replay, *dumpFailed)
+		return runRestarts(*persistence, *image, *binary, *port, *checkpoint, *modelPath, *modelName, *pushdown, *mustMatch, *seeds, *firstSeed, cfg, *replay, *dumpFailed)
 	}
 	addr := os.Getenv("SPANNER_EMULATOR_HOST")
 	if addr == "" {
