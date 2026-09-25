@@ -123,6 +123,7 @@ cc_test(
     name = "concurrency_test",
     srcs = ["concurrency_test.cc"],
     deps = [
+        "//backend/query:function_catalog",
         ":read_only_transaction",
         ":read_write_transaction",
         "//backend/access:read",

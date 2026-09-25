@@ -233,6 +233,10 @@ class ReadWriteTransaction : public RowReader, public RowWriter {
   const Schema* schema_ ABSL_GUARDED_BY(mu_);
 
   CaseInsensitiveStringMap<std::vector<KeyRange>> deleted_key_ranges_by_table_;
+
+  // Tables of mutation rows whose keys have default or generated values, so
+  // their rows were not in the read set before the mutations were applied.
+  std::vector<const Table*> unrecorded_key_tables_ ABSL_GUARDED_BY(mu_);
 };
 
 }  // namespace backend

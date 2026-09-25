@@ -371,7 +371,8 @@ void ReadWriteTransaction::RecordMutationReads(const Mutation& mutation) {
     }
     // Keys are computed from the supplied columns only: evaluating default or
     // generated key columns here could have side effects (sequences). Such
-    // rows are still read while they are flattened.
+    // rows are read while they are flattened; until then the whole table
+    // stands in for them when an error is validated (AbortIfReadSetStale).
     if (!ValidateNonDeleteMutationOp(mutation_op, schema_).ok()) {
       continue;
     }
@@ -386,6 +387,7 @@ void ReadWriteTransaction::RecordMutationReads(const Mutation& mutation) {
         absl::c_any_of(*key_indices, [](const std::optional<int>& index) {
           return !index.has_value();
         })) {
+      unrecorded_key_tables_.push_back(table);
       continue;
     }
     for (const ValueList& row : mutation_op.rows) {
@@ -407,11 +409,14 @@ void ReadWriteTransaction::RecordMutationReads(const Mutation& mutation) {
 absl::Status ReadWriteTransaction::AbortIfReadSetStale(
     const absl::Status& status) {
   mu_.AssertHeld();
-  if (status.ok() || status.code() == absl::StatusCode::kAborted ||
-      !lock_handle_->ReadSetIsStale()) {
+  if (status.ok() || status.code() == absl::StatusCode::kAborted) {
     return status;
   }
-  return error::AbortReadSetConflict(id_);
+  bool stale = lock_handle_->ReadSetIsStale() ||
+               absl::c_any_of(unrecorded_key_tables_, [&](const Table* table) {
+                 return lock_handle_->TableChangedSinceSnapshot(table->id());
+               });
+  return stale ? error::AbortReadSetConflict(id_) : status;
 }
 
 absl::Status ReadWriteTransaction::MaybeAbortOnStaleReads(
@@ -434,6 +439,7 @@ void ReadWriteTransaction::Reset() {
 
   lock_handle_->UnlockAll();
   transaction_store_->Clear();
+  unrecorded_key_tables_.clear();
   std::queue<WriteOp> empty;
   write_ops_queue_.swap(empty);
   state_ = State::kUninitialized;
@@ -726,6 +732,8 @@ absl::Status ReadWriteTransaction::Write(const Mutation& mutation) {
     // to effector reads if the updates are split into separate Write calls, but
     // should succeed if written together).
     UpdateTrackedCommitTimestamps();
+    // Every row has now been flattened, and so read.
+    unrecorded_key_tables_.clear();
     return absl::OkStatus();
   });
 }

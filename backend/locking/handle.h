@@ -72,6 +72,11 @@ class LockHandle {
   // of the read set. False when no snapshot was taken.
   bool ReadSetIsStale() ABSL_LOCKS_EXCLUDED(mu_);
 
+  // Returns true if a version committed after the snapshot lies anywhere in
+  // the table. False when no snapshot was taken.
+  bool TableChangedSinceSnapshot(const TableID& table_id)
+      ABSL_LOCKS_EXCLUDED(mu_);
+
   // Runs the commit protocol in the database's commit critical section:
   //   1. `precheck` (e.g. the schema is unchanged); its error is returned.
   //   2. Validate the read set; ABORTED if stale.

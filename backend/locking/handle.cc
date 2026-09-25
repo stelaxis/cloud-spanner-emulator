@@ -90,6 +90,13 @@ bool LockHandle::ReadSetIsStale() {
   return ReadSetIsStaleLocked();
 }
 
+bool LockHandle::TableChangedSinceSnapshot(const TableID& table_id) {
+  absl::MutexLock lock(mu_);
+  const Storage* storage = manager_->storage_;
+  return snapshot_.has_value() && storage != nullptr &&
+         storage->HasVersionsAfter(*snapshot_, table_id, KeyRange::All());
+}
+
 bool LockHandle::ReadSetIsStaleLocked() {
   if (!snapshot_.has_value() || read_set_.empty()) {
     return false;

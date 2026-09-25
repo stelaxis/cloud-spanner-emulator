@@ -39,6 +39,7 @@
 #include "backend/datamodel/key_set.h"
 #include "backend/datamodel/value.h"
 #include "backend/locking/manager.h"
+#include "backend/query/function_catalog.h"
 #include "backend/schema/catalog/versioned_catalog.h"
 #include "backend/storage/in_memory_storage.h"
 #include "backend/transaction/options.h"
@@ -68,13 +69,22 @@ class ConcurrencyTest : public testing::Test {
                   k INT64 NOT NULL,
                   v INT64
                 ) PRIMARY KEY (k)
+              )sql",
+                                   R"sql(
+                CREATE TABLE D (
+                  k INT64 NOT NULL DEFAULT (7),
+                  v INT64
+                ) PRIMARY KEY (k)
               )sql"},
                                   type_factory_.get())
             .value());
+    function_catalog_ = std::make_unique<FunctionCatalog>(
+        type_factory_.get(), kCloudSpannerEmulatorFunctionCatalogName,
+        versioned_catalog_->GetLatestSchema());
     action_manager_ = std::make_unique<ActionManager>();
     action_manager_->AddActionsForSchema(
         versioned_catalog_->GetSchema(absl::InfiniteFuture()),
-        /*function_catalog=*/nullptr, type_factory_.get());
+        function_catalog_.get(), type_factory_.get());
   }
 
  protected:
@@ -138,6 +148,7 @@ class ConcurrencyTest : public testing::Test {
   std::unique_ptr<InMemoryStorage> storage_;
   std::unique_ptr<LockManager> lock_manager_;
   std::unique_ptr<VersionedCatalog> versioned_catalog_;
+  std::unique_ptr<FunctionCatalog> function_catalog_;
   std::unique_ptr<ActionManager> action_manager_;
   std::atomic<int> id_counter_ = 0;
 };
@@ -278,6 +289,33 @@ TEST_F(ConcurrencyTest, MutationErrorWithFreshReadsIsReported) {
   Mutation m = Update(3, 0);
   m.AddWriteOp(MutationOpType::kUpdate, "T", {"k", "v"},
                {{Int64(2), Int64(22)}});
+  EXPECT_THAT(t1->Write(m), StatusIs(absl::StatusCode::kNotFound));
+}
+
+// A mutation whose key has a default value cannot be put in the read set
+// before the mutations are applied. If an earlier mutation fails first, the
+// whole table stands in for that row: a commit to it after the snapshot turns
+// the error into ABORTED, as validating the row itself would have.
+TEST_F(ConcurrencyTest, MutationErrorValidatesRowsWithDefaultKeys) {
+  auto t1 = Begin();
+  GOOGLESQL_ASSERT_OK(ReadKey(t1.get(), 9));
+  auto t2 = Begin();
+  Mutation insert_default;
+  insert_default.AddWriteOp(MutationOpType::kInsert, "D", {"v"},
+                            {{Int64(1)}});
+  GOOGLESQL_ASSERT_OK(t2->Write(insert_default));
+  GOOGLESQL_ASSERT_OK(t2->Commit());
+
+  Mutation m = Update(3, 0);  // Row 3 does not exist: NOT_FOUND.
+  m.AddWriteOp(MutationOpType::kInsert, "D", {"v"}, {{Int64(2)}});
+  EXPECT_THAT(t1->Write(m), StatusIs(absl::StatusCode::kAborted));
+}
+
+TEST_F(ConcurrencyTest, MutationErrorWithDefaultKeysAndFreshReadsIsReported) {
+  auto t1 = Begin();
+  GOOGLESQL_ASSERT_OK(ReadKey(t1.get(), 9));
+  Mutation m = Update(3, 0);
+  m.AddWriteOp(MutationOpType::kInsert, "D", {"v"}, {{Int64(2)}});
   EXPECT_THAT(t1->Write(m), StatusIs(absl::StatusCode::kNotFound));
 }
 
