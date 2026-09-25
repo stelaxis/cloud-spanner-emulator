@@ -44,12 +44,11 @@ ABSL_FLAG(bool, disable_query_null_filtered_index_check, false,
           "for all the queries at once.");
 
 ABSL_FLAG(
-    int, abort_current_transaction_probability, 20,
-    "The probability that the emulator will try to abort the current "
-    "transaction if a new transaction is requested. A higher value gives "
-    "higher priority to new transactions. A lower value gives higher priority "
-    "to the current transaction. A value of zero means that the emulator will "
-    "never abort the current transaction.");
+    int, abort_current_transaction_probability, 0,
+    "The percentage (0-100) of read-write transaction commits that the "
+    "emulator aborts at random, to test application abort-retry loops. "
+    "Read-write transactions run concurrently and abort only on a conflict, "
+    "so this is the only source of random aborts. Zero disables it.");
 
 namespace google {
 namespace spanner {

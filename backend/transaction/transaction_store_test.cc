@@ -53,11 +53,10 @@ namespace {
 class TransactionStoreTest : public testing::Test {
  public:
   TransactionStoreTest()
-      : lock_manager_(LockManager(&clock_)),
+      : base_storage_(std::make_unique<InMemoryStorage>()),
+        lock_manager_(LockManager(&clock_, base_storage_.get())),
         lock_handle_(lock_manager_.CreateHandle(TransactionID(1),
-                                                /*try_abort_fn=*/nullptr,
                                                 TransactionPriority(1))),
-        base_storage_(std::make_unique<InMemoryStorage>()),
         commit_timestamp_tracker_(std::make_unique<CommitTimestampTracker>()),
         transaction_store_(base_storage_.get(), lock_handle_.get(),
                            commit_timestamp_tracker_.get()),
@@ -79,9 +78,9 @@ class TransactionStoreTest : public testing::Test {
  protected:
   // Components
   Clock clock_;
+  std::unique_ptr<InMemoryStorage> base_storage_;
   LockManager lock_manager_;
   std::unique_ptr<LockHandle> lock_handle_;
-  std::unique_ptr<InMemoryStorage> base_storage_;
   std::unique_ptr<CommitTimestampTracker> commit_timestamp_tracker_;
   TransactionStore transaction_store_;
 
@@ -151,7 +150,7 @@ class TransactionStoreTest : public testing::Test {
 
 TEST_F(TransactionStoreTest, CanReadBufferedWrites) {
   // Populate the table with some data.
-  absl::Time t0 = absl::Now();
+  absl::Time t0 = clock_.Now();
   GOOGLESQL_EXPECT_OK(Write(t0, Key({Int64(1)}), {Int64(1), String("value")}));
   GOOGLESQL_EXPECT_OK(Write(t0, Key({Int64(2)}), {Int64(2), String("value")}));
 
@@ -173,7 +172,7 @@ TEST_F(TransactionStoreTest, CanReadBufferedWrites) {
 
 TEST_F(TransactionStoreTest, CanBufferInsertAfterDelete) {
   // Populate the table with some data.
-  absl::Time t0 = absl::Now();
+  absl::Time t0 = clock_.Now();
   GOOGLESQL_EXPECT_OK(Write(t0, Key({Int64(1)}), {Int64(1), String("value")}));
 
   // Read your writes.
@@ -218,7 +217,7 @@ TEST_F(TransactionStoreTest, CanBufferDeleteAfterInsert) {
 }
 
 TEST_F(TransactionStoreTest, CanBufferMultipleUpdates) {
-  absl::Time t0 = absl::Now();
+  absl::Time t0 = clock_.Now();
   GOOGLESQL_EXPECT_OK(Write(t0, Key({Int64(1)}), {Int64(1), String("value-1")}));
 
   GOOGLESQL_EXPECT_OK(BufferUpdate(Key({Int64(1)}), {string_col_}, {String("value-2")}));
@@ -234,7 +233,7 @@ TEST_F(TransactionStoreTest, CanBufferMultipleUpdates) {
 }
 
 TEST_F(TransactionStoreTest, CanBufferReplaceWithNullValues) {
-  absl::Time t0 = absl::Now();
+  absl::Time t0 = clock_.Now();
   GOOGLESQL_EXPECT_OK(Write(t0, Key({Int64(1)}), {Int64(1), String("value-1")}));
 
   // Delete row and only insert key column value.
@@ -246,7 +245,7 @@ TEST_F(TransactionStoreTest, CanBufferReplaceWithNullValues) {
 }
 
 TEST_F(TransactionStoreTest, CanBufferDeleteInsertUpdate) {
-  absl::Time t0 = absl::Now();
+  absl::Time t0 = clock_.Now();
   GOOGLESQL_EXPECT_OK(Write(t0, Key({Int64(1)}), {Int64(1), String("value-1")}));
 
   GOOGLESQL_EXPECT_OK(BufferDelete(Key({Int64(1)})));
@@ -264,7 +263,7 @@ TEST_F(TransactionStoreTest, ReadValueNotFound) {
 
 TEST_F(TransactionStoreTest, ReadValueOnlyInBaseStorage) {
   // Write into base storage.
-  absl::Time t0 = absl::Now();
+  absl::Time t0 = clock_.Now();
   GOOGLESQL_EXPECT_OK(Write(t0, Key({Int64(1)}), {Int64(1), String("value-1")}));
 
   // Read
@@ -314,7 +313,7 @@ TEST_F(TransactionStoreTest, LookupDelete) {
 }
 
 TEST_F(TransactionStoreTest, LookupBaseStorage) {
-  absl::Time t0 = absl::Now();
+  absl::Time t0 = clock_.Now();
   GOOGLESQL_EXPECT_OK(Write(t0, Key({Int64(1)}), {Int64(1), String("value")}));
   EXPECT_THAT(Lookup(Key({Int64(1)})),
               IsOkAndHoldsRow({Int64(1), String("value")}));
@@ -326,7 +325,7 @@ TEST_F(TransactionStoreTest, LookupBaseStorage) {
 }
 
 TEST_F(TransactionStoreTest, LookupEmptyColumns) {
-  absl::Time t0 = absl::Now();
+  absl::Time t0 = clock_.Now();
   GOOGLESQL_EXPECT_OK(Write(t0, Key({Int64(1)}), {Int64(1), String("value")}));
   GOOGLESQL_EXPECT_OK(BufferInsert(Key({Int64(2)}), {int64_col_, string_col_},
                          {Int64(2), String("value")}));
@@ -347,7 +346,7 @@ TEST_F(TransactionStoreTest, ReturnsNullValuesForUnpopulatedColumns) {
   // - Key(3) which exists in both base and transaction storage.
   // In each case, we do not populate the string column, and expect that all
   // reads for the string column return NULL.
-  absl::Time t0 = absl::Now();
+  absl::Time t0 = clock_.Now();
   GOOGLESQL_EXPECT_OK(base_storage_->Write(t0, table_->id(), Key({Int64(1)}),
                                  {int64_col_->id()}, {Int64(1)}));
   GOOGLESQL_EXPECT_OK(BufferInsert(Key({Int64(2)}), {int64_col_}, {Int64(2)}));
@@ -376,6 +375,39 @@ TEST_F(TransactionStoreTest, ReadsClosedOpenRange) {
               IsOkAndHoldsRows({}));
 }
 
+TEST_F(TransactionStoreTest, InsertThenDeleteOfAbsentRowIsACancelledWrite) {
+  absl::Time t0 = clock_.Now();
+  GOOGLESQL_EXPECT_OK(Write(t0, Key({Int64(1)}), {Int64(1), String("value")}));
+
+  // Absent row: the delete cancels the insert, nothing is buffered.
+  GOOGLESQL_EXPECT_OK(BufferInsert(Key({Int64(2)}), {int64_col_}, {Int64(2)}));
+  GOOGLESQL_EXPECT_OK(BufferDelete(Key({Int64(2)})));
+  // Existing row: the delete is buffered.
+  GOOGLESQL_EXPECT_OK(BufferDelete(Key({Int64(1)})));
+
+  std::vector<std::pair<const Table*, Key>> cancelled =
+      transaction_store_.GetCancelledWrites();
+  ASSERT_EQ(cancelled.size(), 1);
+  EXPECT_EQ(cancelled[0].first, table_);
+  EXPECT_EQ(cancelled[0].second, Key({Int64(2)}));
+
+  transaction_store_.Clear();
+  EXPECT_TRUE(transaction_store_.GetCancelledWrites().empty());
+}
+
+TEST_F(TransactionStoreTest, ReadsAtTheSnapshotTakenByTheFirstRead) {
+  absl::Time t0 = clock_.Now();
+  GOOGLESQL_EXPECT_OK(Write(t0, Key({Int64(1)}), {Int64(1), String("before")}));
+  EXPECT_THAT(ReadAll(), IsOkAndHoldsRows({{Int64(1), String("before")}}));
+
+  // A later commit is invisible to this transaction, and makes its read set
+  // stale.
+  GOOGLESQL_EXPECT_OK(
+      Write(clock_.Now(), Key({Int64(1)}), {Int64(1), String("after")}));
+  EXPECT_THAT(ReadAll(), IsOkAndHoldsRows({{Int64(1), String("before")}}));
+  EXPECT_TRUE(lock_handle_->ReadSetIsStale());
+}
+
 }  // namespace
 
 void BM_TransactionStoreRead(benchmark::State& state) {
@@ -383,10 +415,10 @@ void BM_TransactionStoreRead(benchmark::State& state) {
   int num_buffer_rows = state.range(1);
 
   Clock clock;
-  LockManager lock_manager(&clock);
-  auto lock_handle = lock_manager.CreateHandle(TransactionID(1), nullptr,
-                                               TransactionPriority(1));
   InMemoryStorage base_storage;
+  LockManager lock_manager(&clock, &base_storage);
+  auto lock_handle =
+      lock_manager.CreateHandle(TransactionID(1), TransactionPriority(1));
   CommitTimestampTracker commit_timestamp_tracker;
   TransactionStore transaction_store(&base_storage, lock_handle.get(),
                                      &commit_timestamp_tracker);
@@ -406,7 +438,7 @@ void BM_TransactionStoreRead(benchmark::State& state) {
   const Column* int64_col = table->FindColumn("Int64Col");
   const Column* string_col = table->FindColumn("StringCol");
 
-  absl::Time t0 = absl::Now();
+  absl::Time t0 = clock.Now();
   for (int i = 0; i < num_base_rows; ++i) {
     base_storage
         .Write(t0, table->id(), Key({Int64(i * 10)}),

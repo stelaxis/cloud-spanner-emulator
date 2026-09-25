@@ -529,33 +529,17 @@ TEST_P(BatchWriteApiTest, ConcurrentTransactions) {
   absl::Status rw_commit_status = Commit(commit_request, &commit_response);
 
   // Assertions
-  // Check that either all mutation groups failed with Aborted OR
-  // that some mutation groups started committing successfully and the
-  // first RW transaction failed with Aborted.
+  // Read-write transactions run concurrently: both mutation groups commit.
+  // The first transaction's INSERT read key 6, which group 1 then wrote, so
+  // its commit fails validation with ABORTED.
   EXPECT_EQ(batch_write_responses.size(), 2);
-  int num_committed_mutation_groups = 0;
   for (const auto& response : batch_write_responses) {
-    // During transaction write when we check for lock contention, sometimes
-    // current transaction can be aborted for another new transaction which
-    // can lead to flaky tests.
-    // So only check aborted status if error code is not 0.
-    std::string status_message = response.status().message();
-    absl::AsciiStrToLower(&status_message);
-    if (response.status().code() != 0) {
-      ASSERT_THAT(status_message, testing::HasSubstr("aborted"));
-      EXPECT_FALSE(response.has_commit_timestamp());
-    } else {
-      ASSERT_THAT(status_message, testing::IsEmpty());
-      EXPECT_TRUE(response.has_commit_timestamp());
-      num_committed_mutation_groups++;
-    }
+    EXPECT_THAT(response.status().code(), Eq(0));
+    EXPECT_THAT(response.status().message(), testing::IsEmpty());
+    EXPECT_TRUE(response.has_commit_timestamp());
   }
-  if (num_committed_mutation_groups > 0) {
-    EXPECT_THAT(rw_commit_status,
-                googlesql_base::testing::StatusIs(absl::StatusCode::kAborted));
-  } else {
-    GOOGLESQL_EXPECT_OK(rw_commit_status);
-  }
+  EXPECT_THAT(rw_commit_status,
+              googlesql_base::testing::StatusIs(absl::StatusCode::kAborted));
   // Construct a new BatchWrite request with a single mutation group
   spanner_api::BatchWriteRequest new_batch_write_request;
   new_batch_write_request.set_session(

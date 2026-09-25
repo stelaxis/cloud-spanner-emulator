@@ -181,7 +181,7 @@ TEST_P(BatchDmlTest, MixDmlAndBatchDmlInTransactionSucceeds) {
               IsOkAndHoldsRows({{1, "Levin", 27}, {2, "Mark", 27}}));
 }
 
-TEST_P(BatchDmlTest, ConcurrentTransactionWithBatchDmlNotAllowed) {
+TEST_P(BatchDmlTest, ConcurrentTransactionsWithBatchDmlOnDisjointRows) {
   auto current_probability = config::abort_current_transaction_probability();
   config::set_abort_current_transaction_probability(0);
 
@@ -195,14 +195,14 @@ TEST_P(BatchDmlTest, ConcurrentTransactionWithBatchDmlNotAllowed) {
   GOOGLESQL_ASSERT_OK(result);
   GOOGLESQL_ASSERT_OK(ToUtilStatus(result.value().status));
 
-  // Subsequent transactions will abort.
+  // A concurrent transaction inserting a different row proceeds, as in
+  // production.
   result = BatchDmlTransaction(
       txn2, {SqlStatement(
                 "INSERT INTO users(id, name, age) VALUES (2, 'Mark', 37)")});
   // The Status can come from the call Status or the `BatchDmlResult`
   auto status = !result.ok() ? result.status() : ToUtilStatus(result->status);
-  EXPECT_THAT(status, StatusIs(in_prod_env() ? absl::StatusCode::kOk
-                                             : absl::StatusCode::kAborted));
+  EXPECT_THAT(status, StatusIs(absl::StatusCode::kOk));
   // Commit first transaction succeeds.
   GOOGLESQL_EXPECT_OK(CommitTransaction(txn1, {}));
 

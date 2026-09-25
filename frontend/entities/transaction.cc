@@ -224,7 +224,7 @@ absl::StatusOr<backend::QueryResult> Transaction::ExecuteSql(
           query_mode);
     }
     case kReadWrite: {
-      return query_engine_->ExecuteSql(
+      absl::StatusOr<backend::QueryResult> result = query_engine_->ExecuteSql(
           query,
           backend::QueryContext{.schema = schema(),
                                 .reader = read_write(),
@@ -234,6 +234,12 @@ absl::StatusOr<backend::QueryResult> Transaction::ExecuteSql(
                                 .allow_read_write_only_functions = true,
                                 .is_read_only_txn = false},
           query_mode);
+      // An error the query engine raises from data read at a stale snapshot
+      // (e.g. a duplicate key found by an INSERT) becomes ABORTED.
+      if (!result.ok()) {
+        return read_write()->MaybeAbortOnStaleReads(result.status());
+      }
+      return result;
     }
     case kPartitionedDml: {
       auto context = backend::QueryContext{

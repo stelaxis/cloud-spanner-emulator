@@ -21,6 +21,7 @@
 
 #include "googlesql/public/value.h"
 #include "absl/container/btree_map.h"
+#include "absl/container/btree_set.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
@@ -106,6 +107,11 @@ class TransactionStore {
                     std::unique_ptr<StorageIterator>* storage_itr,
                     bool allow_pending_commit_timestamps_in_read = true) const;
 
+  // Adds `key_range` of `table` to the read set without reading it.
+  void RecordRead(const Table* table, const KeyRange& key_range) const {
+    AcquireReadLock(table, key_range, {}).IgnoreError();
+  }
+
   // Returns true if the column has been written with a pending commit timestamp
   // in this transaction.
   bool HasPendingCommitTimestamp(const Column* column) const;
@@ -113,8 +119,17 @@ class TransactionStore {
   // Returns the buffered mutations.
   std::vector<WriteOp> GetBufferedOps() const;
 
-  // Clears the buffered mutations.
-  void Clear() { buffered_ops_.clear(); }
+  // Returns the keys this transaction wrote whose buffered ops cancelled out
+  // (an insert, then a delete, of a row absent from storage). Nothing is
+  // flushed for them, but the commit must still record a write
+  // (Storage::MarkWritten) so that conflict detection sees it.
+  std::vector<std::pair<const Table*, Key>> GetCancelledWrites() const;
+
+  // Clears the buffered mutations and the write set.
+  void Clear() {
+    buffered_ops_.clear();
+    written_keys_.clear();
+  }
 
  private:
   // Types of mutations.
@@ -126,13 +141,17 @@ class TransactionStore {
 
   using RowOp = std::pair<OpType, Row>;
 
-  // Acquires read locks for the specified column ranges.
+  // Records the scanned key range in the read set validated at commit.
   absl::Status AcquireReadLock(const Table* table, const KeyRange& key_range,
                                absl::Span<const Column* const> columns) const;
 
-  // Acquires write locks for the specified column ranges.
-  absl::Status AcquireWriteLock(const Table* table, const KeyRange& key_range,
-                                absl::Span<const Column* const> columns) const;
+  // Records a write of `key` in the write set.
+  absl::Status AcquireWriteLock(const Table* table, const Key& key,
+                                absl::Span<const Column* const> columns);
+
+  // The timestamp at which base storage is read: the transaction's snapshot,
+  // fixed by the first read.
+  absl::Time ReadTimestamp() const;
 
   // Buffers an insert mutation. Acquires write locks.
   absl::Status BufferInsert(const Table* table, const Key& key,
@@ -164,6 +183,9 @@ class TransactionStore {
 
   // Tracks tables/columns containing pending commit timestamps.
   CommitTimestampTracker* commit_timestamp_tracker_;
+
+  // The write set: every key a write op was buffered for.
+  absl::flat_hash_map<const Table*, absl::btree_set<Key>> written_keys_;
 
   // Tracks all operations buffered during the current statement.
   std::vector<WriteOp> current_statement_ops_;

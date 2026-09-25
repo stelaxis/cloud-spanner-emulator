@@ -17,12 +17,17 @@
 #include "backend/locking/handle.h"
 
 #include <functional>
+#include <optional>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/str_cat.h"
+#include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
+#include "backend/datamodel/key.h"
+#include "backend/datamodel/key_range.h"
 #include "backend/locking/manager.h"
 #include "common/errors.h"
+#include "googlesql/base/status_macros.h"
 
 namespace google {
 namespace spanner {
@@ -30,72 +35,101 @@ namespace emulator {
 namespace backend {
 
 LockHandle::LockHandle(LockManager* manager, TransactionID tid,
-                       const std::function<absl::Status()>& abort_fn,
                        TransactionPriority priority)
-    : manager_(manager),
-      tid_(tid),
-      try_abort_transaction_fn_(abort_fn),
-      priority_(priority) {}
-
-LockHandle::~LockHandle() {
-  absl::MutexLock lock(mu_);
-  try_abort_transaction_fn_ = nullptr;
-}
+    : manager_(manager), tid_(tid), priority_(priority) {}
 
 void LockHandle::EnqueueLock(const LockRequest& request) {
-  manager_->EnqueueLock(this, request);
+  if (request.mode() != LockMode::kShared) {
+    return;
+  }
+  KeyRange range = request.key_range().IsClosedOpen()
+                       ? request.key_range()
+                       : request.key_range().ToClosedOpen();
+  // An empty range reads nothing.
+  if (range.start_key() >= range.limit_key()) {
+    return;
+  }
+  absl::MutexLock lock(mu_);
+  TableReads& reads = read_set_[request.table_id()];
+  if (reads.all) {
+    return;
+  }
+  if (range.start_key() == Key::Empty() && range.limit_key() == Key::Infinity()) {
+    reads.all = true;
+    reads.ranges.clear();
+    return;
+  }
+  // Validators look the same row up repeatedly; skip exact repeats.
+  if (!reads.ranges.empty() && reads.ranges.back() == range) {
+    return;
+  }
+  reads.ranges.push_back(std::move(range));
 }
 
-void LockHandle::UnlockAll() { manager_->UnlockAll(this); }
-
-bool LockHandle::IsBlocked() {
-  // The current implementation never blocks.
+void LockHandle::UnlockAll() {
   absl::MutexLock lock(mu_);
+  snapshot_.reset();
+  read_set_.clear();
+}
+
+absl::Time LockHandle::SnapshotTimestamp() {
+  absl::MutexLock lock(mu_);
+  if (!snapshot_.has_value()) {
+    snapshot_ = manager_->PickSnapshotTimestamp();
+  }
+  return *snapshot_;
+}
+
+std::optional<absl::Time> LockHandle::snapshot() {
+  absl::MutexLock lock(mu_);
+  return snapshot_;
+}
+
+bool LockHandle::ReadSetIsStale() {
+  absl::MutexLock lock(mu_);
+  return ReadSetIsStaleLocked();
+}
+
+bool LockHandle::ReadSetIsStaleLocked() {
+  if (!snapshot_.has_value() || read_set_.empty()) {
+    return false;
+  }
+  const Storage* storage = manager_->storage_;
+  if (storage == nullptr) {
+    return false;
+  }
+  for (const auto& [table_id, reads] : read_set_) {
+    if (reads.all) {
+      if (storage->HasVersionsAfter(*snapshot_, table_id, KeyRange::All())) {
+        return true;
+      }
+      continue;
+    }
+    for (const KeyRange& range : reads.ranges) {
+      if (storage->HasVersionsAfter(*snapshot_, table_id, range)) {
+        return true;
+      }
+    }
+  }
   return false;
 }
 
-bool LockHandle::IsAborted() {
-  absl::MutexLock lock(mu_);
-  return !status_.ok();
-}
-
-absl::Status LockHandle::Wait() {
-  // The current implementation never blocks.
-  absl::MutexLock lock(mu_);
-  return status_;
-}
-
-void LockHandle::Abort(const absl::Status& status) {
-  absl::MutexLock lock(mu_);
-  status_ = status;
-}
-
-absl::Status LockHandle::TryAbortTransaction(const absl::Status& status) {
-  if (mu_.try_lock()) {
-    if (try_abort_transaction_fn_ != nullptr) {
-      auto aborted = try_abort_transaction_fn_();
-      if (aborted.ok()) {
-        status_ = status;
-        mu_.unlock();
-        return absl::OkStatus();
-      }
+absl::StatusOr<absl::Time> LockHandle::Commit(
+    const std::function<absl::Status()>& precheck,
+    const std::function<absl::Status(absl::Time)>& flush) {
+  absl::MutexLock commit_lock(manager_->commit_mu_);
+  GOOGLESQL_RETURN_IF_ERROR(precheck());
+  {
+    absl::MutexLock lock(mu_);
+    if (ReadSetIsStaleLocked()) {
+      return error::AbortReadSetConflict(tid_);
     }
-    mu_.unlock();
   }
-  return error::CouldNotObtainLockHandleMutex(tid_);
-}
-
-void LockHandle::Reset() {
-  absl::MutexLock lock(mu_);
-  status_ = absl::OkStatus();
-}
-
-absl::StatusOr<absl::Time> LockHandle::ReserveCommitTimestamp() {
-  return manager_->ReserveCommitTimestamp(this);
-}
-
-absl::Status LockHandle::MarkCommitted() {
-  return manager_->MarkCommitted(this);
+  absl::Time commit_timestamp = manager_->ReserveCommitTimestamp();
+  absl::Status flush_status = flush(commit_timestamp);
+  manager_->MarkCommitted(commit_timestamp);
+  GOOGLESQL_RETURN_IF_ERROR(flush_status);
+  return commit_timestamp;
 }
 
 void LockHandle::WaitForSafeRead(absl::Time read_time) {

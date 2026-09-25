@@ -97,9 +97,12 @@ class ReadWriteTransaction : public RowReader, public RowWriter {
 
   absl::Status Rollback() ABSL_LOCKS_EXCLUDED(mu_);
 
-  // Tries to abort the transaction. This is a best effort attempt and returns
-  // OK only if the transaction could successfully be aborted.
-  absl::Status TryAbort() ABSL_LOCKS_EXCLUDED(mu_);
+  // Returns ABORTED, resetting the transaction, if `status` is an error other
+  // than ABORTED and a concurrent commit wrote data this transaction read.
+  // Otherwise returns `status`. For errors raised outside Read/Write/Commit,
+  // such as a DML statement the query engine rejects.
+  absl::Status MaybeAbortOnStaleReads(const absl::Status& status)
+      ABSL_LOCKS_EXCLUDED(mu_);
 
   absl::Status Invalidate() ABSL_LOCKS_EXCLUDED(mu_);
 
@@ -147,6 +150,18 @@ class ReadWriteTransaction : public RowReader, public RowWriter {
   absl::Status ProcessChangeStreamWriteOps();
   // Resets the transaction and marks it Active.
   void Reset();
+
+  // Takes the snapshot on the first data operation; ABORTED if a schema
+  // change committed before it.
+  absl::Status AcquireSnapshot() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+  // Adds the rows every mutation op of `mutation` touches to the read set.
+  void RecordMutationReads(const Mutation& mutation)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+  // See MaybeAbortOnStaleReads.
+  absl::Status AbortIfReadSetStale(const absl::Status& status)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   // Apply the constraint checks and effects to the writes.
   absl::Status ApplyValidators(const WriteOp& op);

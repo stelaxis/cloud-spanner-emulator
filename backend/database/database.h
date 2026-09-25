@@ -55,6 +55,8 @@ namespace database_api = ::google::spanner::admin::database::v1;
 //
 // Database largely ties together various subsystems - transactions, locking,
 // schemas, queries, storage etc. and acts as a container for these subsystems.
+class ScopedSchemaChangeLock;
+
 class Database {
  public:
   // Constructs a fully initialized database with schema created using
@@ -129,6 +131,12 @@ class Database {
   Database& operator=(const Database&) = delete;
 
   SchemaChangeContext GetSchemaChangeContext();
+
+  // Applies a schema change while `lock` holds the commit critical section.
+  absl::Status ApplySchemaChangeLocked(
+      const SchemaChangeOperation& schema_change_operation,
+      ScopedSchemaChangeLock& lock, int* num_succesful_statements,
+      absl::Time* commit_timestamp, absl::Status* backfill_status);
 
   // Clock to provide commit timestamps.
   Clock* clock_;

@@ -62,6 +62,13 @@ class InMemoryStorage : public Storage {
                       const KeyRange& key_range) override
       ABSL_LOCKS_EXCLUDED(mu_);
 
+  absl::Status MarkWritten(absl::Time timestamp, const TableID& table_id,
+                           const Key& key) override ABSL_LOCKS_EXCLUDED(mu_);
+
+  bool HasVersionsAfter(absl::Time timestamp, const TableID& table_id,
+                        const KeyRange& key_range) const override
+      ABSL_LOCKS_EXCLUDED(mu_);
+
   void SetVersionRetentionPeriod(
       absl::Duration version_retention_period) override;
 
@@ -96,8 +103,16 @@ class InMemoryStorage : public Storage {
 
   void RemoveExpiredVersions(Cell& cell, absl::Time timestamp);
 
+  // Raises the table's latest version timestamp to `timestamp`.
+  void NoteVersion(const TableID& table_id, absl::Time timestamp)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
   mutable absl::Mutex mu_;
   Tables tables_ ABSL_GUARDED_BY(mu_);
+
+  // Latest version timestamp written to each table; lets HasVersionsAfter skip
+  // tables with no newer versions without scanning them.
+  absl::flat_hash_map<TableID, absl::Time> latest_version_ ABSL_GUARDED_BY(mu_);
 
   // Tracks when tables were dropped so that we can clean up the data.
   std::map<absl::Time, TableID> dropped_tables_ ABSL_GUARDED_BY(mu_);

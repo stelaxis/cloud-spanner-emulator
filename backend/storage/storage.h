@@ -74,6 +74,19 @@ class Storage {
   virtual absl::Status Delete(absl::Time timestamp, const TableID& table_id,
                               const KeyRange& key_range) = 0;
 
+  // Records a version of `key` at `timestamp` that leaves the row's visible
+  // state unchanged, so that HasVersionsAfter reports it. A transaction that
+  // inserts and then deletes a row absent from storage buffers nothing, yet
+  // conflict detection must still see its write.
+  virtual absl::Status MarkWritten(absl::Time timestamp,
+                                   const TableID& table_id, const Key& key) = 0;
+
+  // Returns true if any row in `key_range` has a version (write, delete or
+  // MarkWritten) with a timestamp strictly after `timestamp`. `key_range`
+  // should be ClosedOpen; an empty or inverted range has no versions.
+  virtual bool HasVersionsAfter(absl::Time timestamp, const TableID& table_id,
+                                const KeyRange& key_range) const = 0;
+
   // Sets the version retention period from the database options.
   // This is used to determine when to delete expired data from storage.
   virtual void SetVersionRetentionPeriod(
