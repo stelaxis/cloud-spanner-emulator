@@ -39,9 +39,10 @@ func main() {
 	schemaPath := flag.String("schema", "", "DDL file; statements end with ';'")
 	port := flag.Int("port", 19220, "emulator port")
 	rows := flag.Int("rows", 3, "rows per table")
+	migration := flag.Bool("migrate", false, "after filling, time one schema change creating an index on every table")
 	flag.Parse()
 	log.SetFlags(log.Ltime)
-	if err := run(*binary, *schemaPath, *port, *rows); err != nil {
+	if err := run(*binary, *schemaPath, *port, *rows, *migration); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -57,7 +58,7 @@ func (e *emulator) start(binary string) error {
 	return e.cmd.Start()
 }
 
-func run(binary, schemaPath string, port, perTable int) error {
+func run(binary, schemaPath string, port, perTable int, migration bool) error {
 	ctx := context.Background()
 	schema, err := os.ReadFile(schemaPath)
 	if err != nil {
@@ -120,6 +121,13 @@ func run(binary, schemaPath string, port, perTable int) error {
 	log.Printf("filled %d of %d tables", filled, len(tables))
 	if filled < len(tables)*3/4 {
 		return fmt.Errorf("only %d of %d tables could be filled", filled, len(tables))
+	}
+	if migration {
+		n, took, err := migrate(ctx, opts, tables)
+		if err != nil {
+			return fmt.Errorf("migration: %w", err)
+		}
+		log.Printf("migration: %d CREATE INDEX statements in one schema change took %v", n, took.Round(time.Millisecond))
 	}
 	ddl, err := getDDL(ctx, opts)
 	if err != nil {
@@ -334,7 +342,7 @@ func literal(c column, r int, nullOK bool) string {
 		if c.name == "tenant_id" {
 			return fmt.Sprintf("CAST('%s' AS UUID)", uuids[0])
 		}
-		return fmt.Sprintf("CAST('%s' AS UUID)", uuids[r%len(uuids)])
+		return fmt.Sprintf("CAST('00000000-0000-4000-8000-%012d' AS UUID)", r+1)
 	case strings.HasPrefix(typ, "STRING"):
 		switch c.name {
 		case "kind":
@@ -365,37 +373,60 @@ func literal(c column, r int, nullOK bool) string {
 
 // fill inserts up to `perTable` rows into every table, in as many passes as
 // foreign keys and interleaving need. Returns how many tables have rows.
+func insertSQL(t table, r int, nullOK bool) string {
+	var names, values []string
+	for _, c := range t.columns {
+		if c.omitted {
+			continue
+		}
+		names = append(names, c.name)
+		values = append(values, literal(c, r, nullOK))
+	}
+	return fmt.Sprintf("INSERT OR IGNORE INTO %s (%s) VALUES (%s)", t.name, strings.Join(names, ", "), strings.Join(values, ", "))
+}
+
+// fill inserts up to `perTable` rows into every table, in as many passes as
+// foreign keys and interleaving need: one row at a time until one succeeds,
+// then in batches of 100 like it. Returns how many tables have rows.
 func fill(ctx context.Context, client *spanner.Client, tables []table, perTable int) (int, error) {
 	done := map[string]int{}
+	nulls := map[string]bool{} // whether a table's rows need NULL in nullable columns
 	for pass := 0; pass < len(tables); pass++ {
 		progress := false
 		for _, t := range tables {
-			for r := done[t.name]; r < perTable; r++ {
+			for done[t.name] < perTable {
+				r := done[t.name]
+				if r > 0 {
+					end := min(r+100, perTable)
+					var stmts []spanner.Statement
+					for i := r; i < end; i++ {
+						stmts = append(stmts, spanner.Statement{SQL: insertSQL(t, i, nulls[t.name])})
+					}
+					_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+						_, err := txn.BatchUpdate(ctx, stmts)
+						return err
+					})
+					if err == nil {
+						done[t.name], progress = end, true
+						continue
+					}
+				}
 				ok := false
 				for _, nullOK := range []bool{false, true} {
-					var names, values []string
-					for _, c := range t.columns {
-						if c.omitted {
-							continue
-						}
-						names = append(names, c.name)
-						values = append(values, literal(c, r, nullOK))
-					}
-					sql := fmt.Sprintf("INSERT OR IGNORE INTO %s (%s) VALUES (%s)", t.name, strings.Join(names, ", "), strings.Join(values, ", "))
+					sql := insertSQL(t, r, nullOK)
 					_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 						_, err := txn.Update(ctx, spanner.Statement{SQL: sql})
 						return err
 					})
 					if err == nil {
-						ok = true
+						ok, nulls[t.name] = true, nullOK
 						break
 					}
 				}
 				if !ok {
 					break
 				}
-				done[t.name] = r + 1
-				progress = true
+				done[t.name], progress = r+1, true
 			}
 		}
 		if !progress {
@@ -409,6 +440,33 @@ func fill(ctx context.Context, client *spanner.Client, tables []table, perTable 
 		}
 	}
 	return filled, nil
+}
+
+// migrate applies one schema change creating an index on a non-key column of
+// every table that has one, like a migration on a populated database, and
+// returns how long it took.
+func migrate(ctx context.Context, opts []option.ClientOption, tables []table) (int, time.Duration, error) {
+	indexable := map[string]bool{"INT64": true, "BOOL": true, "DATE": true, "TIMESTAMP": true, "UUID": true, "STRING(MAX)": true}
+	var statements []string
+	for _, t := range tables {
+		for _, c := range t.columns {
+			if !c.key && !c.omitted && indexable[c.typ] {
+				statements = append(statements, fmt.Sprintf("CREATE INDEX smoke_%s ON %s(%s)", t.name, t.name, c.name))
+				break
+			}
+		}
+	}
+	da, err := database.NewDatabaseAdminClient(ctx, opts...)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer da.Close()
+	start := time.Now()
+	op, err := da.UpdateDatabaseDdl(ctx, &databasepb.UpdateDatabaseDdlRequest{Database: dbName, Statements: statements})
+	if err == nil {
+		err = op.Wait(ctx)
+	}
+	return len(statements), time.Since(start), err
 }
 
 func dump(ctx context.Context, client *spanner.Client, tables []table) (map[string][]string, error) {
