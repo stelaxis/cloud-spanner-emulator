@@ -109,14 +109,15 @@ AnalyzePostgreSQL(const std::string& sql, googlesql::EnumerableCatalog* catalog,
   // a SQL rewrite.
   options.mutable_language()->EnableLanguageFeature(
       googlesql::FEATURE_NULLS_FIRST_LAST_IN_ORDER_BY);
+  auto pg_function_catalog = std::make_unique<FunctionCatalog>(
+      type_factory,
+      /*catalog_name=*/kCloudSpannerEmulatorFunctionCatalogName);
+  pg_function_catalog->SetLatestSchema(function_catalog->GetLatestSchema());
   GOOGLESQL_ASSIGN_OR_RETURN(
       std::unique_ptr<const googlesql::AnalyzerOutput> output,
       postgres_translator::spangres::ParseAndAnalyzePostgreSQL(
           sql, catalog, options, type_factory,
-          std::make_unique<FunctionCatalog>(
-              type_factory,
-              /*catalog_name=*/kCloudSpannerEmulatorFunctionCatalogName,
-              /*schema=*/function_catalog->GetLatestSchema())),
+          std::move(pg_function_catalog)),
       _.With(MapSpangresQueryErrorToSpannerError));
   return std::move(output);
 }

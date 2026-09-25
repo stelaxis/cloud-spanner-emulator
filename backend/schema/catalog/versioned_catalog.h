@@ -56,8 +56,10 @@ class VersionedCatalog {
   // GetLatestSchema never returns a nullptr.
   const Schema* GetLatestSchema() const ABSL_LOCKS_EXCLUDED(mu_);
 
-  // Returns the latest schema with shared ownership, so that it outlives its
-  // removal from the catalog (RemoveExpiredSchemas).
+  // GetSchema and GetLatestSchema with shared ownership, so that the schema
+  // outlives its removal from the catalog (RemoveExpiredSchemas).
+  std::shared_ptr<const Schema> GetSchemaShared(absl::Time timestamp) const
+      ABSL_LOCKS_EXCLUDED(mu_);
   std::shared_ptr<const Schema> GetLatestSchemaShared() const
       ABSL_LOCKS_EXCLUDED(mu_);
 

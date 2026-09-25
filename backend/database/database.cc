@@ -118,7 +118,7 @@ absl::StatusOr<std::unique_ptr<Database>> Database::Create(
   // Some functions need to access the schema (e.g. sequence functions), so
   // set the latest schema to the function catalog here.
   database->query_engine_->SetLatestSchemaForFunctionCatalog(
-      database->versioned_catalog_->GetLatestSchema());
+      database->versioned_catalog_->GetLatestSchemaShared());
 
   database->storage_->SetVersionRetentionPeriod(
       database->versioned_catalog_->version_retention_period());
@@ -217,7 +217,7 @@ absl::Status Database::ApplySchemaChangeLocked(
   // Some functions need to access the schema (e.g. sequence functions), so
   // set the latest schema to the function catalog here.
   query_engine_->SetLatestSchemaForFunctionCatalog(
-      versioned_catalog_->GetLatestSchema());
+      versioned_catalog_->GetLatestSchemaShared());
 
   storage_->SetVersionRetentionPeriod(
       versioned_catalog_->version_retention_period());

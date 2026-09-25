@@ -868,6 +868,7 @@ cc_library(
         "function_catalog.h",
     ],
     deps = [
+        "@com_google_absl//absl/synchronization",
         ":analyzer_options",
         "//backend/common:case",
         "//backend/query/graph:mock_graph_algo_table_valued_function",

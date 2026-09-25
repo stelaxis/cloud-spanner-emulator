@@ -572,10 +572,38 @@ std::unique_ptr<googlesql::Function> SecureContextFunction(
 }
 }  // namespace
 
+void FunctionCatalog::SetLatestSchema(
+    std::shared_ptr<const backend::Schema> schema) {
+  absl::MutexLock lock(latest_schema_mu_);
+  latest_schema_ = std::move(schema);
+}
+
+void FunctionCatalog::SetLatestSchema(const backend::Schema* schema) {
+  // Aliasing constructor with no owner: a non-owning shared_ptr.
+  SetLatestSchema(std::shared_ptr<const backend::Schema>(
+      std::shared_ptr<const backend::Schema>(), schema));
+}
+
+std::shared_ptr<const backend::Schema> FunctionCatalog::GetLatestSchema()
+    const {
+  absl::MutexLock lock(latest_schema_mu_);
+  return latest_schema_;
+}
+
+std::shared_ptr<const backend::Schema>
+FunctionCatalog::LoadLatestSchemaForEvaluation() const {
+  std::shared_ptr<const backend::Schema> schema = GetLatestSchema();
+  if (schema_loaded_hook_ != nullptr) {
+    schema_loaded_hook_();
+  }
+  return schema;
+}
+
 FunctionCatalog::FunctionCatalog(googlesql::TypeFactory* type_factory,
                                  const std::string& catalog_name,
                                  const backend::Schema* schema)
-    : catalog_name_(catalog_name), latest_schema_(schema) {
+    : catalog_name_(catalog_name) {
+  SetLatestSchema(schema);
   // Add the subset of GoogleSQL built-in functions supported by Cloud Spanner.
   AddGoogleSQLBuiltInFunctions(type_factory);
   // Add Cloud Spanner specific functions.
@@ -690,7 +718,7 @@ void FunctionCatalog::AddMlFunctions(googlesql::TypeFactory* type_factory) {
 
 void FunctionCatalog::AddSearchFunctions(googlesql::TypeFactory* type_factory) {
   auto dialect = database_api::DatabaseDialect::GOOGLE_STANDARD_SQL;
-  const backend::Schema* latest_schema = GetLatestSchema();
+  std::shared_ptr<const backend::Schema> latest_schema = GetLatestSchema();
   if (latest_schema != nullptr) {
     dialect = latest_schema->dialect();
   }
@@ -810,7 +838,7 @@ std::unique_ptr<googlesql::Function> FunctionCatalog::GetPGToCharFunction(
       postgres_translator::spangres::datatypes::GetPgNumericType();
   // Defines the function as a lambda, so it has access to the schema.
   auto initialize_pg_timezone = [&]() {
-    const backend::Schema* latest_schema = GetLatestSchema();
+    std::shared_ptr<const backend::Schema> latest_schema = GetLatestSchema();
     std::string default_time_zone = latest_schema != nullptr
                                         ? latest_schema->default_time_zone()
                                         : kDefaultTimeZone;
@@ -860,7 +888,7 @@ std::unique_ptr<googlesql::Function> FunctionCatalog::GetPGExtractFunction(
       postgres_translator::spangres::datatypes::GetPgNumericType();
   // Defines the function as a lambda, so it has access to the schema.
   auto initialize_pg_timezone = [&]() {
-    const backend::Schema* latest_schema = GetLatestSchema();
+    std::shared_ptr<const backend::Schema> latest_schema = GetLatestSchema();
     std::string default_time_zone = latest_schema != nullptr
                                         ? latest_schema->default_time_zone()
                                         : kDefaultTimeZone;
@@ -897,7 +925,7 @@ std::unique_ptr<googlesql::Function>
 FunctionCatalog::GetPGCastToTimestampFunction(const std::string& catalog_name) {
   // Defines the function as a lambda, so it has access to the schema.
   auto initialize_pg_timezone = [&]() {
-    const backend::Schema* latest_schema = GetLatestSchema();
+    std::shared_ptr<const backend::Schema> latest_schema = GetLatestSchema();
     std::string default_time_zone = latest_schema != nullptr
                                         ? latest_schema->default_time_zone()
                                         : kDefaultTimeZone;
@@ -932,7 +960,7 @@ std::unique_ptr<googlesql::Function> FunctionCatalog::GetPGCastToStringFunction(
       postgres_translator::spangres::datatypes::GetPgNumericType();
   // Defines the function as a lambda, so it has access to the schema.
   auto initialize_pg_timezone = [&]() {
-    const backend::Schema* latest_schema = GetLatestSchema();
+    std::shared_ptr<const backend::Schema> latest_schema = GetLatestSchema();
     std::string default_time_zone = latest_schema != nullptr
                                         ? latest_schema->default_time_zone()
                                         : kDefaultTimeZone;
@@ -968,7 +996,7 @@ std::unique_ptr<googlesql::Function> FunctionCatalog::GetPGDateTruncFunction(
     const std::string& catalog_name) {
   // Defines the function as a lambda, so it has access to the schema.
   auto initialize_pg_timezone = [&]() {
-    const backend::Schema* latest_schema = GetLatestSchema();
+    std::shared_ptr<const backend::Schema> latest_schema = GetLatestSchema();
     std::string default_time_zone = latest_schema != nullptr
                                         ? latest_schema->default_time_zone()
                                         : kDefaultTimeZone;
@@ -1016,7 +1044,8 @@ FunctionCatalog::GetInternalSequenceStateFunction(
       return error::UnsupportedFunction(kGetInternalSequenceStateFunctionName);
     }
 
-    const backend::Schema* latest_schema = GetLatestSchema();
+    std::shared_ptr<const backend::Schema> latest_schema =
+        LoadLatestSchemaForEvaluation();
     if (latest_schema == nullptr) {
       return error::SequenceNeedsAccessToSchema();
     }
@@ -1070,7 +1099,8 @@ FunctionCatalog::GetTableColumnIdentityStateFunction(
           kGetTableColumnIdentityStateFunctionName);
     }
 
-    const backend::Schema* latest_schema = GetLatestSchema();
+    std::shared_ptr<const backend::Schema> latest_schema =
+        LoadLatestSchemaForEvaluation();
     if (latest_schema == nullptr) {
       return error::SequenceNeedsAccessToSchema();
     }
@@ -1127,7 +1157,8 @@ FunctionCatalog::GetNextSequenceValueFunction(const std::string& catalog_name) {
       return error::UnsupportedFunction(kGetNextSequenceValueFunctionName);
     }
 
-    const backend::Schema* latest_schema = GetLatestSchema();
+    std::shared_ptr<const backend::Schema> latest_schema =
+        LoadLatestSchemaForEvaluation();
     if (latest_schema == nullptr) {
       return error::SequenceNeedsAccessToSchema();
     }

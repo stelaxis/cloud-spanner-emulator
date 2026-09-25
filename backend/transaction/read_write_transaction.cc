@@ -306,7 +306,7 @@ absl::Status ReadWriteTransaction::Read(const ReadArg& read_arg,
       iterators.push_back(std::move(itr));
     }
     *cursor = std::make_unique<StorageIteratorRowCursor>(
-        std::move(iterators), resolved_read_arg.columns);
+        std::move(iterators), resolved_read_arg.columns, schema_holder_);
     return absl::OkStatus();
   });
 }
@@ -335,7 +335,17 @@ void ReadWriteTransaction::UpdateTrackedCommitTimestamps() {
 const Schema* ReadWriteTransaction::schema() const {
   absl::MutexLock lock(mu_);
   if (state_ == State::kUninitialized) {
-    return versioned_catalog_->GetLatestSchema();
+    // Before the first data operation, hand out the latest schema and keep
+    // it: callers analyze the request against it, and the first data
+    // operation runs on it (GuardedCall).
+    std::shared_ptr<const Schema> latest =
+        versioned_catalog_->GetLatestSchemaShared();
+    if (latest.get() != schema_) {
+      retired_schemas_.push_back(std::move(schema_holder_));
+      schema_holder_ = std::move(latest);
+      schema_ = schema_holder_.get();
+    }
+    schema_handed_out_ = true;
   }
   return schema_;
 }
@@ -440,6 +450,7 @@ void ReadWriteTransaction::Reset() {
   lock_handle_->UnlockAll();
   transaction_store_->Clear();
   unrecorded_key_tables_.clear();
+  schema_handed_out_ = false;
   std::queue<WriteOp> empty;
   write_ops_queue_.swap(empty);
   state_ = State::kUninitialized;
@@ -471,8 +482,21 @@ absl::Status ReadWriteTransaction::GuardedCall(
       break;
     }
     case State::kUninitialized: {
-      schema_holder_ = versioned_catalog_->GetLatestSchemaShared();
-      schema_ = schema_holder_.get();
+      std::shared_ptr<const Schema> latest =
+          versioned_catalog_->GetLatestSchemaShared();
+      if (latest.get() != schema_) {
+        // The caller may have analyzed this request against the schema that
+        // schema() handed out, which a schema change has since replaced.
+        if (schema_handed_out_ && op != OpType::kRollback) {
+          Reset();
+          ++retry_state_.abort_retry_count;
+          return error::AbortDueToConcurrentSchemaChange(id_);
+        }
+        retired_schemas_.push_back(std::move(schema_holder_));
+        schema_holder_ = std::move(latest);
+        schema_ = schema_holder_.get();
+      }
+      schema_handed_out_ = false;
       auto maybe_action_registry =
           action_manager_->GetActionsForSchema(schema_);
       if (!maybe_action_registry.ok()) {

@@ -81,9 +81,16 @@ const Schema* VersionedCatalog::GetLatestSchema() const {
   return GetSchema(absl::InfiniteFuture());
 }
 
-std::shared_ptr<const Schema> VersionedCatalog::GetLatestSchemaShared() const {
+std::shared_ptr<const Schema> VersionedCatalog::GetSchemaShared(
+    absl::Time timestamp) const {
   absl::MutexLock lock(mu_);
-  return schemas_.rbegin()->second;
+  auto itr = schemas_.upper_bound(timestamp);
+  itr--;
+  return itr->second;
+}
+
+std::shared_ptr<const Schema> VersionedCatalog::GetLatestSchemaShared() const {
+  return GetSchemaShared(absl::InfiniteFuture());
 }
 
 absl::Status VersionedCatalog::AddSchema(absl::Time creation_time,

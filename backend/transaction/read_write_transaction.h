@@ -202,7 +202,14 @@ class ReadWriteTransaction : public RowReader, public RowWriter {
 
   // Owns schema_, which a concurrent schema change may remove from the
   // catalog. Declared before everything that points into the schema.
-  std::shared_ptr<const Schema> schema_holder_ ABSL_GUARDED_BY(mu_);
+  mutable std::shared_ptr<const Schema> schema_holder_ ABSL_GUARDED_BY(mu_);
+
+  // Schemas schema() handed out earlier, which callers may still use.
+  mutable std::vector<std::shared_ptr<const Schema>> retired_schemas_
+      ABSL_GUARDED_BY(mu_);
+
+  // Whether schema() handed out schema_ since the last data operation began.
+  mutable bool schema_handed_out_ ABSL_GUARDED_BY(mu_) = false;
 
   // Transaction lock management.
   std::unique_ptr<LockHandle> lock_handle_;
@@ -230,7 +237,7 @@ class ReadWriteTransaction : public RowReader, public RowWriter {
   State state_ ABSL_GUARDED_BY(mu_) = State::kUninitialized;
 
   // The schema that is in effect at the timestamp picked for this transaction.
-  const Schema* schema_ ABSL_GUARDED_BY(mu_);
+  mutable const Schema* schema_ ABSL_GUARDED_BY(mu_);
 
   CaseInsensitiveStringMap<std::vector<KeyRange>> deleted_key_ranges_by_table_;
 

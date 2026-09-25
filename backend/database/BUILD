@@ -110,3 +110,30 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ],
 )
+
+cc_test(
+    name = "schema_lifetime_test",
+    srcs = ["schema_lifetime_test.cc"],
+    deps = [
+        ":database",
+        "//backend/access:read",
+        "//backend/datamodel:key_set",
+        "//backend/query:function_catalog",
+        "//backend/query:query_context",
+        "//backend/query:query_engine",
+        "//backend/schema/catalog:schema",
+        "//backend/schema/updater:schema_updater",
+        "//backend/transaction:read_only_transaction",
+        "//backend/transaction:read_write_transaction",
+        "//common:clock",
+        "//tests/common:proto_matchers",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_googlesql//googlesql/base/testing:status_matchers",
+        "@com_google_googlesql//googlesql/public:value",
+        "@com_google_googletest//:gtest_main",
+    ],
+)

@@ -100,11 +100,13 @@ class EmulatorBuiltinFunctionCatalog : public EngineBuiltinFunctionCatalog {
   }
 
   void SetLatestSchema(
-      const google::spanner::emulator::backend::Schema* schema) {
-    function_catalog_->SetLatestSchema(schema);
+      std::shared_ptr<const google::spanner::emulator::backend::Schema>
+          schema) {
+    function_catalog_->SetLatestSchema(std::move(schema));
   }
 
-  const google::spanner::emulator::backend::Schema* GetLatestSchema() {
+  std::shared_ptr<const google::spanner::emulator::backend::Schema>
+  GetLatestSchema() {
     return function_catalog_->GetLatestSchema();
   }
 

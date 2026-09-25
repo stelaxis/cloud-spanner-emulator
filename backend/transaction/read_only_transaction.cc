@@ -67,8 +67,9 @@ absl::Status ReadOnlyTransaction::Read(const ReadArg& read_arg,
     return error::ReadTimestampPastVersionGCLimit(read_timestamp_);
   }
 
+  std::shared_ptr<const Schema> schema = SchemaShared();
   GOOGLESQL_ASSIGN_OR_RETURN(const ResolvedReadArg resolved_read_arg,
-                   ResolveReadArg(read_arg, schema()));
+                   ResolveReadArg(read_arg, schema.get()));
 
   // Clean up any dropped tables that are eligible for deletion.
   // This is inexpensive to do so it can be done for every read.
@@ -84,15 +85,23 @@ absl::Status ReadOnlyTransaction::Read(const ReadArg& read_arg,
     iterators.push_back(std::move(itr));
   }
   *cursor = std::make_unique<StorageIteratorRowCursor>(
-      std::move(iterators), resolved_read_arg.columns);
+      std::move(iterators), resolved_read_arg.columns, std::move(schema));
   return absl::OkStatus();
 }
 
 const Schema* ReadOnlyTransaction::schema() const {
+  return SchemaShared().get();
+}
+
+std::shared_ptr<const Schema> ReadOnlyTransaction::SchemaShared() const {
   // Wait for any concurrent schema change or read-write transactions to commit
   // before accessing database state to read schemas in versioned_catalog.
   lock_handle_->WaitForSafeRead(read_timestamp_);
-  return versioned_catalog_->GetSchema(read_timestamp_);
+  absl::MutexLock lock(schema_mu_);
+  if (schema_holder_ == nullptr) {
+    schema_holder_ = versioned_catalog_->GetSchemaShared(read_timestamp_);
+  }
+  return schema_holder_;
 }
 
 absl::Time ReadOnlyTransaction::PickReadTimestamp() {

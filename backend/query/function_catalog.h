@@ -17,7 +17,7 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_QUERY_FUNCTION_CATALOG_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_QUERY_FUNCTION_CATALOG_H_
 
-#include <atomic>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -28,6 +28,7 @@
 #include "googlesql/public/types/type_factory.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/synchronization/mutex.h"
 #include "backend/common/case.h"
 #include "backend/schema/catalog/schema.h"
 
@@ -63,14 +64,25 @@ class FunctionCatalog {
       const std::string& name,
       const googlesql::TableValuedFunction** output) const;
 
-  // Schema changes set the latest schema while queries and default-value
-  // expressions of concurrent transactions read it.
-  void SetLatestSchema(const backend::Schema* schema) {
-    latest_schema_.store(schema);
-  }
+  // Sets the latest schema that sequence and time zone functions use. Schema
+  // changes replace it while queries and default-value expressions of
+  // concurrent transactions evaluate those functions, so evaluators hold the
+  // schema they loaded (GetLatestSchema) until they are done with it.
+  void SetLatestSchema(std::shared_ptr<const backend::Schema> schema)
+      ABSL_LOCKS_EXCLUDED(latest_schema_mu_);
 
-  const backend::Schema* GetLatestSchema() const {
-    return latest_schema_.load();
+  // As above, without ownership: the caller keeps `schema` alive for as long
+  // as this catalog is used.
+  void SetLatestSchema(const backend::Schema* schema)
+      ABSL_LOCKS_EXCLUDED(latest_schema_mu_);
+
+  std::shared_ptr<const backend::Schema> GetLatestSchema() const
+      ABSL_LOCKS_EXCLUDED(latest_schema_mu_);
+
+  // Runs `hook` each time a sequence or identity function has loaded the
+  // latest schema to evaluate against. For tests.
+  void set_schema_loaded_hook_for_testing(std::function<void()> hook) {
+    schema_loaded_hook_ = std::move(hook);
   }
 
  private:
@@ -112,9 +124,18 @@ class FunctionCatalog {
   CaseInsensitiveStringMap<std::unique_ptr<googlesql::TableValuedFunction>>
       table_valued_functions_;
   const std::string catalog_name_;
-  // A pointer to the latest schema, since some functions need to access it
-  // (e.g. sequence functions).
-  std::atomic<const backend::Schema*> latest_schema_;
+  // Returns the latest schema for a function evaluation, after running the
+  // test hook.
+  std::shared_ptr<const backend::Schema> LoadLatestSchemaForEvaluation() const;
+
+  // The latest schema, since some functions need to access it (e.g. sequence
+  // functions).
+  mutable absl::Mutex latest_schema_mu_;
+  std::shared_ptr<const backend::Schema> latest_schema_
+      ABSL_GUARDED_BY(latest_schema_mu_);
+
+  // See set_schema_loaded_hook_for_testing. Set before concurrent use.
+  std::function<void()> schema_loaded_hook_;
 };
 
 }  // namespace backend
