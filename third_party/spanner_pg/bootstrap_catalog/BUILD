@@ -165,7 +165,13 @@ genrule(
     # If catalog object B refers to catalog object A, then A must be
     # included first.  Otherwise gen_catalog_info.pl will not link
     # B back to A.
-    cmd = """\
+    cmd = select({
+        # macOS: the cp below writes into the source tree (there is no
+        # sandbox); remove the read-only copies a previous build left there,
+        # which cp cannot overwrite.
+        "@platforms//os:macos": "rm -f third_party/spanner_pg/bootstrap_catalog/spanner_pg_data/pg_aggregate.dat third_party/spanner_pg/bootstrap_catalog/spanner_pg_data/pg_proc.dat\n",
+        "//conditions:default": "",
+    }) + """\
         set -e # Exit on error
 
         INCLUDE_PATH=third_party/spanner_pg/src/include

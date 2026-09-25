@@ -85,8 +85,11 @@ cc_library(
     linkopts = [
         "-ldl",
         "-lpthread",
-        "-lrt",
-    ],
+    ] + select({
+        # librt's functions live in libSystem on macOS; there is no -lrt.
+        "@platforms//os:macos": [],
+        "//conditions:default": ["-lrt"],
+    }),
     deps = [
         "//third_party/spanner_pg/src/backend/access/brin",
         "//third_party/spanner_pg/src/backend/access/common",
