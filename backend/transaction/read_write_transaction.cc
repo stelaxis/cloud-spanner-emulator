@@ -264,6 +264,7 @@ ReadWriteTransaction::ReadWriteTransaction(
       clock_(clock),
       base_storage_(storage),
       versioned_catalog_(versioned_catalog),
+      schema_holder_(versioned_catalog_->GetLatestSchemaShared()),
       lock_handle_(
           lock_manager->CreateHandle(transaction_id, retry_state_.priority)),
       commit_timestamp_tracker_(std::make_unique<CommitTimestampTracker>()),
@@ -274,7 +275,7 @@ ReadWriteTransaction::ReadWriteTransaction(
           std::make_unique<TransactionReadOnlyStore>(transaction_store_.get()),
           std::make_unique<TransactionEffectsBuffer>(&write_ops_queue_),
           clock)),
-      schema_(versioned_catalog_->GetLatestSchema()) {}
+      schema_(schema_holder_.get()) {}
 
 absl::StatusOr<absl::Time> ReadWriteTransaction::GetCommitTimestamp() {
   absl::MutexLock lock(mu_);
@@ -464,7 +465,8 @@ absl::Status ReadWriteTransaction::GuardedCall(
       break;
     }
     case State::kUninitialized: {
-      schema_ = versioned_catalog_->GetLatestSchema();
+      schema_holder_ = versioned_catalog_->GetLatestSchemaShared();
+      schema_ = schema_holder_.get();
       auto maybe_action_registry =
           action_manager_->GetActionsForSchema(schema_);
       if (!maybe_action_registry.ok()) {

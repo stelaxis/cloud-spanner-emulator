@@ -17,6 +17,7 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_QUERY_FUNCTION_CATALOG_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_QUERY_FUNCTION_CATALOG_H_
 
+#include <atomic>
 #include <memory>
 #include <string>
 
@@ -62,11 +63,15 @@ class FunctionCatalog {
       const std::string& name,
       const googlesql::TableValuedFunction** output) const;
 
+  // Schema changes set the latest schema while queries and default-value
+  // expressions of concurrent transactions read it.
   void SetLatestSchema(const backend::Schema* schema) {
-    latest_schema_ = schema;
+    latest_schema_.store(schema);
   }
 
-  const backend::Schema* GetLatestSchema() const { return latest_schema_; }
+  const backend::Schema* GetLatestSchema() const {
+    return latest_schema_.load();
+  }
 
  private:
   void AddGoogleSQLBuiltInFunctions(googlesql::TypeFactory* type_factory);
@@ -109,7 +114,7 @@ class FunctionCatalog {
   const std::string catalog_name_;
   // A pointer to the latest schema, since some functions need to access it
   // (e.g. sequence functions).
-  const backend::Schema* latest_schema_;
+  std::atomic<const backend::Schema*> latest_schema_;
 };
 
 }  // namespace backend

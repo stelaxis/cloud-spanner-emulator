@@ -17,6 +17,7 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_DATABASE_DATABASE_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_DATABASE_DATABASE_H_
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -24,6 +25,7 @@
 #include "google/spanner/admin/database/v1/common.pb.h"
 #include "googlesql/public/type.h"
 #include "absl/status/status.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/time.h"
@@ -124,6 +126,12 @@ class Database {
 
   PgOidAssigner* get_pg_oid_assigner() { return pg_oid_assigner_.get(); }
 
+  // Runs `hook` in every schema change after it has read the new schema and
+  // before it reconciles change stream churners with it. For tests.
+  void set_before_churner_update_hook_for_testing(std::function<void()> hook) {
+    before_churner_update_hook_ = std::move(hook);
+  }
+
  private:
   Database();
   // Delete copy and assignment operators since database shouldn't be copyable.
@@ -137,6 +145,13 @@ class Database {
       const SchemaChangeOperation& schema_change_operation,
       ScopedSchemaChangeLock& lock, int* num_succesful_statements,
       absl::Time* commit_timestamp, absl::Status* backfill_status);
+
+  // Serializes whole schema changes, including the change stream churner
+  // reconciliation that runs after the commit critical section is released.
+  absl::Mutex schema_change_mu_;
+
+  // See set_before_churner_update_hook_for_testing. Set before concurrent use.
+  std::function<void()> before_churner_update_hook_;
 
   // Clock to provide commit timestamps.
   Clock* clock_;

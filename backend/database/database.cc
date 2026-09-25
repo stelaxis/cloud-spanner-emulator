@@ -160,6 +160,9 @@ absl::Status Database::UpdateSchema(
     return error::UpdateDatabaseMissingStatements();
   }
 
+  // One schema change at a time, so that churners are reconciled with the
+  // schemas in commit order.
+  absl::MutexLock schema_change_lock(schema_change_mu_);
   {
     // Hold the commit critical section exclusively: in-flight commits finish
     // first, and open read-write transactions abort once they see the new
@@ -173,8 +176,11 @@ absl::Status Database::UpdateSchema(
         schema_change_operation, lock, num_succesful_statements,
         commit_timestamp, backfill_status));
   }
-  change_stream_partition_churner_->Update(
-      versioned_catalog_->GetLatestSchema());
+  const Schema* schema = versioned_catalog_->GetLatestSchema();
+  if (before_churner_update_hook_ != nullptr) {
+    before_churner_update_hook_();
+  }
+  change_stream_partition_churner_->Update(schema);
   return absl::OkStatus();
 }
 

@@ -32,6 +32,7 @@ cc_library(
         "database.h",
     ],
     deps = [
+        "@com_google_absl//absl/synchronization",
         "//backend/actions:manager",
         "//backend/common:ids",
         "//backend/database/change_stream:change_stream_partition_churner",
@@ -82,6 +83,30 @@ cc_test(
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/status",
         "@com_google_googlesql//googlesql/base/testing:status_matchers",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "database_concurrency_test",
+    srcs = ["database_concurrency_test.cc"],
+    deps = [
+        ":database",
+        "//backend/access:write",
+        "//backend/database/change_stream:change_stream_partition_churner",
+        "//backend/query:query_context",
+        "//backend/query:query_engine",
+        "//backend/schema/updater:schema_updater",
+        "//backend/transaction:read_write_transaction",
+        "//common:clock",
+        "//tests/common:proto_matchers",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_googlesql//googlesql/base/testing:status_matchers",
+        "@com_google_googlesql//googlesql/public:value",
         "@com_google_googletest//:gtest_main",
     ],
 )

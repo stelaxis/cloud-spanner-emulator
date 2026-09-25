@@ -690,8 +690,9 @@ void FunctionCatalog::AddMlFunctions(googlesql::TypeFactory* type_factory) {
 
 void FunctionCatalog::AddSearchFunctions(googlesql::TypeFactory* type_factory) {
   auto dialect = database_api::DatabaseDialect::GOOGLE_STANDARD_SQL;
-  if (latest_schema_ != nullptr) {
-    dialect = latest_schema_->dialect();
+  const backend::Schema* latest_schema = GetLatestSchema();
+  if (latest_schema != nullptr) {
+    dialect = latest_schema->dialect();
   }
 
   auto search_functions =
@@ -809,8 +810,9 @@ std::unique_ptr<googlesql::Function> FunctionCatalog::GetPGToCharFunction(
       postgres_translator::spangres::datatypes::GetPgNumericType();
   // Defines the function as a lambda, so it has access to the schema.
   auto initialize_pg_timezone = [&]() {
-    std::string default_time_zone = latest_schema_ != nullptr
-                                        ? latest_schema_->default_time_zone()
+    const backend::Schema* latest_schema = GetLatestSchema();
+    std::string default_time_zone = latest_schema != nullptr
+                                        ? latest_schema->default_time_zone()
                                         : kDefaultTimeZone;
     absl::Status status = postgres_translator::interfaces::InitPGTimezone(
         default_time_zone.c_str());
@@ -858,8 +860,9 @@ std::unique_ptr<googlesql::Function> FunctionCatalog::GetPGExtractFunction(
       postgres_translator::spangres::datatypes::GetPgNumericType();
   // Defines the function as a lambda, so it has access to the schema.
   auto initialize_pg_timezone = [&]() {
-    std::string default_time_zone = latest_schema_ != nullptr
-                                        ? latest_schema_->default_time_zone()
+    const backend::Schema* latest_schema = GetLatestSchema();
+    std::string default_time_zone = latest_schema != nullptr
+                                        ? latest_schema->default_time_zone()
                                         : kDefaultTimeZone;
     absl::Status status = postgres_translator::interfaces::InitPGTimezone(
         default_time_zone.c_str());
@@ -894,8 +897,9 @@ std::unique_ptr<googlesql::Function>
 FunctionCatalog::GetPGCastToTimestampFunction(const std::string& catalog_name) {
   // Defines the function as a lambda, so it has access to the schema.
   auto initialize_pg_timezone = [&]() {
-    std::string default_time_zone = latest_schema_ != nullptr
-                                        ? latest_schema_->default_time_zone()
+    const backend::Schema* latest_schema = GetLatestSchema();
+    std::string default_time_zone = latest_schema != nullptr
+                                        ? latest_schema->default_time_zone()
                                         : kDefaultTimeZone;
     absl::Status status = postgres_translator::interfaces::InitPGTimezone(
         default_time_zone.c_str());
@@ -928,8 +932,9 @@ std::unique_ptr<googlesql::Function> FunctionCatalog::GetPGCastToStringFunction(
       postgres_translator::spangres::datatypes::GetPgNumericType();
   // Defines the function as a lambda, so it has access to the schema.
   auto initialize_pg_timezone = [&]() {
-    std::string default_time_zone = latest_schema_ != nullptr
-                                        ? latest_schema_->default_time_zone()
+    const backend::Schema* latest_schema = GetLatestSchema();
+    std::string default_time_zone = latest_schema != nullptr
+                                        ? latest_schema->default_time_zone()
                                         : kDefaultTimeZone;
     absl::Status status = postgres_translator::interfaces::InitPGTimezone(
         default_time_zone.c_str());
@@ -963,8 +968,9 @@ std::unique_ptr<googlesql::Function> FunctionCatalog::GetPGDateTruncFunction(
     const std::string& catalog_name) {
   // Defines the function as a lambda, so it has access to the schema.
   auto initialize_pg_timezone = [&]() {
-    std::string default_time_zone = latest_schema_ != nullptr
-                                        ? latest_schema_->default_time_zone()
+    const backend::Schema* latest_schema = GetLatestSchema();
+    std::string default_time_zone = latest_schema != nullptr
+                                        ? latest_schema->default_time_zone()
                                         : kDefaultTimeZone;
     absl::Status status = postgres_translator::interfaces::InitPGTimezone(
         default_time_zone.c_str());
@@ -1010,12 +1016,13 @@ FunctionCatalog::GetInternalSequenceStateFunction(
       return error::UnsupportedFunction(kGetInternalSequenceStateFunctionName);
     }
 
-    if (latest_schema_ == nullptr) {
+    const backend::Schema* latest_schema = GetLatestSchema();
+    if (latest_schema == nullptr) {
       return error::SequenceNeedsAccessToSchema();
     }
 
     std::string sequence_name;
-    if (latest_schema_->dialect() ==
+    if (latest_schema->dialect() ==
         database_api::DatabaseDialect::POSTGRESQL) {
       sequence_name = args[0].string_value();
     } else {
@@ -1024,7 +1031,7 @@ FunctionCatalog::GetInternalSequenceStateFunction(
           std::string(absl::StripPrefix(args[0].string_value(), "_sequence_"));
     }
     const backend::Sequence* sequence =
-        latest_schema_->FindSequence(sequence_name);
+        latest_schema->FindSequence(sequence_name);
     if (sequence == nullptr) {
       return error::SequenceNotFound(sequence_name);
     }
@@ -1063,7 +1070,8 @@ FunctionCatalog::GetTableColumnIdentityStateFunction(
           kGetTableColumnIdentityStateFunctionName);
     }
 
-    if (latest_schema_ == nullptr) {
+    const backend::Schema* latest_schema = GetLatestSchema();
+    if (latest_schema == nullptr) {
       return error::SequenceNeedsAccessToSchema();
     }
 
@@ -1076,7 +1084,7 @@ FunctionCatalog::GetTableColumnIdentityStateFunction(
     std::string full_table_name =
         schema_name.empty() ? table_name
                             : absl::StrCat(schema_name, ".", table_name);
-    const Table* table = latest_schema_->FindTable(full_table_name);
+    const Table* table = latest_schema->FindTable(full_table_name);
     if (table == nullptr) {
       return error::TableNotFoundInIdentityFunction(full_table_name);
     }
@@ -1119,12 +1127,13 @@ FunctionCatalog::GetNextSequenceValueFunction(const std::string& catalog_name) {
       return error::UnsupportedFunction(kGetNextSequenceValueFunctionName);
     }
 
-    if (latest_schema_ == nullptr) {
+    const backend::Schema* latest_schema = GetLatestSchema();
+    if (latest_schema == nullptr) {
       return error::SequenceNeedsAccessToSchema();
     }
 
     std::string sequence_name;
-    if (latest_schema_->dialect() ==
+    if (latest_schema->dialect() ==
         database_api::DatabaseDialect::POSTGRESQL) {
       sequence_name =
           GetFullyQualifiedNameFromPgLiteral(args[0].string_value());
@@ -1134,7 +1143,7 @@ FunctionCatalog::GetNextSequenceValueFunction(const std::string& catalog_name) {
           std::string(absl::StripPrefix(args[0].string_value(), "_sequence_"));
     }
     const backend::Sequence* sequence =
-        latest_schema_->FindSequence(sequence_name);
+        latest_schema->FindSequence(sequence_name);
     if (sequence == nullptr) {
       return error::SequenceNotFound(sequence_name);
     }

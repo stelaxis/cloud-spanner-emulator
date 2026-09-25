@@ -200,6 +200,10 @@ class ReadWriteTransaction : public RowReader, public RowWriter {
   // Catalog of schemas.
   const VersionedCatalog* const versioned_catalog_;
 
+  // Owns schema_, which a concurrent schema change may remove from the
+  // catalog. Declared before everything that points into the schema.
+  std::shared_ptr<const Schema> schema_holder_ ABSL_GUARDED_BY(mu_);
+
   // Transaction lock management.
   std::unique_ptr<LockHandle> lock_handle_;
 
@@ -212,7 +216,8 @@ class ReadWriteTransaction : public RowReader, public RowWriter {
 
   // Action Manager for the transaction.
   ActionManager* action_manager_;
-  ActionRegistry* action_registry_;
+  // Shared with the action manager, which replaces it on a schema change.
+  std::shared_ptr<ActionRegistry> action_registry_;
   std::unique_ptr<ActionContext> action_context_;
 
   // The commit timestamp chosen for this transaction.
