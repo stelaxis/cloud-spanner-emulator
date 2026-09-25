@@ -23,18 +23,10 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  rpc-deps:
-    name: RPC dependencies (${{ matrix.arch }})
+  rpc-deps-amd64:
+    name: RPC dependencies (amd64)
     if: github.ref_type != 'tag'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-24.04
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
     permissions:
       contents: read
@@ -48,38 +40,41 @@ jobs:
         run: |
           { echo '### Before build'; echo '```text'; df -h; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          cache-binary: false
       - name: Checkpoint gRPC and protobuf
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: build/docker/Dockerfile.ubuntu
           target: rpc-deps
-          platforms: linux/${{ matrix.arch }}
+          platforms: linux/amd64
           build-args: BAZEL_JOBS=${{ env.BAZEL_JOBS }}
           provenance: false
           sbom: false
           outputs: type=cacheonly
-          cache-from: type=gha,scope=emulator-rpc-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
-          cache-to: type=gha,scope=emulator-rpc-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2,mode=max,timeout=30m,ignore-error=true
+          cache-to: type=local,dest=${{ runner.temp }}/rpc-cache,mode=max,compression=zstd
+      - name: Upload complete RPC cache
+        timeout-minutes: 20
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rpc-cache-amd64
+          path: ${{ runner.temp }}/rpc-cache
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+          overwrite: true
       - name: Record disk space after build
         if: always()
         timeout-minutes: 2
         run: |
           { echo '### After build'; echo '```text'; df -h; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
-  deps:
-    name: GoogleSQL dependencies (${{ matrix.arch }})
-    needs: rpc-deps
+  deps-amd64:
+    name: GoogleSQL dependencies (amd64)
+    needs: rpc-deps-amd64
     if: github.ref_type != 'tag'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-24.04
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
     permissions:
       contents: read
@@ -93,112 +88,258 @@ jobs:
         run: |
           { echo '### Before build'; echo '```text'; df -h; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          cache-binary: false
+      - name: Download complete RPC cache
+        timeout-minutes: 20
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rpc-cache-amd64
+          path: ${{ runner.temp }}/rpc-cache
+      - name: Verify RPC cache handoff
+        run: test -s "$RUNNER_TEMP/rpc-cache/index.json"
       - name: Checkpoint GoogleSQL value before compiling analyzer
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: build/docker/Dockerfile.ubuntu
           target: deps-value
-          platforms: linux/${{ matrix.arch }}
+          platforms: linux/amd64
           build-args: BAZEL_JOBS=${{ env.BAZEL_JOBS }}
           provenance: false
           sbom: false
           outputs: type=cacheonly
-          cache-from: |
-            type=gha,scope=emulator-value-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
-            type=gha,scope=emulator-rpc-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
-          cache-to: type=gha,scope=emulator-value-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2,mode=max,timeout=30m,ignore-error=true
+          cache-from: type=local,src=${{ runner.temp }}/rpc-cache
       - name: Checkpoint GoogleSQL parser
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: build/docker/Dockerfile.ubuntu
           target: deps-parser
-          platforms: linux/${{ matrix.arch }}
+          platforms: linux/amd64
           build-args: BAZEL_JOBS=${{ env.BAZEL_JOBS }}
           provenance: false
           sbom: false
           outputs: type=cacheonly
-          cache-from: |
-            type=gha,scope=emulator-parser-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
-            type=gha,scope=emulator-value-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
-          cache-to: type=gha,scope=emulator-parser-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2,mode=max,timeout=30m,ignore-error=true
+          cache-from: type=local,src=${{ runner.temp }}/rpc-cache
       - name: Checkpoint GoogleSQL resolved AST
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: build/docker/Dockerfile.ubuntu
           target: deps-resolved-ast
-          platforms: linux/${{ matrix.arch }}
+          platforms: linux/amd64
           build-args: BAZEL_JOBS=${{ env.BAZEL_JOBS }}
           provenance: false
           sbom: false
           outputs: type=cacheonly
-          cache-from: |
-            type=gha,scope=emulator-resolved-ast-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
-            type=gha,scope=emulator-parser-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
-          cache-to: type=gha,scope=emulator-resolved-ast-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2,mode=max,timeout=30m,ignore-error=true
+          cache-from: type=local,src=${{ runner.temp }}/rpc-cache
       - name: Checkpoint GoogleSQL resolver
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: build/docker/Dockerfile.ubuntu
           target: deps-resolver
-          platforms: linux/${{ matrix.arch }}
+          platforms: linux/amd64
           build-args: BAZEL_JOBS=${{ env.BAZEL_JOBS }}
           provenance: false
           sbom: false
           outputs: type=cacheonly
-          cache-from: |
-            type=gha,scope=emulator-resolver-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
-            type=gha,scope=emulator-resolved-ast-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
-          cache-to: type=gha,scope=emulator-resolver-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2,mode=max,timeout=30m,ignore-error=true
+          cache-from: type=local,src=${{ runner.temp }}/rpc-cache
       - name: Checkpoint GoogleSQL before compiling the emulator
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: build/docker/Dockerfile.ubuntu
           target: deps
-          platforms: linux/${{ matrix.arch }}
+          platforms: linux/amd64
           build-args: BAZEL_JOBS=${{ env.BAZEL_JOBS }}
           provenance: false
           sbom: false
           outputs: type=cacheonly
-          cache-from: |
-            type=gha,scope=emulator-deps-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
-            type=gha,scope=emulator-resolver-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
-            type=gha,scope=emulator-resolved-ast-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
-            type=gha,scope=emulator-parser-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
-            type=gha,scope=emulator-value-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
-            type=gha,scope=emulator-rpc-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
-          cache-to: type=gha,scope=emulator-deps-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2,mode=max,timeout=30m,ignore-error=true
+          cache-from: type=local,src=${{ runner.temp }}/rpc-cache
+          cache-to: type=local,dest=${{ runner.temp }}/deps-cache,mode=max,compression=zstd
+      - name: Upload complete GoogleSQL cache
+        timeout-minutes: 20
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deps-cache-amd64
+          path: ${{ runner.temp }}/deps-cache
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+          overwrite: true
       - name: Record disk space after build
         if: always()
         timeout-minutes: 2
         run: |
           { echo '### After build'; echo '```text'; df -h; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
-  build:
-    name: Build (${{ matrix.arch }})
-    needs: deps
+  rpc-deps-arm64:
+    name: RPC dependencies (arm64)
+    if: github.ref_type != 'tag'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Free disk for Bazel intermediates
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Record disk space before build
+        run: |
+          { echo '### Before build'; echo '```text'; df -h; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          cache-binary: false
+      - name: Checkpoint gRPC and protobuf
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: build/docker/Dockerfile.ubuntu
+          target: rpc-deps
+          platforms: linux/arm64
+          build-args: BAZEL_JOBS=${{ env.BAZEL_JOBS }}
+          provenance: false
+          sbom: false
+          outputs: type=cacheonly
+          cache-to: type=local,dest=${{ runner.temp }}/rpc-cache,mode=max,compression=zstd
+      - name: Upload complete RPC cache
+        timeout-minutes: 20
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rpc-cache-arm64
+          path: ${{ runner.temp }}/rpc-cache
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+          overwrite: true
+      - name: Record disk space after build
+        if: always()
+        timeout-minutes: 2
+        run: |
+          { echo '### After build'; echo '```text'; df -h; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  deps-arm64:
+    name: GoogleSQL dependencies (arm64)
+    needs: rpc-deps-arm64
+    if: github.ref_type != 'tag'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Free disk for Bazel intermediates
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Record disk space before build
+        run: |
+          { echo '### Before build'; echo '```text'; df -h; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          cache-binary: false
+      - name: Download complete RPC cache
+        timeout-minutes: 20
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rpc-cache-arm64
+          path: ${{ runner.temp }}/rpc-cache
+      - name: Verify RPC cache handoff
+        run: test -s "$RUNNER_TEMP/rpc-cache/index.json"
+      - name: Checkpoint GoogleSQL value before compiling analyzer
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: build/docker/Dockerfile.ubuntu
+          target: deps-value
+          platforms: linux/arm64
+          build-args: BAZEL_JOBS=${{ env.BAZEL_JOBS }}
+          provenance: false
+          sbom: false
+          outputs: type=cacheonly
+          cache-from: type=local,src=${{ runner.temp }}/rpc-cache
+      - name: Checkpoint GoogleSQL parser
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: build/docker/Dockerfile.ubuntu
+          target: deps-parser
+          platforms: linux/arm64
+          build-args: BAZEL_JOBS=${{ env.BAZEL_JOBS }}
+          provenance: false
+          sbom: false
+          outputs: type=cacheonly
+          cache-from: type=local,src=${{ runner.temp }}/rpc-cache
+      - name: Checkpoint GoogleSQL resolved AST
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: build/docker/Dockerfile.ubuntu
+          target: deps-resolved-ast
+          platforms: linux/arm64
+          build-args: BAZEL_JOBS=${{ env.BAZEL_JOBS }}
+          provenance: false
+          sbom: false
+          outputs: type=cacheonly
+          cache-from: type=local,src=${{ runner.temp }}/rpc-cache
+      - name: Checkpoint GoogleSQL resolver
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: build/docker/Dockerfile.ubuntu
+          target: deps-resolver
+          platforms: linux/arm64
+          build-args: BAZEL_JOBS=${{ env.BAZEL_JOBS }}
+          provenance: false
+          sbom: false
+          outputs: type=cacheonly
+          cache-from: type=local,src=${{ runner.temp }}/rpc-cache
+      - name: Checkpoint GoogleSQL before compiling the emulator
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: build/docker/Dockerfile.ubuntu
+          target: deps
+          platforms: linux/arm64
+          build-args: BAZEL_JOBS=${{ env.BAZEL_JOBS }}
+          provenance: false
+          sbom: false
+          outputs: type=cacheonly
+          cache-from: type=local,src=${{ runner.temp }}/rpc-cache
+          cache-to: type=local,dest=${{ runner.temp }}/deps-cache,mode=max,compression=zstd
+      - name: Upload complete GoogleSQL cache
+        timeout-minutes: 20
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deps-cache-arm64
+          path: ${{ runner.temp }}/deps-cache
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+          overwrite: true
+      - name: Record disk space after build
+        if: always()
+        timeout-minutes: 2
+        run: |
+          { echo '### After build'; echo '```text'; df -h; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  build-amd64:
+    name: Build (amd64)
+    needs: deps-amd64
     # Required checks must fail, rather than be skipped, if a checkpoint fails.
     if: ${{ !cancelled() && github.ref_type != 'tag' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-24.04
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
     permissions:
       contents: read
     steps:
       - name: Require successful dependency checkpoints
         env:
-          DEPS_RESULT: ${{ needs.deps.result }}
+          DEPS_RESULT: ${{ needs.deps-amd64.result }}
         run: test "$DEPS_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -209,34 +350,144 @@ jobs:
         run: |
           { echo '### Before build'; echo '```text'; df -h; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      # Native runners only: do not install QEMU. mode=max retains the build
-      # stage, including Bazel's expensive GoogleSQL compilation and outputs.
+        with:
+          cache-binary: false
+          # Keep the compiled build stage until the test-builder export finishes.
+          buildkitd-config-inline: |
+            [worker.oci]
+              gc = false
+      - name: Download complete GoogleSQL cache
+        timeout-minutes: 20
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deps-cache-amd64
+          path: ${{ runner.temp }}/deps-cache
+      - name: Verify GoogleSQL cache handoff
+        run: test -s "$RUNNER_TEMP/deps-cache/index.json"
+      # Native runners only: do not install QEMU. Import the complete current-run
+      # dependency layers, including the Bazel outputs in /root/.cache/bazel.
       - name: Build native image
+        timeout-minutes: 240
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: build/docker/Dockerfile.ubuntu
-          platforms: linux/${{ matrix.arch }}
+          platforms: linux/amd64
           build-args: BAZEL_JOBS=${{ env.BAZEL_JOBS }}
           provenance: false
           sbom: false
-          tags: emulator:ci-${{ matrix.arch }}
+          tags: emulator:ci-amd64
           labels: |
             org.opencontainers.image.source=https://github.com/stelaxis/cloud-spanner-emulator
             org.opencontainers.image.revision=${{ github.sha }}
-          outputs: type=docker,dest=${{ runner.temp }}/emulator-${{ matrix.arch }}.tar
-          cache-from: |
-            type=gha,scope=emulator-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
-            type=gha,scope=emulator-deps-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
-            type=gha,scope=emulator-resolver-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
-            type=gha,scope=emulator-resolved-ast-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
-            type=gha,scope=emulator-parser-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
-            type=gha,scope=emulator-value-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
-            type=gha,scope=emulator-rpc-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2
-          cache-to: type=gha,scope=emulator-${{ matrix.arch }}-jobs-${{ env.BAZEL_JOBS }},version=2,mode=max,timeout=30m,ignore-error=true
+          outputs: type=docker,dest=${{ runner.temp }}/emulator-amd64.tar
+          cache-from: type=local,src=${{ runner.temp }}/deps-cache
       - name: Smoke-test native image
         env:
-          ARCH: ${{ matrix.arch }}
+          ARCH: amd64
+        run: |
+          docker load --input "$RUNNER_TEMP/emulator-$ARCH.tar"
+          docker run --detach --name emulator --publish 127.0.0.1:9020:9020 "emulator:ci-$ARCH"
+          trap 'docker logs emulator; docker rm --force emulator' EXIT
+          curl --fail --show-error --retry 30 --retry-delay 2 --retry-connrefused \
+            --retry-all-errors --max-time 10 localhost:9020/v1/projects/test/instances
+      - name: Export compiled amd64 test builder
+        timeout-minutes: 40
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: build/docker/Dockerfile.ubuntu
+          target: test-builder
+          platforms: linux/amd64
+          build-args: BAZEL_JOBS=${{ env.BAZEL_JOBS }}
+          provenance: false
+          sbom: false
+          tags: emulator:tests
+          outputs: type=docker,dest=${{ runner.temp }}/test-builder.tar
+      - name: Record test builder archive size
+        run: du -h "$RUNNER_TEMP/test-builder.tar" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload compiled amd64 test builder
+        timeout-minutes: 20
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-builder-amd64
+          path: ${{ runner.temp }}/test-builder.tar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+          overwrite: true
+      # Only runtime images cross into the publishing job; no registry token is
+      # available to either the Docker build or pull-request code.
+      - name: Upload runtime image
+        if: github.event_name == 'push'
+        timeout-minutes: 20
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: emulator-amd64
+          path: ${{ runner.temp }}/emulator-amd64.tar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Record disk space after build
+        if: always()
+        timeout-minutes: 2
+        run: |
+          { echo '### After build'; echo '```text'; df -h; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  build-arm64:
+    name: Build (arm64)
+    needs: deps-arm64
+    # Required checks must fail, rather than be skipped, if a checkpoint fails.
+    if: ${{ !cancelled() && github.ref_type != 'tag' }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    steps:
+      - name: Require successful dependency checkpoints
+        env:
+          DEPS_RESULT: ${{ needs.deps-arm64.result }}
+        run: test "$DEPS_RESULT" = success
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Free disk for Bazel intermediates
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Record disk space before build
+        run: |
+          { echo '### Before build'; echo '```text'; df -h; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          cache-binary: false
+      - name: Download complete GoogleSQL cache
+        timeout-minutes: 20
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deps-cache-arm64
+          path: ${{ runner.temp }}/deps-cache
+      - name: Verify GoogleSQL cache handoff
+        run: test -s "$RUNNER_TEMP/deps-cache/index.json"
+      # Native runners only: do not install QEMU. Import the complete current-run
+      # dependency layers, including the Bazel outputs in /root/.cache/bazel.
+      - name: Build native image
+        timeout-minutes: 300
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: build/docker/Dockerfile.ubuntu
+          platforms: linux/arm64
+          build-args: BAZEL_JOBS=${{ env.BAZEL_JOBS }}
+          provenance: false
+          sbom: false
+          tags: emulator:ci-arm64
+          labels: |
+            org.opencontainers.image.source=https://github.com/stelaxis/cloud-spanner-emulator
+            org.opencontainers.image.revision=${{ github.sha }}
+          outputs: type=docker,dest=${{ runner.temp }}/emulator-arm64.tar
+          cache-from: type=local,src=${{ runner.temp }}/deps-cache
+      - name: Smoke-test native image
+        env:
+          ARCH: arm64
         run: |
           docker load --input "$RUNNER_TEMP/emulator-$ARCH.tar"
           docker run --detach --name emulator --publish 127.0.0.1:9020:9020 "emulator:ci-$ARCH"
@@ -247,10 +498,11 @@ jobs:
       # available to either the Docker build or pull-request code.
       - name: Upload runtime image
         if: github.event_name == 'push'
+        timeout-minutes: 20
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: emulator-${{ matrix.arch }}
-          path: ${{ runner.temp }}/emulator-${{ matrix.arch }}.tar
+          name: emulator-arm64
+          path: ${{ runner.temp }}/emulator-arm64.tar
           if-no-files-found: error
           compression-level: 0
           retention-days: 1
@@ -262,7 +514,7 @@ jobs:
 
   test-shards:
     name: Tests (${{ matrix.area }})
-    needs: build
+    needs: build-amd64
     if: github.ref_type != 'tag'
     strategy:
       fail-fast: false
@@ -296,64 +548,28 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
       - name: Free disk for Bazel intermediates
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - name: Record disk space before build
         run: |
           { echo '### Before build'; echo '```text'; df -h; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - name: Add test stage to upstream builder
-        run: |
-          cp build/docker/Dockerfile.ubuntu "$RUNNER_TEMP/Dockerfile.test"
-          cat >> "$RUNNER_TEMP/Dockerfile.test" <<'EOF'
-
-          FROM build AS test-builder
-          # The full suite includes tests/gcloud, unlike the runtime-only build.
-          RUN curl --fail --location --retry 3 \
-                https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-586.0.0-linux-x86_64.tar.gz \
-                --output /tmp/gcloud.tar.gz \
-              && echo '6c774c76793eedd501150b59da653610fbe3eaac169e822965b722de75a2f001  /tmp/gcloud.tar.gz' | sha256sum --check - \
-              && tar -xzf /tmp/gcloud.tar.gz -C /opt \
-              && rm /tmp/gcloud.tar.gz
-          ENV GCLOUD_DIR=/opt/google-cloud-sdk/bin
-          RUN /opt/google-cloud-sdk/bin/gcloud version
-          EOF
-      - name: Load cached builder with test tools
-        id: test-builder
-        timeout-minutes: 75
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      # Loading an artifact cannot trigger compilation or cache-miss fallbacks.
+      - name: Download compiled amd64 test builder
+        timeout-minutes: 20
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          context: .
-          file: ${{ runner.temp }}/Dockerfile.test
-          target: test-builder
-          platforms: linux/amd64
-          build-args: BAZEL_JOBS=${{ env.BAZEL_JOBS }}
-          provenance: false
-          sbom: false
-          tags: emulator:tests
-          load: true
-          cache-from: |
-            type=gha,scope=emulator-amd64-jobs-${{ env.BAZEL_JOBS }},version=2
-            type=gha,scope=emulator-deps-amd64-jobs-${{ env.BAZEL_JOBS }},version=2
-            type=gha,scope=emulator-resolver-amd64-jobs-${{ env.BAZEL_JOBS }},version=2
-            type=gha,scope=emulator-resolved-ast-amd64-jobs-${{ env.BAZEL_JOBS }},version=2
-            type=gha,scope=emulator-parser-amd64-jobs-${{ env.BAZEL_JOBS }},version=2
-            type=gha,scope=emulator-value-amd64-jobs-${{ env.BAZEL_JOBS }},version=2
-            type=gha,scope=emulator-rpc-amd64-jobs-${{ env.BAZEL_JOBS }},version=2
-      - name: Explain a failed builder cache load
-        if: failure() && steps.test-builder.outcome == 'failure'
-        run: |
-          echo '::error::Could not load the test builder. The build-stage cache may be missing or evicted; the 75-minute load budget cannot cover a cold rebuild. Check the preceding BuildKit log for cache misses or another build error, then rerun the native build to restore its cache.'
+          name: test-builder-amd64
+          path: ${{ runner.temp }}/test-builder
+      - name: Load compiled amd64 test builder
+        timeout-minutes: 30
+        run: docker load --input "$RUNNER_TEMP/test-builder/test-builder.tar"
       - name: Record disk space after loading builder
         run: |
           { echo '### After loading test builder'; echo '```text'; df -h; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Run upstream shard inside builder
         id: tests
-        # 75 min for loading + 255 for tests leaves 30 min for setup and logs.
-        timeout-minutes: 255
+        # 20 min download + 30 load + 285 tests leaves 25 min for setup/logs.
+        timeout-minutes: 285
         env:
           TEST_TARGETS: ${{ matrix.targets }}
         run: |
@@ -409,7 +625,7 @@ jobs:
   publish:
     name: Publish multi-arch image
     if: github.event_name == 'push' && github.ref_type == 'branch' && github.repository == 'stelaxis/cloud-spanner-emulator'
-    needs: [build, unit-tests]
+    needs: [build-amd64, build-arm64, unit-tests]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -423,6 +639,8 @@ jobs:
           path: ${{ runner.temp }}/images
           merge-multiple: true
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          cache-binary: false
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -462,6 +680,8 @@ jobs:
       IMAGE: ghcr.io/stelaxis/cloud-spanner-emulator
     steps:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          cache-binary: false
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
