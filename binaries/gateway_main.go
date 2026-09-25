@@ -61,6 +61,10 @@ var (
 	enableQueryKeyPushdown = flag.Bool("enable_query_key_pushdown", true,
 		"If true, primary key predicates in SQL narrow the key ranges a statement reads, and so "+
 			"the ranges its read-write transaction validates at commit.")
+	dataDir = flag.String("data_dir", os.Getenv("SPANNER_EMULATOR_DATA_DIR"),
+		"If set, the emulator keeps its instances, databases, schemas and data in this "+
+			"directory and recovers them on restart, including after a crash. Empty keeps "+
+			"everything in memory. Defaults to $SPANNER_EMULATOR_DATA_DIR.")
 	overrideMaxDatabasesPerInstance = flag.Int("override_max_databases_per_instance", 100,
 		"If set at a value greater than the default limit of Spanner, overrides the allowed "+
 			"maximum number of databases per instance. If the "+
@@ -175,6 +179,7 @@ func main() {
 		RemoteFunctionsHostPort:                        *remoteFunctionsHostPort,
 		AbortCurrentTransactionProbability:             *abortCurrentTransactionProbability,
 		DisableQueryKeyPushdown:                        !*enableQueryKeyPushdown,
+		DataDir:                                        *dataDir,
 	}
 	gw := gateway.New(gwopts)
 	gw.Run()

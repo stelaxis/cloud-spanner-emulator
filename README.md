@@ -197,8 +197,9 @@ Notable limitations:
   https://cloud.google.com/spanner/docs/transactions) applies to the Cloud
   Spanner service as well.
 
-- The emulator does not support persistence - all data is kept in memory and
-  discarded when the emulator terminates.
+- By default all data is kept in memory and discarded when the emulator
+  terminates. This fork can keep it in a directory across restarts with
+  `--data_dir`; see [docs/persistence.md](docs/persistence.md).
 
 - Error messages may not be consistent between the emulator and the Cloud
   Spanner service. Error messages are not part of Cloud Spanner's API contract
