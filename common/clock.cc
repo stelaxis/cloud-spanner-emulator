@@ -60,16 +60,18 @@ absl::Time Clock::Now() {
   }
   last_system_time_ = now;
 
-  if (last_dispensed_time_ > lease_) {
-    absl::StatusOr<absl::Time> lease = extend_lease_(last_dispensed_time_);
-    if (!lease.ok() || *lease < last_dispensed_time_) {
-      std::fprintf(stderr, "Cannot extend the durable clock lease: %s\n",
-                   lease.status().ToString().c_str());
-      std::abort();
-    }
-    lease_ = *lease;
-  }
+  if (last_dispensed_time_ > lease_) ExtendLeaseLocked(last_dispensed_time_);
   return last_dispensed_time_;
+}
+
+void Clock::ExtendLeaseLocked(absl::Time needed) {
+  absl::StatusOr<absl::Time> lease = extend_lease_(needed);
+  if (!lease.ok() || *lease < needed) {
+    std::fprintf(stderr, "Cannot extend the durable clock lease: %s\n",
+                 lease.status().ToString().c_str());
+    std::abort();
+  }
+  lease_ = std::max(lease_, *lease);
 }
 
 void Clock::AdvanceTo(absl::Time floor) {
@@ -83,13 +85,9 @@ void Clock::SetLease(absl::Time lease, LeaseExtender extend) {
   extend_lease_ = std::move(extend);
 }
 
-absl::Status Clock::CoverWithLease(absl::Time timestamp) {
+void Clock::CoverWithLease(absl::Time timestamp) {
   absl::MutexLock lock(mu_);
-  if (!extend_lease_ || timestamp <= lease_) return absl::OkStatus();
-  absl::StatusOr<absl::Time> lease = extend_lease_(timestamp);
-  if (!lease.ok()) return lease.status();
-  lease_ = std::max(lease_, *lease);
-  return absl::OkStatus();
+  if (extend_lease_ && timestamp > lease_) ExtendLeaseLocked(timestamp);
 }
 
 absl::Time Clock::lease() {

@@ -74,6 +74,11 @@ class ReadOnlyTransaction : public RowReader {
   // Picks a read timestamp given transaction type and timestamp bound.
   absl::Time PickReadTimestamp();
 
+  // Waits until state at the read timestamp can be read, and covers it with
+  // the clock lease. Everything the transaction serves (Read, schema())
+  // passes through here first.
+  void WaitUntilReadable() const;
+
   // Returns the schema at the read timestamp, which this transaction owns from
   // the first call on, so that a schema change cannot free it.
   std::shared_ptr<const Schema> SchemaShared() const

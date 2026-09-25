@@ -38,8 +38,11 @@ namespace frontend {
 // ServerEnv encapsulates global objects for Cloud Spanner Emulator.
 class ServerEnv {
  public:
-  ServerEnv()
-      : clock_(new Clock()),
+  ServerEnv() : ServerEnv(std::make_unique<Clock>()) {}
+
+  // Uses `clock`, which a test can give a system clock of its own.
+  explicit ServerEnv(std::unique_ptr<Clock> clock)
+      : clock_(std::move(clock)),
         database_manager_(new DatabaseManager(clock_.get())),
         instance_manager_(new InstanceManager()),
         instance_partition_manager_(new InstancePartitionManager()),

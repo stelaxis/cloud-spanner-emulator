@@ -61,13 +61,18 @@
 #include "frontend/persistence/mem_file_system.h"
 #include "frontend/persistence/persistence.pb.h"
 #include "frontend/server/environment.h"
+#include "frontend/server/handler.h"
+#include "frontend/server/request_context.h"
 #include "gmock/gmock.h"
 #include "google/protobuf/descriptor.pb.h"
 #include "google/protobuf/text_format.h"
 #include "google/spanner/admin/database/v1/common.pb.h"
 #include "google/spanner/admin/instance/v1/spanner_instance_admin.pb.h"
+#include "google/spanner/v1/result_set.pb.h"
+#include "google/spanner/v1/spanner.pb.h"
 #include "googlesql/base/testing/status_matchers.h"
 #include "googlesql/public/value.h"
+#include "grpcpp/support/sync_stream.h"
 #include "gtest/gtest.h"
 
 namespace google {
@@ -82,6 +87,19 @@ using ::googlesql::values::String;
 using ::googlesql_base::testing::StatusIs;
 using Op = MemFileSystem::Op;
 namespace database_api = ::google::spanner::admin::database::v1;
+
+namespace spanner_api = ::google::spanner::v1;
+
+// Captures what a streaming handler sends.
+template <class MessageT>
+struct CollectingWriter : public grpc::ServerWriterInterface<MessageT> {
+  void SendInitialMetadata() override {}
+  bool Write(const MessageT& msg, grpc::WriteOptions options) override {
+    messages.push_back(msg);
+    return true;
+  }
+  std::vector<MessageT> messages;
+};
 
 constexpr char kInstance[] = "projects/p/instances/i1";
 constexpr char kDatabase[] = "projects/p/instances/i1/databases/db1";
@@ -179,15 +197,23 @@ class PersistenceTest : public ::testing::Test {
   std::shared_ptr<Database> CreateDatabase(
       Emulator* emulator, const std::string& uri = kDatabase,
       const std::vector<std::string>& schema = kSchema) {
-    if (!emulator->instances->GetInstance(kInstance).ok()) {
+    return CreateDatabase(emulator->instances.get(), emulator->databases.get(),
+                          uri, schema);
+  }
+
+  std::shared_ptr<Database> CreateDatabase(
+      InstanceManager* instances, DatabaseManager* databases,
+      const std::string& uri = kDatabase,
+      const std::vector<std::string>& schema = kSchema) {
+    if (!instances->GetInstance(kInstance).ok()) {
       admin::instance::v1::Instance instance;
       instance.set_config("projects/p/instanceConfigs/emulator-config");
       instance.set_display_name("i1");
       instance.set_node_count(1);
       GOOGLESQL_EXPECT_OK(
-          emulator->instances->CreateInstance(kInstance, instance).status());
+          instances->CreateInstance(kInstance, instance).status());
     }
-    auto database = emulator->databases->CreateDatabase(
+    auto database = databases->CreateDatabase(
         uri, backend::SchemaChangeOperation{
                  .statements = schema,
                  .database_dialect =
@@ -1276,6 +1302,189 @@ TEST_F(PersistenceTest, ServedReadTimestampsAreCoveredAcrossARestart) {
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(absl::Time after,
                                  Commit(db.get(), InsertAccount("b", 1)));
   EXPECT_GT(after, served);
+}
+
+// The values a single-use read-only query at `timestamp` returns through the
+// ExecuteSql or ExecuteStreamingSql handler, as strings.
+absl::StatusOr<std::vector<std::string>> QueryThroughTheHandler(
+    ServerEnv* env, const std::string& session, const std::string& sql,
+    absl::Time timestamp, bool streaming,
+    spanner_api::ExecuteSqlRequest::QueryMode mode =
+        spanner_api::ExecuteSqlRequest::NORMAL) {
+  spanner_api::ExecuteSqlRequest request;
+  request.set_session(session);
+  request.set_sql(sql);
+  request.set_query_mode(mode);
+  GOOGLESQL_RETURN_IF_ERROR(
+      EncodeTime(timestamp, request.mutable_transaction()
+                                ->mutable_single_use()
+                                ->mutable_read_only()
+                                ->mutable_read_timestamp()));
+  RequestContext ctx(env, /*grpc=*/nullptr);
+  std::vector<std::string> values;
+  auto add = [&](const google::protobuf::Value& value) {
+    values.push_back(value.has_string_value() ? value.string_value()
+                                              : value.ShortDebugString());
+  };
+  if (streaming) {
+    auto* handler = dynamic_cast<ServerStreamingGRPCHandler<
+        spanner_api::ExecuteSqlRequest, spanner_api::PartialResultSet>*>(
+        GetHandler("Spanner", "ExecuteStreamingSql"));
+    if (handler == nullptr) return absl::InternalError("no handler");
+    CollectingWriter<spanner_api::PartialResultSet> writer;
+    GOOGLESQL_RETURN_IF_ERROR(handler->Run(&ctx, &request, &writer));
+    for (const auto& partial : writer.messages) {
+      if (partial.chunked_value()) return absl::InternalError("chunked");
+      for (const auto& value : partial.values()) add(value);
+    }
+  } else {
+    auto* handler =
+        dynamic_cast<UnaryGRPCHandler<spanner_api::ExecuteSqlRequest,
+                                      spanner_api::ResultSet>*>(
+            GetHandler("Spanner", "ExecuteSql"));
+    if (handler == nullptr) return absl::InternalError("no handler");
+    spanner_api::ResultSet result;
+    GOOGLESQL_RETURN_IF_ERROR(handler->Run(&ctx, &request, &result));
+    for (const auto& row : result.rows()) {
+      for (const auto& value : row.values()) add(value);
+    }
+  }
+  return values;
+}
+
+constexpr char kListTables[] =
+    "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+    "WHERE TABLE_SCHEMA = '' ORDER BY TABLE_NAME";
+
+TEST_F(PersistenceTest, SchemaServedBySqlAtAFutureTimestampIsCovered) {
+  // INFORMATION_SCHEMA rows come from the transaction's schema, not from
+  // ReadOnlyTransaction::Read. A query at a future timestamp serves them once
+  // it has passed; the lease must cover it then, or after a crash with the
+  // system clock stepped back a schema change could land at or below it.
+  absl::Mutex mu;
+  absl::Duration offset = absl::ZeroDuration();
+  auto system_now = [&]() {
+    absl::MutexLock lock(mu);
+    return absl::Now() + offset;
+  };
+  for (bool streaming : {false, true}) {
+    SCOPED_TRACE(streaming ? "ExecuteStreamingSql" : "ExecuteSql");
+    const std::string dir = streaming ? "/streaming" : "/unary";
+    auto start = [&]() {
+      auto env =
+          std::make_unique<ServerEnv>(std::make_unique<Clock>(system_now));
+      PersistenceOptions options;
+      options.fs = &fs_;
+      options.dir = dir;
+      options.background_checkpoints = false;
+      GOOGLESQL_EXPECT_OK(env->EnablePersistence(options));
+      return env;
+    };
+    {
+      absl::MutexLock lock(mu);
+      offset = absl::ZeroDuration();
+    }
+    auto env = start();
+    auto db = CreateDatabase(env->instance_manager(), env->database_manager());
+    ASSERT_NE(db, nullptr);
+    GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+        auto session,
+        env->session_manager()->CreateSession({}, /*multiplexed=*/false, db,
+                                              /*mux_txn_manager=*/nullptr));
+    const std::string session_uri = session->session_uri();
+    session.reset();
+    const absl::Time future = env->clock()->Now() + absl::Seconds(2);
+    GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+        std::vector<std::string> served,
+        QueryThroughTheHandler(env.get(), session_uri, kListTables, future,
+                               streaming));
+    EXPECT_THAT(served,
+                ::testing::ElementsAre("Accounts", "Entries", "Transfers"));
+    db.reset();
+    env.reset();
+    fs_.Crash();
+    {
+      absl::MutexLock lock(mu);
+      offset = -absl::Hours(1);
+    }
+    env = start();
+    EXPECT_GT(env->persistence()->restart_floor(), future);
+    GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+        db, env->database_manager()->GetDatabase(kDatabase));
+    int successful;
+    absl::Time changed;
+    absl::Status backfill;
+    GOOGLESQL_ASSERT_OK(db->backend()->UpdateSchema(
+        backend::SchemaChangeOperation{
+            .statements = {"CREATE TABLE Later (Id INT64) PRIMARY KEY (Id)"},
+            .database_dialect =
+                database_api::DatabaseDialect::GOOGLE_STANDARD_SQL},
+        &successful, &changed, &backfill));
+    EXPECT_GT(changed, future);
+    // The query at that timestamp never answers differently: the schema has
+    // not changed at or before it, and it is below the restart floor.
+    GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+        session,
+        env->session_manager()->CreateSession({}, /*multiplexed=*/false, db,
+                                              /*mux_txn_manager=*/nullptr));
+    absl::StatusOr<std::vector<std::string>> again = QueryThroughTheHandler(
+        env.get(), session->session_uri(), kListTables, future, streaming);
+    if (again.ok()) {
+      EXPECT_EQ(*again, served);
+    } else {
+      EXPECT_THAT(again.status(),
+                  StatusIs(absl::StatusCode::kFailedPrecondition));
+    }
+    session.reset();
+    db.reset();
+    env.reset();
+  }
+}
+
+TEST_F(PersistenceTest, EverySqlAnswerAtAFutureTimestampIsCovered) {
+  // Whatever a read-only query returns (rows, the schema, constants, a plan)
+  // is returned only once the lease covers its read timestamp.
+  ServerEnv env;
+  PersistenceOptions options;
+  options.fs = &fs_;
+  options.dir = "/data";
+  options.background_checkpoints = false;
+  GOOGLESQL_ASSERT_OK(env.EnablePersistence(options));
+  auto db = CreateDatabase(env.instance_manager(), env.database_manager());
+  ASSERT_NE(db, nullptr);
+  GOOGLESQL_ASSERT_OK(Commit(db.get(), InsertAccount("a", 1)).status());
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto session,
+      env.session_manager()->CreateSession({}, /*multiplexed=*/false, db,
+                                           /*mux_txn_manager=*/nullptr));
+  const struct {
+    std::string sql;
+    spanner_api::ExecuteSqlRequest::QueryMode mode;
+  } queries[] = {
+      {kListTables, spanner_api::ExecuteSqlRequest::NORMAL},
+      {"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+       "WHERE TABLE_NAME = 'Accounts'",
+       spanner_api::ExecuteSqlRequest::NORMAL},
+      {"SELECT * FROM SPANNER_SYS.SUPPORTED_OPTIMIZER_VERSIONS",
+       spanner_api::ExecuteSqlRequest::NORMAL},
+      {"SELECT 1", spanner_api::ExecuteSqlRequest::NORMAL},
+      {"SELECT CURRENT_TIMESTAMP()", spanner_api::ExecuteSqlRequest::NORMAL},
+      {"SELECT COUNT(*) FROM Accounts", spanner_api::ExecuteSqlRequest::NORMAL},
+      {"SELECT Id FROM Accounts", spanner_api::ExecuteSqlRequest::PLAN},
+  };
+  for (bool streaming : {false, true}) {
+    for (const auto& query : queries) {
+      SCOPED_TRACE(absl::StrCat(streaming ? "streaming " : "unary ", query.mode,
+                                " ", query.sql));
+      const absl::Time future = env.clock()->Now() + absl::Milliseconds(500);
+      ASSERT_LT(env.clock()->lease(), future);
+      GOOGLESQL_ASSERT_OK(QueryThroughTheHandler(&env, session->session_uri(),
+                                                 query.sql, future, streaming,
+                                                 query.mode)
+                              .status());
+      EXPECT_GE(env.clock()->lease(), future);
+    }
+  }
 }
 
 TEST_F(PersistenceTest, FutureReadBoundsDoNotStallTheRestartedClock) {

@@ -66,14 +66,17 @@ class Clock {
       ABSL_LOCKS_EXCLUDED(mu_);
 
   // Extends the lease, durably, to cover `timestamp` if it does not already:
-  // for a read timestamp a caller chose, before data is served at it. OK
-  // without a lease.
-  absl::Status CoverWithLease(absl::Time timestamp) ABSL_LOCKS_EXCLUDED(mu_);
+  // for a read timestamp a caller chose, before anything is served at it.
+  // Aborts, as Now() does, if the lease cannot be extended.
+  void CoverWithLease(absl::Time timestamp) ABSL_LOCKS_EXCLUDED(mu_);
 
   // The current lease, or InfiniteFuture without one.
   absl::Time lease() ABSL_LOCKS_EXCLUDED(mu_);
 
  private:
+  // Extends the lease to at least `needed`, or aborts.
+  void ExtendLeaseLocked(absl::Time needed) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
   // Returns the system time at microsecond granularity.
   absl::Time SystemNowMicros() const;
 
