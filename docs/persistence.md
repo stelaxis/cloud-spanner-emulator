@@ -64,12 +64,14 @@ another emulator process`.
   The emulator never hands out a timestamp past a synced lease, which it
   extends about 250 ms ahead at a time; it restarts above that lease, so its
   clock can run up to that much ahead of the system clock right after a
-  restart, and the first reads wait that out. Data is served at a read
-  timestamp only once that timestamp has passed (a read at a future
+  restart, and the first reads wait that out. A read-only transaction
+  answers a read or a query (rows, the schema `INFORMATION_SCHEMA` shows, or
+  even `SELECT 1`) only once its timestamp has passed (a read at a future
   `read_timestamp` or `min_read_timestamp` waits for it) and the lease covers
-  it, so no commit after a crash lands at or below a timestamp data was read
-  at. `BeginTransaction` returning a future timestamp does not move the
-  clock. The whole timestamp range Spanner accepts is accepted.
+  it, so no commit or schema change after a crash lands at or below a
+  timestamp something was read at. `BeginTransaction` returning a future
+  timestamp does not move the clock. The whole timestamp range Spanner
+  accepts is accepted.
 * **Sequences** never hand out a value twice. The emulator reserves 1000
   counter values at a time and syncs the reservation before handing out any of
   them. After a crash, a sequence continues after its last reservation, so up
