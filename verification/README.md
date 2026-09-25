@@ -308,23 +308,37 @@ regression schedule in
 the old model, it fails 65 of 2000 schedules and shrinks to
 `delete B{0}; delete B{0}; insert B{0}; update B{0}`.
 
-**Upstream bug found:** a RW `Read` of an empty open range such as `(2,2)`
-crashes the emulator process (SIGSEGV, exit 139), once the transaction has
-buffered a write in that table. `KeyRange::ToClosedOpen` turns `(k,k)` into
-`[succ(k), k)`, with start after limit (`backend/datamodel/key_range.cc:126-140`).
-`TransactionStore::Read` then walks the buffered ops from `lower_bound(start)`
-until it reaches `lower_bound(limit)`, which is earlier in the map, so it runs
-off the end (`backend/transaction/transaction_store.cc:256-259`). Reproduce
-with:
+**Empty-range crash (fixed on this fork):** upstream 1.5.58 crashes
+(SIGSEGV, exit 139) on a RW `Read` of `(2,2)` once the transaction has
+buffered a write in that table. `KeyRange::ToClosedOpen` produces
+`[succ(k), k)`, and `TransactionStore::Read` walked the buffered ops from
+`lower_bound(start)` towards `lower_bound(limit)`, which is earlier in the
+map, so it ran off the end. It now skips the buffer scan when start >= limit,
+as `InMemoryStorage::Read` already does. Delete-range mutations flatten
+through the same read, so empty deletes were affected too. Lock acquisition
+and pending-commit-timestamp checks are unchanged.
+
+The former crash repro is now `testdata/regression_empty_open_range.jsonl`:
+its equal-bound and inverted reads return zero rows, and later reads keep both
+updated rows. `testdata/regression_*.jsonl` are schedules that must match;
+replay each with `-schedule` against an `emulator_main` built from this fork:
 
 ```sh
-go run . -schedule testdata/upstream_crash_empty_open_range.jsonl
+SPANNER_EMULATOR_HOST=localhost:19110 mise exec go@1.25 -- go run . \
+  -schedule testdata/regression_empty_open_range.jsonl
+SPANNER_EMULATOR_HOST=localhost:19110 mise exec go@1.25 -- go run . -seeds 2000
 ```
 
-`testdata/regression_*.jsonl` are schedules that must match; replay each with
-`-schedule`.
-
-The generator avoids empty ranges so the rest of the run can proceed.
+The generator draws range endpoints independently. With six keys, 5/12 of
+generated ranges are inverted and 1/6 have equal endpoints (with
+independently chosen inclusivity). The 1.5.58 results above predate this and
+used a generator that avoided empty ranges. Against `emulator_main` built from
+this fork, seeds 1–2000 of the current generator give 2000 schedules, 32,880
+steps, **0** mismatches, 4,623 / 4,623 `ABORTED`; 2,601 of their 4,994 range
+operations (reads, SQL, DML) are empty or inverted. The Lean models need no
+change: `KeySpec.contains` checks both endpoints and `rowsOf` / `matched`
+filter by it, so empty ranges already read as empty.
+`TestEmptyRangeRegressionModel` asserts this for the regression schedule.
 
 ## L2: persistence protocol and crash conformance
 

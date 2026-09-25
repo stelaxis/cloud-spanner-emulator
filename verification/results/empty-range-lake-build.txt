@@ -1,0 +1,35 @@
+$ lake build
+ℹ [18/36] Replayed TxnSpec.PersistenceCounterexamples
+info: TxnSpec/PersistenceCounterexamples.lean:219:0: 'TxnSpec.Persistence.durability' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:220:0: 'TxnSpec.Persistence.atomicity' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:221:0: 'TxnSpec.Persistence.log_monotone' depends on axioms: [propext]
+info: TxnSpec/PersistenceCounterexamples.lean:222:0: 'TxnSpec.Persistence.physical_recovery' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:223:0: 'TxnSpec.Persistence.next_sequence_physical' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:224:0: 'TxnSpec.Persistence.checkpoint_safety' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:225:0: 'TxnSpec.Persistence.served_within_lease' depends on axioms: [propext, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:226:0: 'TxnSpec.Persistence.acknowledged_within_lease' depends on axioms: [propext, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:227:0: 'TxnSpec.Persistence.every_post_restart_timestamp' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:228:0: 'TxnSpec.Persistence.storage_sequences_never_reissue' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:229:0: 'TxnSpec.Persistence.acknowledged_drop_recovered' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:230:0: 'TxnSpec.Persistence.instance_drop_survives' depends on axioms: [propext]
+info: TxnSpec/PersistenceCounterexamples.lean:231:0: 'TxnSpec.Persistence.product_target_inv' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:232:0: 'TxnSpec.Persistence.product_recovered_rows' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:233:0: 'TxnSpec.Persistence.product_recovered_target_rows' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:234:0: 'TxnSpec.Persistence.product_visible_rows' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:235:0: 'TxnSpec.Persistence.product_timestamp_mapping' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:236:0: 'TxnSpec.Persistence.target_serializable_across_restarts' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:237:0: 'TxnSpec.Persistence.early_ack_loses_durability' depends on axioms: [propext]
+info: TxnSpec/PersistenceCounterexamples.lean:238:0: 'TxnSpec.Persistence.early_truncate_loses_recovery' depends on axioms: [propext, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:239:0: 'TxnSpec.Persistence.correct_recovery_excludes_early_truncate' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:240:0: 'TxnSpec.Persistence.wall_restart_regresses' depends on axioms: [propext]
+info: TxnSpec/PersistenceCounterexamples.lean:241:0: 'TxnSpec.Persistence.correct_restart_excludes_regression' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:242:0: 'TxnSpec.Persistence.rerun_backfill_changes_rows' depends on axioms: [propext, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:243:0: 'TxnSpec.Persistence.correct_quiescence_excludes_rerun' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: TxnSpec/PersistenceCounterexamples.lean:244:0: 'TxnSpec.Persistence.covered_wal_replay_is_wrong' depends on axioms: [propext]
+info: TxnSpec/PersistenceCounterexamples.lean:245:0: 'TxnSpec.Persistence.per_database_gate_reorders_wal' depends on axioms: [propext]
+info: TxnSpec/PersistenceCounterexamples.lean:246:0: 'TxnSpec.Persistence.cursor_reset_reissues' does not depend on any axioms
+ℹ [21/36] Replayed TxnSpec.RestartJson
+info: TxnSpec/RestartJson.lean:122:0: 'TxnSpec.Json.runRestartModel_target_inv' depends on axioms: [propext, Classical.choice, Quot.sound]
+Build completed successfully (36 jobs).

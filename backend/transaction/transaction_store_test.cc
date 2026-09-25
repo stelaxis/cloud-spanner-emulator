@@ -17,6 +17,7 @@
 #include "backend/transaction/transaction_store.h"
 
 #include <memory>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -148,6 +149,53 @@ class TransactionStoreTest : public testing::Test {
     return googlesql_base::testing::IsOkAndHolds(testing::ElementsAreArray(rows));
   }
 };
+
+class EmptyRangeTransactionStoreTest
+    : public TransactionStoreTest,
+      public testing::WithParamInterface<std::tuple<KeyRange, bool>> {};
+
+TEST_P(EmptyRangeTransactionStoreTest, ReadsNoRows) {
+  const auto& [range, buffer_writes] = GetParam();
+  const absl::Time now = absl::Now();
+  for (int key : {1, 2, 3}) {
+    GOOGLESQL_ASSERT_OK(Write(now, Key({Int64(key)}),
+                            {Int64(key), String("value")}));
+  }
+  if (buffer_writes) {
+    GOOGLESQL_ASSERT_OK(BufferInsert(Key({Int64(4)}), {int64_col_, string_col_},
+                                    {Int64(4), String("inserted")}));
+    GOOGLESQL_ASSERT_OK(
+        BufferUpdate(Key({Int64(2)}), {string_col_}, {String("updated")}));
+    GOOGLESQL_ASSERT_OK(BufferDelete(Key({Int64(3)})));
+  }
+
+  EXPECT_THAT(Read(range.ToClosedOpen()), IsOkAndHoldsRows({}));
+  // Empty reads must not disturb either committed or buffered rows.
+  if (buffer_writes) {
+    EXPECT_THAT(ReadAll(), IsOkAndHoldsRows({{Int64(1), String("value")},
+                                           {Int64(2), String("updated")},
+                                           {Int64(4), String("inserted")}}));
+  } else {
+    EXPECT_THAT(ReadAll(), IsOkAndHoldsRows({{Int64(1), String("value")},
+                                           {Int64(2), String("value")},
+                                           {Int64(3), String("value")}}));
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    EmptyRanges, EmptyRangeTransactionStoreTest,
+    testing::Combine(
+        testing::Values(
+            KeyRange::OpenOpen(Key({Int64(2)}), Key({Int64(2)})),
+            KeyRange::ClosedOpen(Key({Int64(2)}), Key({Int64(2)})),
+            KeyRange::OpenClosed(Key({Int64(2)}), Key({Int64(2)})),
+            KeyRange::ClosedOpen(Key({Int64(5)}), Key({Int64(1)})),
+            KeyRange::ClosedClosed(Key({Int64(5)}), Key({Int64(1)})),
+            KeyRange::OpenOpen(Key({Int64(5)}), Key({Int64(1)})),
+            KeyRange::OpenClosed(Key({Int64(5)}), Key({Int64(1)})),
+            KeyRange::OpenOpen(Key({Int64(2)}), Key({Int64(2), Int64(1)})),
+            KeyRange::Empty()),
+        testing::Bool()));
 
 TEST_F(TransactionStoreTest, CanReadBufferedWrites) {
   // Populate the table with some data.
