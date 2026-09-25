@@ -85,6 +85,9 @@ class InMemoryStorage : public Storage {
                          ColumnID dropped_column_id) override
       ABSL_LOCKS_EXCLUDED(mu_);
 
+  void RollBackVersionsAt(absl::Time timestamp) override
+      ABSL_LOCKS_EXCLUDED(mu_);
+
  private:
   using Cell = std::map<absl::Time, googlesql::Value>;
   using Row = absl::flat_hash_map<ColumnID, Cell>;

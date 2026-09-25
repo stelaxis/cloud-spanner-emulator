@@ -114,6 +114,9 @@ class RecordingStorage : public Storage {
                          ColumnID column_id) override {
     base_->MarkDroppedColumn(timestamp, table_id, column_id);
   }
+  void RollBackVersionsAt(absl::Time timestamp) override {
+    base_->RollBackVersionsAt(timestamp);
+  }
 
  private:
   Storage* const base_;

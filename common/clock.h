@@ -62,7 +62,11 @@ class Clock {
   // cannot.
   using LeaseExtender =
       std::function<absl::StatusOr<absl::Time>(absl::Time needed)>;
-  void SetLease(absl::Time lease, LeaseExtender extend)
+  //
+  // CoverWithLease refuses (INVALID_ARGUMENT) timestamps after
+  // `latest_coverable`, so that the clock's restart point stays within range.
+  void SetLease(absl::Time lease, LeaseExtender extend,
+                absl::Time latest_coverable = absl::InfiniteFuture())
       ABSL_LOCKS_EXCLUDED(mu_);
 
   // Extends the lease, durably, to cover `timestamp` if it does not already:
@@ -91,6 +95,7 @@ class Clock {
 
   absl::Time lease_ ABSL_GUARDED_BY(mu_) = absl::InfiniteFuture();
   LeaseExtender extend_lease_ ABSL_GUARDED_BY(mu_);
+  absl::Time latest_coverable_ ABSL_GUARDED_BY(mu_) = absl::InfiniteFuture();
 };
 
 }  // namespace emulator

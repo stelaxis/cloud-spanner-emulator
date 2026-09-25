@@ -52,6 +52,7 @@
 #include "common/clock.h"
 #include "frontend/collections/database_manager.h"
 #include "frontend/collections/instance_manager.h"
+#include "frontend/collections/session_manager.h"
 #include "frontend/entities/database.h"
 #include "frontend/persistence/codec.h"
 #include "frontend/persistence/log.h"
@@ -1021,6 +1022,14 @@ TEST_F(PersistenceTest, Version1DataDirectoriesStayReadable) {
       db.get(), {"CREATE TABLE Later (K INT64 NOT NULL) PRIMARY KEY (K)"}));
   const auto storage = DumpStorage(db.get());
   const auto ddl = Ddl(db.get());
+  GOOGLESQL_ASSERT_OK(emulator->persistence->Checkpoint());
+  absl::Time create_time;
+  {
+    persistence::Checkpoint original;
+    ASSERT_TRUE(original.ParseFromString(
+        fs_.Contents("/data/checkpoint")->substr(16 + 24)));
+    create_time = DecodeTime(original.databases(0).database().create_time());
+  }
   db.reset();
   Crash(emulator);
 
@@ -1078,12 +1087,225 @@ TEST_F(PersistenceTest, Version1DataDirectoriesStayReadable) {
   ASSERT_NE(db, nullptr);
   EXPECT_EQ(Ddl(db.get()), ddl);
   EXPECT_EQ(DumpStorage(db.get()), storage);
+
+  // A checkpoint after the migration writes the current timestamp fields
+  // only.
+  GOOGLESQL_ASSERT_OK(emulator->persistence->Checkpoint());
+  auto written = fs_.Contents("/data/checkpoint");
+  GOOGLESQL_ASSERT_OK(written.status());
+  persistence::Checkpoint migrated;
+  ASSERT_TRUE(migrated.ParseFromString(written->substr(16 + 24)));
+  ASSERT_EQ(migrated.databases_size(), 1);
+  const DatabaseState& state = migrated.databases(0).database();
+  EXPECT_TRUE(state.has_create_time());
+  EXPECT_EQ(state.create_time_nanos(), 0);
+  EXPECT_EQ(DecodeTime(state.create_time()), create_time);
   GOOGLESQL_EXPECT_OK(Commit(db.get(), InsertAccount("c", 3)).status());
   db.reset();
   Crash(emulator);
   emulator = StartOrDie();
   db = GetDatabase(emulator.get());
   EXPECT_EQ(ReadTable(db.get(), "Accounts").size(), 3);
+}
+
+// A proto type for tests: p.Msg { optional string name = 1; }.
+std::string MsgDescriptors() {
+  google::protobuf::FileDescriptorProto file;
+  EXPECT_TRUE(
+      google::protobuf::TextFormat::ParseFromString(R"pb(
+                                                      syntax: "proto2"
+                                                      name: "p.proto"
+                                                      package: "p"
+                                                      message_type {
+                                                        name: "Msg"
+                                                        field {
+                                                          name: "name"
+                                                          number: 1
+                                                          label: LABEL_OPTIONAL
+                                                          type: TYPE_STRING
+                                                        }
+                                                      }
+                                                    )pb",
+                                                    &file));
+  google::protobuf::FileDescriptorSet files;
+  *files.add_file() = file;
+  return files.SerializeAsString();
+}
+
+// The batch of the review: its backfill converts V to p.Msg in place, then
+// installing the schema rejects the retention period.
+absl::Status ConvertThenReject(backend::Database* database) {
+  int successful;
+  absl::Time timestamp;
+  absl::Status backfill;
+  absl::Status status = database->UpdateSchema(
+      backend::SchemaChangeOperation{
+          .statements = {"CREATE PROTO BUNDLE (p.Msg)",
+                         "ALTER TABLE T ALTER COLUMN V p.Msg",
+                         "ALTER DATABASE db1 SET OPTIONS "
+                         "(version_retention_period = '8d')"},
+          .proto_descriptor_bytes = MsgDescriptors(),
+          .database_dialect =
+              database_api::DatabaseDialect::GOOGLE_STANDARD_SQL},
+      &successful, &timestamp, &backfill);
+  return status.ok() ? backfill : status;
+}
+
+// The value of T.V at key 1, by a strong read.
+googlesql::Value ReadV(backend::Database* database) {
+  auto txn = database->CreateReadOnlyTransaction(backend::ReadOnlyOptions());
+  EXPECT_TRUE(txn.ok()) << txn.status();
+  std::unique_ptr<backend::RowCursor> cursor;
+  EXPECT_TRUE((*txn)
+                  ->Read(backend::ReadArg{.table = "T",
+                                          .key_set = backend::KeySet::All(),
+                                          .columns = {"V"}},
+                         &cursor)
+                  .ok());
+  EXPECT_TRUE(cursor->Next());
+  return cursor->ColumnValue(0);
+}
+
+TEST_F(PersistenceTest, ARejectedTypeChangeLeavesItsColumnAlone) {
+  auto emulator = StartOrDie();
+  auto db = CreateDatabase(
+      emulator.get(), kDatabase,
+      {"CREATE TABLE T (K INT64 NOT NULL, V BYTES(MAX)) PRIMARY KEY (K)"});
+  backend::Mutation m;
+  m.AddWriteOp(backend::MutationOpType::kInsert, "T", {"K", "V"},
+               {{Int64(1), googlesql::values::Bytes("\x0a\x03"
+                                                    "ann")}});
+  GOOGLESQL_ASSERT_OK(Commit(db.get(), m).status());
+  const auto storage = DumpStorage(db.get());
+  const auto ddl = Ddl(db.get());
+
+  EXPECT_THAT(ConvertThenReject(db->backend()),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  // Nothing of the rejected change is left, in memory ...
+  EXPECT_EQ(Ddl(db.get()), ddl);
+  EXPECT_EQ(DumpStorage(db.get()), storage);
+  EXPECT_EQ(ReadV(db->backend()), googlesql::values::Bytes("\x0a\x03"
+                                                           "ann"));
+  db.reset();
+  Crash(emulator);
+  // ... or after a restart from the log.
+  emulator = StartOrDie();
+  db = GetDatabase(emulator.get());
+  ASSERT_NE(db, nullptr);
+  EXPECT_EQ(Ddl(db.get()), ddl);
+  EXPECT_EQ(DumpStorage(db.get()), storage);
+  EXPECT_EQ(ReadV(db->backend()), googlesql::values::Bytes("\x0a\x03"
+                                                           "ann"));
+}
+
+TEST_F(PersistenceTest, ARejectedSchemaChangeHasNoEffectInMemory) {
+  // Without --data_dir: upstream kept the converted values under the BYTES
+  // column (a later comparison crashed it) and the dropped-table mark (the
+  // table's rows vanished once the retention period passed).
+  Clock clock;
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto database,
+      backend::Database::Create(
+          &clock, "db1",
+          backend::SchemaChangeOperation{
+              .statements =
+                  {"CREATE TABLE T (K INT64 NOT NULL, V BYTES(MAX)) "
+                   "PRIMARY KEY (K)",
+                   "CREATE TABLE U (K INT64 NOT NULL) PRIMARY KEY (K)"},
+              .database_dialect =
+                  database_api::DatabaseDialect::GOOGLE_STANDARD_SQL}));
+  for (const char* table : {"T", "U"}) {
+    auto txn = database->CreateReadWriteTransaction(backend::ReadWriteOptions(),
+                                                    backend::RetryState());
+    GOOGLESQL_ASSERT_OK(txn.status());
+    backend::Mutation m;
+    m.AddWriteOp(backend::MutationOpType::kInsert, table, {"K"}, {{Int64(1)}});
+    GOOGLESQL_ASSERT_OK((*txn)->Write(m));
+    GOOGLESQL_ASSERT_OK((*txn)->Commit());
+  }
+  {
+    auto txn = database->CreateReadWriteTransaction(backend::ReadWriteOptions(),
+                                                    backend::RetryState());
+    backend::Mutation m;
+    m.AddWriteOp(backend::MutationOpType::kUpdate, "T", {"K", "V"},
+                 {{Int64(1), googlesql::values::Bytes("\x0a\x03"
+                                                      "ann")}});
+    GOOGLESQL_ASSERT_OK((*txn)->Write(m));
+    GOOGLESQL_ASSERT_OK((*txn)->Commit());
+  }
+  EXPECT_THAT(ConvertThenReject(database.get()),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_EQ(ReadV(database.get()), googlesql::values::Bytes("\x0a\x03"
+                                                            "ann"));
+
+  int successful;
+  absl::Time timestamp;
+  absl::Status backfill;
+  EXPECT_FALSE(
+      database
+          ->UpdateSchema(
+              backend::SchemaChangeOperation{
+                  .statements = {"DROP TABLE U",
+                                 "ALTER DATABASE db1 SET OPTIONS "
+                                 "(version_retention_period = '8d')"},
+                  .database_dialect =
+                      database_api::DatabaseDialect::GOOGLE_STANDARD_SQL},
+              &successful, &timestamp, &backfill)
+          .ok());
+  // U is still in the schema; its rows must outlive the retention period.
+  database->storage()->CleanUpDeletedTables(absl::Now() + absl::Hours(24));
+  const backend::Table* u = database->GetLatestSchema()->FindTable("U");
+  ASSERT_NE(u, nullptr);
+  GOOGLESQL_EXPECT_OK(database->storage()->Lookup(
+      absl::InfiniteFuture(), u->id(), backend::Key({Int64(1)}), {}, nullptr));
+}
+
+TEST_F(PersistenceTest, ReadTimestampsThatWouldOverflowTheClockAreRefused) {
+  auto emulator = StartOrDie();
+  auto db = CreateDatabase(emulator.get());
+  const absl::Time spanner_max =
+      absl::FromUnixSeconds(253402300799) + absl::Nanoseconds(999999999);
+  const absl::Time latest = emulator->persistence->latest_read_timestamp();
+  EXPECT_LT(latest, spanner_max);
+  for (absl::Time refused : {spanner_max, latest + absl::Nanoseconds(1)}) {
+    EXPECT_THAT(db->backend()
+                    ->CreateReadOnlyTransaction(backend::ReadOnlyOptions{
+                        .bound = backend::TimestampBound::kExactTimestamp,
+                        .timestamp = refused})
+                    .status(),
+                StatusIs(absl::StatusCode::kInvalidArgument));
+  }
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto txn,
+      db->backend()->CreateReadOnlyTransaction(backend::ReadOnlyOptions{
+          .bound = backend::TimestampBound::kExactTimestamp,
+          .timestamp = latest}));
+  txn.reset();
+  db.reset();
+  Crash(emulator);
+  emulator = StartOrDie();
+  db = GetDatabase(emulator.get());
+  EXPECT_GT(emulator->clock->Now(), latest);
+  // The clock is still usable: sessions get timestamps clients accept.
+  SessionManager sessions(emulator->clock.get());
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto session, sessions.CreateSession({}, /*multiplexed=*/false, db,
+                                           /*mux_txn_manager=*/nullptr));
+  ::google::spanner::v1::Session proto;
+  GOOGLESQL_EXPECT_OK(session->ToProto(&proto, /*include_labels=*/true));
+}
+
+TEST_F(PersistenceTest, TimestampsOutsideSpannersRangeAreNeverWritten) {
+  google::protobuf::Timestamp out;
+  const absl::Time spanner_max =
+      absl::FromUnixSeconds(253402300799) + absl::Nanoseconds(999999999);
+  GOOGLESQL_EXPECT_OK(EncodeTime(spanner_max, &out));
+  EXPECT_FALSE(EncodeTime(spanner_max + absl::Nanoseconds(1), &out).ok());
+  EXPECT_FALSE(EncodeTime(absl::InfiniteFuture(), &out).ok());
+  EXPECT_FALSE(
+      EncodeTime(absl::FromUnixSeconds(-62135596800) - absl::Nanoseconds(1),
+                 &out)
+          .ok());
 }
 
 TEST_F(PersistenceTest, ConcurrentCommitsCheckpointsAndACrash) {

@@ -16,6 +16,8 @@
 
 #include "backend/storage/in_memory_storage.h"
 
+#include <algorithm>
+#include <iterator>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -350,6 +352,39 @@ void InMemoryStorage::CleanUpDeletedColumns(absl::Time timestamp) {
     }
     it = dropped_columns_.erase(it);
   }
+}
+
+void InMemoryStorage::RollBackVersionsAt(absl::Time timestamp) {
+  absl::MutexLock lock(mu_);
+  std::vector<TableID> emptied_tables;
+  for (auto table = tables_.begin(); table != tables_.end(); ++table) {
+    bool touched = false;
+    absl::Time latest = absl::InfinitePast();
+    for (auto row = table->second.begin(); row != table->second.end();) {
+      std::vector<ColumnID> emptied;
+      for (auto& [column_id, cell] : row->second) {
+        touched |= cell.erase(timestamp) > 0;
+        if (cell.empty()) {
+          emptied.push_back(column_id);
+        } else {
+          latest = std::max(latest, cell.rbegin()->first);
+        }
+      }
+      for (const ColumnID& column_id : emptied) row->second.erase(column_id);
+      row = row->second.empty() ? table->second.erase(row) : std::next(row);
+    }
+    if (touched) {
+      if (latest == absl::InfinitePast()) {
+        latest_version_.erase(table->first);
+      } else {
+        latest_version_[table->first] = latest;
+      }
+    }
+    if (table->second.empty()) emptied_tables.push_back(table->first);
+  }
+  for (const TableID& table_id : emptied_tables) tables_.erase(table_id);
+  dropped_tables_.erase(timestamp);
+  dropped_columns_.erase(timestamp);
 }
 
 void InMemoryStorage::MarkDroppedTable(absl::Time timestamp,

@@ -341,30 +341,38 @@ absl::Status Database::ApplySchemaChangeLocked(
     }
   };
   SchemaUpdater updater;
-  GOOGLESQL_ASSIGN_OR_RETURN(
-      auto result,
-      updater.UpdateSchemaFromDDL(existing_schema.get(),
-                                  schema_change_operation, context));
+  auto updated = updater.UpdateSchemaFromDDL(existing_schema.get(),
+                                             schema_change_operation, context);
+  if (!updated.ok()) {
+    // Statements validated before the failing one may have marked tables and
+    // columns dropped.
+    storage_->RollBackVersionsAt(update_timestamp);
+    return updated.status();
+  }
+  SchemaChangeResult result = *std::move(updated);
   *commit_timestamp = update_timestamp;
   *num_succesful_statements = result.num_successful_statements;
   *backfill_status = result.backfill_status;
 
   // Every check AddSchema makes runs here, before the record is written, so
-  // that installing a logged schema cannot fail.
-  absl::Status rejected;
+  // that installing a logged schema cannot fail. A rejected change is undone
+  // in storage: its backfills may have rewritten surviving columns (a type
+  // change) and its drops marked tables for cleanup. Upstream kept both,
+  // leaving values of the new type under the old schema.
   if (result.updated_schema != nullptr) {
-    rejected = versioned_catalog_->CheckSchema(update_timestamp,
-                                               *result.updated_schema);
-    if (!rejected.ok()) result.updated_schema.reset();
+    absl::Status rejected = versioned_catalog_->CheckSchema(
+        update_timestamp, *result.updated_schema);
+    if (!rejected.ok()) {
+      storage_->RollBackVersionsAt(update_timestamp);
+      return rejected;
+    }
   }
 
   // With --data_dir, the new schema is published only once its record is
   // synced: nothing (GetDatabaseDdl, queries, new transactions) can see it
   // before. Its backfill writes are already in storage but invisible, since
-  // reads at or after its timestamp wait until it is marked committed; they
-  // are logged even if the schema is rejected. They cannot be undone, so if
-  // the record fails the emulator stops; restarting recovers what the log
-  // holds.
+  // reads at or after its timestamp wait until it is marked committed. If the
+  // record fails the emulator stops; restarting recovers what the log holds.
   if (log_ != nullptr &&
       (result.updated_schema != nullptr || !recorded->ops().empty())) {
     PersistedSchema persisted = GetPersistedSchema();
@@ -381,7 +389,6 @@ absl::Status Database::ApplySchemaChangeLocked(
       std::abort();
     }
   }
-  GOOGLESQL_RETURN_IF_ERROR(rejected);
 
   // We update the schema even if the backfill status was not OK, the returned
   // schema will be the schema for the last valid statement before the statement

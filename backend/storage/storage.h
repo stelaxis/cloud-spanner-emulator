@@ -100,6 +100,12 @@ class Storage {
 
   virtual void MarkDroppedColumn(absl::Time timestamp, TableID dropped_table_id,
                                  ColumnID dropped_column_id) = 0;
+
+  // Removes every version written at exactly `timestamp`, and the tables and
+  // columns marked dropped at it. A schema change owns its commit timestamp,
+  // so this undoes a change that is rejected after its backfills and drop
+  // marks reached storage.
+  virtual void RollBackVersionsAt(absl::Time timestamp) = 0;
 };
 
 }  // namespace backend

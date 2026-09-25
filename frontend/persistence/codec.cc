@@ -24,6 +24,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "backend/database/database.h"
 #include "backend/datamodel/key.h"
 #include "backend/datamodel/key_range.h"
@@ -188,11 +189,20 @@ backend::DatabaseRestore DecodeRestore(const SchemaState& schema) {
   return restore;
 }
 
-void EncodeTime(absl::Time time, google::protobuf::Timestamp* out) {
+absl::Status EncodeTime(absl::Time time, google::protobuf::Timestamp* out) {
+  // Spanner's range, as in google/protobuf/timestamp.proto.
+  static const absl::Time kMin = absl::FromUnixSeconds(-62135596800);
+  static const absl::Time kMax =
+      absl::FromUnixSeconds(253402300799) + absl::Nanoseconds(999999999);
+  if (time < kMin || time > kMax) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Timestamp out of range: ", absl::FormatTime(time)));
+  }
   int64_t seconds = absl::ToUnixSeconds(time);  // rounds down
   out->set_seconds(seconds);
   out->set_nanos(static_cast<int32_t>(
       absl::ToInt64Nanoseconds(time - absl::FromUnixSeconds(seconds))));
+  return absl::OkStatus();
 }
 
 absl::Time DecodeTime(const google::protobuf::Timestamp& in) {

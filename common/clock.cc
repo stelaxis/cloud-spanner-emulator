@@ -24,6 +24,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 
@@ -77,15 +78,23 @@ void Clock::AdvanceTo(absl::Time floor) {
   if (last_dispensed_time_ < floor) last_dispensed_time_ = floor;
 }
 
-void Clock::SetLease(absl::Time lease, LeaseExtender extend) {
+void Clock::SetLease(absl::Time lease, LeaseExtender extend,
+                     absl::Time latest_coverable) {
   absl::MutexLock lock(mu_);
   lease_ = lease;
   extend_lease_ = std::move(extend);
+  latest_coverable_ = latest_coverable;
 }
 
 absl::Status Clock::CoverWithLease(absl::Time timestamp) {
   absl::MutexLock lock(mu_);
   if (!extend_lease_ || timestamp <= lease_) return absl::OkStatus();
+  if (timestamp > latest_coverable_) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Timestamp ", absl::FormatTime(timestamp),
+        " is too far in the future: with --data_dir the latest is ",
+        absl::FormatTime(latest_coverable_)));
+  }
   absl::StatusOr<absl::Time> lease = extend_lease_(timestamp);
   if (!lease.ok()) return lease.status();
   lease_ = std::max(lease_, *lease);

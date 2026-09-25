@@ -63,7 +63,7 @@ absl::Status EncodeSchema(const backend::PersistedSchema& schema,
 backend::DatabaseRestore DecodeRestore(const SchemaState& schema);
 
 // Lossless for every timestamp Spanner accepts.
-void EncodeTime(absl::Time time, google::protobuf::Timestamp* out);
+absl::Status EncodeTime(absl::Time time, google::protobuf::Timestamp* out);
 absl::Time DecodeTime(const google::protobuf::Timestamp& in);
 
 // The timestamps of a record or checkpoint, from the current field or, in
