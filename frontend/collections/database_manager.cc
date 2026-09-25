@@ -80,11 +80,21 @@ absl::StatusOr<std::shared_ptr<Database>> DatabaseManager::CreateDatabase(
       ParseDatabaseUri(database_uri, &project_id, &instance_id, &database_id));
   std::string instance_uri = MakeInstanceUri(project_id, instance_id);
 
+  std::unique_ptr<backend::DatabaseLog> log;
+  if (persistence_ != nullptr) {
+    if (schema_change_operation.database_dialect ==
+        backend::database_api::DatabaseDialect::POSTGRESQL) {
+      return error::PostgreSQLDatabaseNotPersisted();
+    }
+    log = persistence_->NewDatabaseLog();
+  }
   GOOGLESQL_ASSIGN_OR_RETURN(
       std::unique_ptr<backend::Database> backend_db,
-      backend::Database::Create(clock_, database_id, schema_change_operation));
+      backend::Database::Create(clock_, database_id, schema_change_operation,
+                                std::move(log)));
+  absl::Time create_time = clock_->Now();
   auto database = std::make_shared<Database>(
-      database_uri, std::move(backend_db), clock_->Now());
+      database_uri, std::move(backend_db), create_time);
 
   // Now update the database manager state. We could do the validation checks
   // at the top of this function, but we would have to do it here again anyway,
@@ -105,6 +115,11 @@ absl::StatusOr<std::shared_ptr<Database>> DatabaseManager::CreateDatabase(
     return error::TooManyDatabasesPerInstance(instance_uri);
   }
 
+  if (persistence_ != nullptr) {
+    GOOGLESQL_RETURN_IF_ERROR(
+        persistence_->LogCreateDatabase(instance_uri, database, create_time));
+  }
+
   // Record this database in the database manager.
   database_map_[database_uri] = database;
   num_databases_per_instance_[instance_uri] += 1;
@@ -122,8 +137,23 @@ absl::StatusOr<std::shared_ptr<Database>> DatabaseManager::GetDatabase(
   return itr->second;
 }
 
+absl::Status DatabaseManager::RestoreDatabase(
+    std::shared_ptr<Database> database) {
+  absl::string_view project_id, instance_id, database_id;
+  GOOGLESQL_RETURN_IF_ERROR(ParseDatabaseUri(
+      database->database_uri(), &project_id, &instance_id, &database_id));
+  absl::MutexLock lock(mu_);
+  num_databases_per_instance_[MakeInstanceUri(project_id, instance_id)] += 1;
+  database_map_[database->database_uri()] = std::move(database);
+  return absl::OkStatus();
+}
+
 absl::Status DatabaseManager::DeleteDatabase(const std::string& database_uri) {
   absl::MutexLock lock(mu_);
+  if (auto it = database_map_.find(database_uri);
+      it != database_map_.end() && persistence_ != nullptr) {
+    GOOGLESQL_RETURN_IF_ERROR(persistence_->LogDropDatabase(*it->second));
+  }
   if (database_map_.erase(database_uri) > 0) {
     absl::string_view project_id, instance_id, database_id;
     GOOGLESQL_RETURN_IF_ERROR(ParseDatabaseUri(database_uri, &project_id, &instance_id,

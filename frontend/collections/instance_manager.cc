@@ -89,20 +89,29 @@ absl::StatusOr<std::shared_ptr<Instance>> InstanceManager::CreateInstance(
     processing_units = instance_proto.processing_units();
   }
   Labels labels(instance_proto.labels().begin(), instance_proto.labels().end());
-  auto inserted = instances_.insert(
-      {instance_uri,
-       std::make_shared<Instance>(
-           instance_uri, instance_proto.config(), instance_proto.display_name(),
-           processing_units, labels, googlesql_base::Clock::RealClock())});
-  if (!inserted.second) {
+  if (instances_.contains(instance_uri)) {
     return error::InstanceAlreadyExists(instance_uri);
   }
-  return inserted.first->second;
+  auto instance = std::make_shared<Instance>(
+      instance_uri, instance_proto.config(), instance_proto.display_name(),
+      processing_units, labels, googlesql_base::Clock::RealClock());
+  if (persistence_ != nullptr) {
+    instance_api::Instance created;
+    instance->ToProto(&created);
+    GOOGLESQL_RETURN_IF_ERROR(
+        persistence_->LogCreateInstance(instance_uri, created));
+  }
+  instances_[instance_uri] = instance;
+  return instance;
 }
 
-void InstanceManager::DeleteInstance(const std::string& instance_uri) {
+absl::Status InstanceManager::DeleteInstance(const std::string& instance_uri) {
   absl::MutexLock lock(&mu_);
+  if (instances_.contains(instance_uri) && persistence_ != nullptr) {
+    GOOGLESQL_RETURN_IF_ERROR(persistence_->LogDeleteInstance(instance_uri));
+  }
   instances_.erase(instance_uri);
+  return absl::OkStatus();
 }
 
 }  // namespace frontend

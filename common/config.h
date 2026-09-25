@@ -17,6 +17,7 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_COMMON_CONFIG_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_COMMON_CONFIG_H_
 
+#include <cstdint>
 #include <string>
 
 namespace google {
@@ -57,6 +58,12 @@ bool query_key_pushdown_enabled();
 
 // Sets the query key pushdown flag (for tests).
 void set_query_key_pushdown_enabled(bool enabled);
+
+// The data directory (--data_dir), or empty for in-memory only.
+std::string data_dir();
+
+// Log growth, in bytes, after which a checkpoint is written.
+int64_t data_dir_checkpoint_bytes();
 
 }  // namespace config
 }  // namespace emulator

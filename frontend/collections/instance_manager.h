@@ -21,6 +21,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
+#include "frontend/collections/catalog_persistence.h"
 #include "frontend/entities/instance.h"
 #include "absl/status/status.h"
 
@@ -42,14 +43,23 @@ class InstanceManager {
   absl::StatusOr<std::shared_ptr<Instance>> GetInstance(
       const std::string& instance_uri) const ABSL_LOCKS_EXCLUDED(mu_);
 
-  // Deletes an instance with the given URI.
-  void DeleteInstance(const std::string& instance_uri) ABSL_LOCKS_EXCLUDED(mu_);
+  // Deletes an instance with the given URI, if it exists.
+  absl::Status DeleteInstance(const std::string& instance_uri)
+      ABSL_LOCKS_EXCLUDED(mu_);
 
   // Lists all instances associated with the given project URI.
   absl::StatusOr<std::vector<std::shared_ptr<Instance>>> ListInstances(
       const std::string& project_uri) const ABSL_LOCKS_EXCLUDED(mu_);
 
+  // With --data_dir: creations and deletions are logged here. Set before
+  // use; instances created before it is set (recovery) are not logged.
+  void set_persistence(CatalogPersistence* persistence) {
+    persistence_ = persistence;
+  }
+
  private:
+  CatalogPersistence* persistence_ = nullptr;
+
   // Mutex to guard state below.
   mutable absl::Mutex mu_;
 

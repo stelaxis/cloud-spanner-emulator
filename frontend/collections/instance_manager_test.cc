@@ -268,7 +268,8 @@ TEST(InstanceManagerTest, DeleteInstance) {
         node_count: 6
       )pb")));
 
-  instance_manager.DeleteInstance("projects/123/instances/456");
+  GOOGLESQL_EXPECT_OK(
+      instance_manager.DeleteInstance("projects/123/instances/456"));
 
   EXPECT_THAT(instance_manager.GetInstance("projects/123/instances/456"),
               StatusIs(absl::StatusCode::kNotFound,

@@ -29,6 +29,7 @@
 #include "absl/synchronization/mutex.h"
 #include "backend/schema/updater/schema_updater.h"
 #include "common/clock.h"
+#include "frontend/collections/catalog_persistence.h"
 #include "frontend/entities/database.h"
 #include "absl/status/status.h"
 
@@ -64,9 +65,20 @@ class DatabaseManager {
   absl::StatusOr<std::vector<std::shared_ptr<Database>>> ListDatabases(
       const std::string& instance_uri) const ABSL_LOCKS_EXCLUDED(mu_);
 
+  // With --data_dir: creations and drops are logged here. Set before use.
+  void set_persistence(CatalogPersistence* persistence) {
+    persistence_ = persistence;
+  }
+
+  // Adds a database recovered from the data directory.
+  absl::Status RestoreDatabase(std::shared_ptr<Database> database)
+      ABSL_LOCKS_EXCLUDED(mu_);
+
  private:
   // System-wide clock.
   Clock* clock_;
+
+  CatalogPersistence* persistence_ = nullptr;
 
   // Mutex to guard state below.
   mutable absl::Mutex mu_;

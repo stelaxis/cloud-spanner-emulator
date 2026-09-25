@@ -24,10 +24,23 @@ package(
 licenses(["notice"])
 
 cc_library(
+    name = "catalog_persistence",
+    hdrs = ["catalog_persistence.h"],
+    deps = [
+        "//backend/database:database_log",
+        "//frontend/entities:database",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/time",
+        "@com_google_googleapis//google/spanner/admin/instance/v1:instance_cc_grpc",
+    ],
+)
+
+cc_library(
     name = "database_manager",
     srcs = ["database_manager.cc"],
     hdrs = ["database_manager.h"],
     deps = [
+        ":catalog_persistence",
         "//backend/database",
         "//backend/schema/updater:schema_updater",
         "//common:clock",
@@ -166,6 +179,8 @@ cc_library(
         "instance_manager.h",
     ],
     deps = [
+        ":catalog_persistence",
+        "@com_google_googlesql//googlesql/base:status",
         "//common:errors",
         "//frontend/common:labels",
         "//frontend/entities:instance",

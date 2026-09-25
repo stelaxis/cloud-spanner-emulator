@@ -19,6 +19,8 @@
 
 #include <memory>
 
+#include "absl/status/status.h"
+
 #include "common/clock.h"
 #include "frontend/collections/database_manager.h"
 #include "frontend/collections/instance_manager.h"
@@ -26,6 +28,7 @@
 #include "frontend/collections/multiplexed_session_transaction_manager.h"
 #include "frontend/collections/operation_manager.h"
 #include "frontend/collections/session_manager.h"
+#include "frontend/persistence/manager.h"
 
 namespace google {
 namespace spanner {
@@ -44,6 +47,20 @@ class ServerEnv {
         session_manager_(new SessionManager(clock_.get())),
         mux_txn_manager_(new MultiplexedSessionTransactionManager()) {}
 
+  // Recovers the state kept in `options.dir` and keeps it there from now on
+  // (--data_dir). Call before serving requests.
+  absl::Status EnablePersistence(
+      const persistence::PersistenceOptions& options) {
+    auto manager = persistence::PersistenceManager::Open(
+        options, clock_.get(), instance_manager_.get(),
+        database_manager_.get());
+    if (!manager.ok()) return manager.status();
+    persistence_ = *std::move(manager);
+    return absl::OkStatus();
+  }
+
+  persistence::PersistenceManager* persistence() { return persistence_.get(); }
+
   Clock* clock() { return clock_.get(); }
   DatabaseManager* database_manager() { return database_manager_.get(); }
   InstanceManager* instance_manager() { return instance_manager_.get(); }
@@ -58,6 +75,8 @@ class ServerEnv {
 
  private:
   std::unique_ptr<Clock> clock_;
+  // Destroyed after the managers below, whose databases log through it.
+  std::unique_ptr<persistence::PersistenceManager> persistence_;
   std::unique_ptr<DatabaseManager> database_manager_;
   std::unique_ptr<InstanceManager> instance_manager_;
   std::unique_ptr<InstancePartitionManager> instance_partition_manager_;

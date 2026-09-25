@@ -57,6 +57,16 @@ ABSL_FLAG(
     "statement reads, and so the ranges its transaction validates at commit. "
     "If false, every query and UPDATE/DELETE reads its tables in full.");
 
+ABSL_FLAG(std::string, data_dir, "",
+          "If set, the emulator keeps its instances, databases, schemas and "
+          "data in this directory and recovers them on restart, including "
+          "after a crash. Only one emulator can use a directory at a time. "
+          "Empty (the default) keeps everything in memory.");
+
+ABSL_FLAG(int64_t, data_dir_checkpoint_bytes, 64 << 20,
+          "With --data_dir: write a checkpoint, and drop the log it covers, "
+          "once the log has grown by this many bytes.");
+
 namespace google {
 namespace spanner {
 namespace emulator {
@@ -88,6 +98,12 @@ bool query_key_pushdown_enabled() {
 
 void set_query_key_pushdown_enabled(bool enabled) {
   absl::SetFlag(&FLAGS_enable_query_key_pushdown, enabled);
+}
+
+std::string data_dir() { return absl::GetFlag(FLAGS_data_dir); }
+
+int64_t data_dir_checkpoint_bytes() {
+  return absl::GetFlag(FLAGS_data_dir_checkpoint_bytes);
 }
 
 }  // namespace config

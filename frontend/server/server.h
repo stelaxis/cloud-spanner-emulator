@@ -17,6 +17,7 @@
 #ifndef STORAGE_SPANNER_CLOUD_EMULATOR_FRONTEND_SERVER_H_
 #define STORAGE_SPANNER_CLOUD_EMULATOR_FRONTEND_SERVER_H_
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -54,6 +55,9 @@ class Server {
  public:
   struct Options {
     std::string server_address;
+    // If set, state is kept in this directory (--data_dir).
+    std::string data_dir;
+    int64_t checkpoint_bytes = 64 << 20;
   };
 
   // Returns an initialized Server, or nullptr if the initialization failed.
