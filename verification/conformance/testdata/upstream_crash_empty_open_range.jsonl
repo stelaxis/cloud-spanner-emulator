@@ -1,0 +1,5 @@
+{"txn":0,"op":"begin_rw","args":{}}
+{"txn":0,"op":"commit","args":{"mutations":[{"kind":"insert","table":"A","key":2,"val":5},{"kind":"insert","table":"A","key":3,"val":93}]}}
+{"txn":1,"op":"begin_rw","args":{}}
+{"txn":1,"op":"dml_update","args":{"table":"A","keys":{"lo":2,"lo_incl":true,"hi":4,"hi_incl":false},"val":83}}
+{"txn":1,"op":"read","args":{"table":"A","keys":{"lo":2,"lo_incl":false,"hi":2,"hi_incl":false}}}

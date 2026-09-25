@@ -1,0 +1,2 @@
+gcr.io/cloud-spanner-emulator/emulator:1.5.58 NanoCpus=2000000000
+RepoDigest=gcr.io/cloud-spanner-emulator/emulator@sha256:c6f3402f2599684f295a0fdefb6fbbbfb18a0e43e309ff5456ccb452a4570a79

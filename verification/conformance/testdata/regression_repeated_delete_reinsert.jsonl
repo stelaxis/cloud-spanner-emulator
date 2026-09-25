@@ -1,0 +1,7 @@
+{"txn":0,"op":"begin_rw","args":{}}
+{"txn":0,"op":"commit","args":{"mutations":[]}}
+{"txn":1,"op":"begin_rw","args":{}}
+{"txn":1,"op":"commit","args":{"mutations":[{"kind":"delete","table":"A","key":1},{"kind":"delete","table":"A","key":1},{"kind":"insert","table":"A","key":1,"val":7},{"kind":"update","table":"A","key":1,"val":7}]}}
+{"txn":2,"op":"begin_ro","args":{}}
+{"txn":2,"op":"read","args":{"table":"A","keys":"all"}}
+{"txn":2,"op":"read","args":{"table":"B","keys":"all"}}
