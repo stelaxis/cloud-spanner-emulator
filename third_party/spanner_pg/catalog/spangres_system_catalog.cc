@@ -32,9 +32,11 @@
 #include "third_party/spanner_pg/catalog/spangres_system_catalog.h"
 
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "google/protobuf/text_format.h"
@@ -146,9 +148,24 @@ absl::StatusOr<bool> SpangresSystemCatalog::TryInitializeEngineSystemCatalog(
       EmulatorBuiltinFunctionCatalog* target_builtin_function_catalog =
           static_cast<EmulatorBuiltinFunctionCatalog*>(
               (*spangres_system_catalog)->builtin_function_catalog());
-      target_builtin_function_catalog->SetLatestSchema(
-          source_builtin_function_catalog->GetLatestSchema());
+      // The singleton outlives this call, so it takes only a schema that
+      // the source catalog owns. Schema changes translate expressions with
+      // catalogs that borrow intermediate schemas, which they destroy.
+      if (std::shared_ptr<const google::spanner::emulator::backend::Schema>
+              schema = source_builtin_function_catalog->GetOwnedLatestSchema();
+          schema != nullptr) {
+        target_builtin_function_catalog->SetLatestSchema(std::move(schema));
+      }
     return false;
+  }
+
+  // Likewise, the new singleton must not keep a borrowed schema.
+  {
+    EmulatorBuiltinFunctionCatalog* emulator_builtin_function_catalog =
+        static_cast<EmulatorBuiltinFunctionCatalog*>(
+            builtin_function_catalog.get());
+    emulator_builtin_function_catalog->SetLatestSchema(
+        emulator_builtin_function_catalog->GetOwnedLatestSchema());
   }
 
   // Create and setup a new catalog. If setup is successful, set the

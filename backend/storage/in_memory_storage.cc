@@ -197,7 +197,8 @@ absl::Status InMemoryStorage::Write(
 
   // Add the row with _exists system column if it does not exist.
   Row& row = table[key];
-  if (!Exists(row, timestamp)) {
+  // A write of no columns to an existing row must still leave a version.
+  if (!Exists(row, timestamp) || column_ids.empty()) {
     Cell& cell = row[kExistsColumn];
     cell[timestamp] = googlesql::values::Bool(true);
     RemoveExpiredVersions(cell, timestamp);
@@ -209,8 +210,58 @@ absl::Status InMemoryStorage::Write(
     cell[timestamp] = values[i];
     RemoveExpiredVersions(cell, timestamp);
   }
+  NoteVersion(table_id, timestamp);
 
   return absl::OkStatus();
+}
+
+void InMemoryStorage::NoteVersion(const TableID& table_id,
+                                  absl::Time timestamp) {
+  auto [it, inserted] = latest_version_.try_emplace(table_id, timestamp);
+  if (!inserted && it->second < timestamp) {
+    it->second = timestamp;
+  }
+}
+
+absl::Status InMemoryStorage::MarkWritten(absl::Time timestamp,
+                                          const TableID& table_id,
+                                          const Key& key) {
+  absl::MutexLock lock(mu_);
+  Row& row = tables_[table_id][key];
+  Cell& cell = row[kExistsColumn];
+  cell[timestamp] = googlesql::values::Bool(Exists(row, timestamp));
+  RemoveExpiredVersions(cell, timestamp);
+  NoteVersion(table_id, timestamp);
+  return absl::OkStatus();
+}
+
+bool InMemoryStorage::HasVersionsAfter(absl::Time timestamp,
+                                       const TableID& table_id,
+                                       const KeyRange& key_range) const {
+  absl::MutexLock lock(mu_);
+  auto latest_itr = latest_version_.find(table_id);
+  if (latest_itr == latest_version_.end() || latest_itr->second <= timestamp) {
+    return false;
+  }
+  if (key_range.start_key() >= key_range.limit_key()) {
+    return false;
+  }
+  auto table_itr = tables_.find(table_id);
+  if (table_itr == tables_.end()) {
+    return false;
+  }
+  const Table& table = table_itr->second;
+  auto row_end_itr = table.lower_bound(key_range.limit_key());
+  for (auto itr = table.lower_bound(key_range.start_key()); itr != row_end_itr;
+       ++itr) {
+    for (const auto& [column_id, cell] : itr->second) {
+      // The newest version of a cell is never garbage collected.
+      if (!cell.empty() && cell.rbegin()->first > timestamp) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 absl::Status InMemoryStorage::Delete(absl::Time timestamp,
@@ -247,6 +298,7 @@ absl::Status InMemoryStorage::Delete(absl::Time timestamp,
     if (!Exists(itr->second, timestamp)) {
       continue;
     }
+    NoteVersion(table_id, timestamp);
 
     for (const auto& columns : itr->second) {
       if (columns.first == kExistsColumn) {

@@ -56,6 +56,13 @@ class VersionedCatalog {
   // GetLatestSchema never returns a nullptr.
   const Schema* GetLatestSchema() const ABSL_LOCKS_EXCLUDED(mu_);
 
+  // GetSchema and GetLatestSchema with shared ownership, so that the schema
+  // outlives its removal from the catalog (RemoveExpiredSchemas).
+  std::shared_ptr<const Schema> GetSchemaShared(absl::Time timestamp) const
+      ABSL_LOCKS_EXCLUDED(mu_);
+  std::shared_ptr<const Schema> GetLatestSchemaShared() const
+      ABSL_LOCKS_EXCLUDED(mu_);
+
   // Adds a schema at a given timestamp. Returns an error if creation_time is
   // the same or prior to the largest timestamp in all of the schemas. In this
   // case, the new schema will not be added.
@@ -82,7 +89,7 @@ class VersionedCatalog {
   // Note that this cannot be changed into a hash map (e.g. std::unordered_map)
   // because the lookup of schemas by creation timestamp depends on the ordering
   // of keys in this map.
-  std::map<absl::Time, std::unique_ptr<const Schema>> schemas_
+  std::map<absl::Time, std::shared_ptr<const Schema>> schemas_
       ABSL_GUARDED_BY(mu_);
 
   // The retention period for schema versions.

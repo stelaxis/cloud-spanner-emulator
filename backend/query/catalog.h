@@ -43,6 +43,7 @@
 #include "backend/query/queryable_named_schema.h"
 #include "backend/query/queryable_property_graph.h"
 #include "backend/query/queryable_sequence.h"
+#include "backend/query/key_narrowing.h"
 #include "backend/query/queryable_table.h"
 #include "backend/query/queryable_view.h"
 #include "backend/query/spanner_sys_catalog.h"
@@ -78,6 +79,12 @@ class Catalog : public googlesql::EnumerableCatalog {
   std::string FullName() const override {
     // The name of the root catalog is "".
     return "";
+  }
+
+  // Bounds what the next evaluated statement reads from each table; tables
+  // without an entry are read in full. See ComputeScanKeySets.
+  void set_scan_key_sets(ScanKeySets scan_key_sets) {
+    scan_key_sets_ = std::move(scan_key_sets);
   }
 
  private:
@@ -173,6 +180,10 @@ class Catalog : public googlesql::EnumerableCatalog {
   template <typename T>
   absl::Status AddObjectToNamedSchema(const std::string& named_schema_name,
                                       T object);
+
+  // Key sets bounding the current statement's table reads; see
+  // ComputeScanKeySets. Tables hold a pointer to this map.
+  ScanKeySets scan_key_sets_;
 
   // The backend schema (which is the default schema in this catalog).
   const Schema* schema_ = nullptr;

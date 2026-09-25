@@ -59,7 +59,7 @@ class ReadOnlyTransaction : public RowReader {
   absl::Time read_timestamp() const { return read_timestamp_; }
 
   // Returns the schema used by this transaction.
-  const Schema* schema() const;
+  const Schema* schema() const ABSL_LOCKS_EXCLUDED(schema_mu_);
 
   // Returns the ID of this transaction.
   const TransactionID id() const { return id_; }
@@ -73,6 +73,17 @@ class ReadOnlyTransaction : public RowReader {
 
   // Picks a read timestamp given transaction type and timestamp bound.
   absl::Time PickReadTimestamp();
+
+  // Returns the schema at the read timestamp, which this transaction owns from
+  // the first call on, so that a schema change cannot free it.
+  std::shared_ptr<const Schema> SchemaShared() const
+      ABSL_LOCKS_EXCLUDED(schema_mu_);
+
+  // Guards schema_holder_. Separate from mu_, which Read holds while it calls
+  // schema().
+  mutable absl::Mutex schema_mu_;
+  mutable std::shared_ptr<const Schema> schema_holder_
+      ABSL_GUARDED_BY(schema_mu_);
 
   // Options with which the transaction was created.
   ReadOnlyOptions options_;

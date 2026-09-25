@@ -49,6 +49,8 @@ namespace backend {
 //
 // Transactions use this registry for constraint checking the writes to a
 // database.
+// The registry is immutable once built: concurrent transactions execute its
+// actions without locking.
 class ActionRegistry {
  public:
   explicit ActionRegistry(const Schema* schema,
@@ -114,13 +116,14 @@ class ActionManager {
                            const FunctionCatalog* function_catalog,
                            googlesql::TypeFactory* type_factory);
 
-  // Returns the action registry for given schema.
-  absl::StatusOr<ActionRegistry*> GetActionsForSchema(
+  // Returns the action registry for given schema. A read-write transaction
+  // keeps it alive while a schema change replaces the latest one.
+  absl::StatusOr<std::shared_ptr<ActionRegistry>> GetActionsForSchema(
       const Schema* schema) const;
 
  private:
   const Schema* latest_schema_ ABSL_GUARDED_BY(mutex_);
-  std::unique_ptr<ActionRegistry> registry_ ABSL_GUARDED_BY(mutex_);
+  std::shared_ptr<ActionRegistry> registry_ ABSL_GUARDED_BY(mutex_);
 
   mutable absl::Mutex mutex_;
 };

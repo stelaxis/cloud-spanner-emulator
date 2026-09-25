@@ -45,14 +45,18 @@ bool fault_injection_enabled();
 // once.
 bool disable_query_null_filtered_index_check();
 
-// The probability that the emulator will try to abort the current transaction
-// if a new transaction is requested. A higher value gives higher priority to
-// new transactions. A lower value gives higher priority to the current
-// transaction. A value of zero means that the emulator will never abort the
-// current transaction.
+// The percentage (0-100) of read-write commits aborted at random, for testing
+// application retry loops. Zero (the default) disables it.
 int abort_current_transaction_probability();
 
 void set_abort_current_transaction_probability(int probability);
+
+// Returns true if primary key predicates narrow the key ranges that SQL
+// statements read.
+bool query_key_pushdown_enabled();
+
+// Sets the query key pushdown flag (for tests).
+void set_query_key_pushdown_enabled(bool enabled);
 
 }  // namespace config
 }  // namespace emulator

@@ -55,6 +55,12 @@ var (
 			"requests to allow testing application abort-retry behavior).")
 	disableQueryNullFilteredIndexCheck = flag.Bool("disable_query_null_filtered_index_check", false,
 		"If true, then queries that use NULL_FILTERED indexes will be answered.")
+	abortCurrentTransactionProbability = flag.Int("abort_current_transaction_probability", 0,
+		"The percentage (0-100) of read-write transaction commits that the emulator aborts at "+
+			"random, to test application abort-retry loops. Zero disables it.")
+	enableQueryKeyPushdown = flag.Bool("enable_query_key_pushdown", true,
+		"If true, primary key predicates in SQL narrow the key ranges a statement reads, and so "+
+			"the ranges its read-write transaction validates at commit.")
 	overrideMaxDatabasesPerInstance = flag.Int("override_max_databases_per_instance", 100,
 		"If set at a value greater than the default limit of Spanner, overrides the allowed "+
 			"maximum number of databases per instance. If the "+
@@ -167,6 +173,8 @@ func main() {
 		OverrideMaxDatabasesPerInstance:    instanceDbs,
 		OverrideChangeStreamPartitionTokenAliveSeconds: overrideChangeStreamPartitionTokenAliveSeconds,
 		RemoteFunctionsHostPort:                        *remoteFunctionsHostPort,
+		AbortCurrentTransactionProbability:             *abortCurrentTransactionProbability,
+		DisableQueryKeyPushdown:                        !*enableQueryKeyPushdown,
 	}
 	gw := gateway.New(gwopts)
 	gw.Run()

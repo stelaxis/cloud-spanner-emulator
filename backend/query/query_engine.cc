@@ -80,6 +80,7 @@
 #include "backend/query/insert_on_conflict_dml_execution.h"
 #include "backend/query/partitionability_validator.h"
 #include "backend/query/partitioned_dml_validator.h"
+#include "backend/query/key_narrowing.h"
 #include "backend/query/query_context.h"
 #include "backend/query/query_engine_options.h"
 #include "backend/query/query_engine_util.h"
@@ -1171,7 +1172,7 @@ absl::StatusOr<std::string> QueryEngine::GetDmlTargetTable(
   GOOGLESQL_ASSIGN_OR_RETURN(auto analyzer_options,
                    MakeAnalyzerOptionsWithParameters(
                        normalized_query.declared_params,
-                       GetTimeZone(function_catalog_.GetLatestSchema())));
+                       GetTimeZone(function_catalog_.GetLatestSchema().get())));
   analyzer_options.set_prune_unused_columns(true);
   Catalog catalog(schema, &function_catalog_, type_factory_, analyzer_options);
   GOOGLESQL_ASSIGN_OR_RETURN(
@@ -1248,7 +1249,7 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteInsertOnConflictDml(
           EvaluateUpdate(insert_or_update_stmt.get(), &catalog, params,
                          type_factory_, context.schema->dialect(),
                          context.schema,
-                         GetTimeZone(function_catalog_.GetLatestSchema())));
+                         GetTimeZone(function_catalog_.GetLatestSchema().get())));
       GOOGLESQL_RETURN_IF_ERROR(context.writer->Write(insert_or_update_result.mutation));
       result.modified_row_count = insert_or_update_result.modify_row_count;
       result.rows = std::move(insert_or_update_result.returning_row_cursor);
@@ -1276,7 +1277,7 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteInsertOnConflictDml(
       auto insert_or_ignore_result,
       EvaluateUpdate(insert_or_ignore_stmt.get(), &catalog, params,
                      type_factory_, context.schema->dialect(), context.schema,
-                     GetTimeZone(function_catalog_.GetLatestSchema()),
+                     GetTimeZone(function_catalog_.GetLatestSchema().get()),
                      /*return_all_insert_rows_insert_ignore_dml=*/true));
 
   // 4. Get all table rows keys. The key columns are the conflict target key
@@ -1313,7 +1314,7 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteInsertOnConflictDml(
         auto insert_stmt_execute_update_result,
         EvaluateUpdate(insert_new_rows_stmt.get(), &catalog, params,
                        type_factory_, context.schema->dialect(), context.schema,
-                       GetTimeZone(function_catalog_.GetLatestSchema())));
+                       GetTimeZone(function_catalog_.GetLatestSchema().get())));
 
     GOOGLESQL_RETURN_IF_ERROR(
         context.writer->Write(insert_stmt_execute_update_result.mutation));
@@ -1341,7 +1342,7 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteInsertOnConflictDml(
         EvaluateUpdate(update_existing_rows_resolved_stmt.get(), &catalog,
                        params, type_factory_, context.schema->dialect(),
                        context.schema,
-                       GetTimeZone(function_catalog_.GetLatestSchema())));
+                       GetTimeZone(function_catalog_.GetLatestSchema().get())));
     GOOGLESQL_RETURN_IF_ERROR(
         context.writer->Write(update_stmt_execute_update_result.mutation));
     result.modified_row_count +=
@@ -1369,7 +1370,7 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteSql(
   GOOGLESQL_ASSIGN_OR_RETURN(auto analyzer_options,
                    MakeAnalyzerOptionsWithParameters(
                        normalized_query.declared_params,
-                       GetTimeZone(function_catalog_.GetLatestSchema())));
+                       GetTimeZone(function_catalog_.GetLatestSchema().get())));
   analyzer_options.set_prune_unused_columns(true);
 
   QueryEvaluatorForEngine view_evaluator(*this, context,
@@ -1427,11 +1428,13 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteSql(
 
   QueryResult result;
   if (!IsDMLStmt(analyzer_output->resolved_statement()->node_kind())) {
+    catalog->set_scan_key_sets(ComputeScanKeySets(
+        resolved_statement.get(), params, config::query_key_pushdown_enabled()));
     GOOGLESQL_ASSIGN_OR_RETURN(
         auto cursor,
         EvaluateQuery(resolved_statement.get(), params, type_factory_,
                       &result.num_output_rows, query_mode,
-                      GetTimeZone(function_catalog_.GetLatestSchema())));
+                      GetTimeZone(function_catalog_.GetLatestSchema().get())));
     result.rows = std::move(cursor);
   } else {
     GOOGLESQL_RET_CHECK_NE(context.writer, nullptr);
@@ -1458,12 +1461,15 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteSql(
           resolved_statement->GetAs<googlesql::ResolvedInsertStmt>()
                   ->on_conflict_clause() != nullptr;
       if (!is_insert_on_conflict_stmt) {
+        catalog->set_scan_key_sets(
+            ComputeScanKeySets(resolved_statement.get(), params,
+                               config::query_key_pushdown_enabled()));
         GOOGLESQL_ASSIGN_OR_RETURN(
             auto execute_update_result,
             EvaluateUpdate(resolved_statement.get(), catalog.get(), params,
                            type_factory_, context.schema->dialect(),
                            context.schema,
-                           GetTimeZone(function_catalog_.GetLatestSchema())));
+                           GetTimeZone(function_catalog_.GetLatestSchema().get())));
         GOOGLESQL_RETURN_IF_ERROR(context.writer->Write(execute_update_result.mutation));
         result.modified_row_count = execute_update_result.modify_row_count;
         result.rows = std::move(execute_update_result.returning_row_cursor);
@@ -1539,7 +1545,7 @@ absl::Status QueryEngine::IsPartitionable(const Query& query,
   GOOGLESQL_ASSIGN_OR_RETURN(auto analyzer_options,
                    MakeAnalyzerOptionsWithParameters(
                        local_query.declared_params,
-                       GetTimeZone(function_catalog_.GetLatestSchema())));
+                       GetTimeZone(function_catalog_.GetLatestSchema().get())));
   analyzer_options.set_prune_unused_columns(true);
   Catalog catalog{context.schema, &function_catalog_, type_factory_,
                   analyzer_options};
@@ -1580,7 +1586,7 @@ absl::Status QueryEngine::IsValidPartitionedDML(
   GOOGLESQL_ASSIGN_OR_RETURN(auto analyzer_options,
                    MakeAnalyzerOptionsWithParameters(
                        local_query.declared_params,
-                       GetTimeZone(function_catalog_.GetLatestSchema())));
+                       GetTimeZone(function_catalog_.GetLatestSchema().get())));
   analyzer_options.set_prune_unused_columns(true);
   Catalog catalog{context.schema, &function_catalog_, type_factory_,
                   analyzer_options};

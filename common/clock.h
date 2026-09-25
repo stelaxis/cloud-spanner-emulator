@@ -17,6 +17,8 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_COMMON_CLOCK_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_COMMON_CLOCK_H_
 
+#include <functional>
+
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 
@@ -42,10 +44,19 @@ class Clock {
  public:
   Clock();
 
+  // Uses `system_now` instead of the system clock. For tests.
+  explicit Clock(std::function<absl::Time()> system_now);
+
   // Returns the current time.
   absl::Time Now() ABSL_LOCKS_EXCLUDED(mu_);
 
  private:
+  // Returns the system time at microsecond granularity.
+  absl::Time SystemNowMicros() const;
+
+  // The system clock; absl::Now unless a test replaces it.
+  const std::function<absl::Time()> system_now_;
+
   // Mutex to guard state below.
   absl::Mutex mu_;
 

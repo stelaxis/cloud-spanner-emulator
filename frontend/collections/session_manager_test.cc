@@ -57,7 +57,10 @@ class SessionManagerTest : public testing::Test {
 };
 
 TEST_F(SessionManagerTest, CreateSession) {
-  absl::Time start_time = absl::Now();
+  // The emulator clock follows the system clock at microsecond granularity, so
+  // a session created in the same microsecond as `start_time` carries that
+  // microsecond, which can be earlier than `start_time` itself.
+  absl::Time start_time = absl::FromUnixMicros(absl::ToUnixMicros(absl::Now()));
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<Session> actual,
       session_manager_.CreateSession(test_labels_, multiplexed_, database_,
@@ -69,14 +72,15 @@ TEST_F(SessionManagerTest, CreateSession) {
                                      /*mux_txn_manager=*/nullptr));
   EXPECT_TRUE(
       absl::StartsWith(actual->session_uri(), database_->database_uri()));
-  EXPECT_GT(actual->create_time(), start_time);
-  EXPECT_GT(actual->approximate_last_use_time(), start_time);
+  EXPECT_GE(actual->create_time(), start_time);
+  EXPECT_GE(actual->approximate_last_use_time(), actual->create_time());
 
   EXPECT_TRUE(absl::StartsWith(actual_multiplexed->session_uri(),
                                database_->database_uri()));
   EXPECT_TRUE(actual_multiplexed->multiplexed());
-  EXPECT_GT(actual_multiplexed->create_time(), start_time);
-  EXPECT_GT(actual_multiplexed->approximate_last_use_time(), start_time);
+  EXPECT_GT(actual_multiplexed->create_time(), actual->create_time());
+  EXPECT_GE(actual_multiplexed->approximate_last_use_time(),
+            actual_multiplexed->create_time());
 }
 
 TEST_F(SessionManagerTest, GetSession) {
