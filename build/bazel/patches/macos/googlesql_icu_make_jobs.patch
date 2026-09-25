@@ -1,0 +1,13 @@
+macOS only: cap ICU's configure_make at -j4 (upstream hard-codes -j32 inside one Bazel action, ignoring --jobs); the Linux branch of the select() is untouched.
+
+--- a/bazel/icu.BUILD
++++ b/bazel/icu.BUILD
+@@ -41,7 +41,7 @@
+         "@platforms//os:macos": [
+             "ARFLAGS=\"-static -o\"",
+             "MAKE=gnumake",
+-            "-j32"
++            "-j4"
+         ],
+         "//conditions:default": [
+             "-j32"

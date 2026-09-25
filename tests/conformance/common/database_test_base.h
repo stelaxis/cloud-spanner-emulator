@@ -243,11 +243,29 @@ class DatabaseTest : public ::testing::Test {
   // is cumbersome for unit tests. This class acts as a proxy for implicitly
   // converting a list of C++ objects into client library Value objects.
   class ValueRow {
+#ifdef __APPLE__
+    // On macOS int64_t is `long long`, so a `long` argument matches several
+    // Value constructors equally well; pass it on as int64_t.
+    template <typename T>
+    static decltype(auto) ToValueArg(T&& v) {
+      if constexpr (std::is_same_v<std::decay_t<T>, long>) {  // NOLINT
+        return static_cast<std::int64_t>(v);
+      } else {
+        return std::forward<T>(v);
+      }
+    }
+#endif
+
    public:
     // Creates a vector of Value objects from an argument list.
     template <typename... Ts>
     ValueRow(Ts... values)  // NOLINT
+#ifdef __APPLE__
+        : row_({cloud::spanner::Value(
+              ToValueArg(std::forward<Ts>(values)))...}) {}
+#else
         : row_({cloud::spanner::Value(std::forward<Ts>(values))...}) {}
+#endif
 
     // Creates a vector of Value objects from a typed client library Row object.
     ValueRow(const cloud::spanner::Row& row) {  // NOLINT

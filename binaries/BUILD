@@ -28,10 +28,14 @@ licenses(["notice"])
 cc_binary(
     name = "emulator_main",
     srcs = ["emulator_main.cc"],
-    linkopts = [
-        "-static-libgcc",
-        "-static-libstdc++",
-    ],
+    # libgcc/libstdc++ are GNU toolchain libraries; Apple clang links libc++.
+    linkopts = select({
+        "@platforms//os:macos": [],
+        "//conditions:default": [
+            "-static-libgcc",
+            "-static-libstdc++",
+        ],
+    }),
     deps = [
         "//common:config",
         "//frontend/server",
