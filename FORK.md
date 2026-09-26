@@ -45,19 +45,160 @@ git fetch upstream --tags && git merge vX.Y.Z
   by digest, without rebuilding. A missing SHA image or revision mismatch fails
   promotion; finish the master build and rerun the release job.
 
-PRs to master build both architectures without publishing. PRs and master pushes
-run the full upstream unit/conformance selection on native amd64 in eight parallel
-area shards. They depend only on `Build (amd64)`; `Build (arm64)` continues in
-parallel. Each shard downloads the compiled amd64 builder from the current run,
-with a six-hour job budget: up to 20 minutes to download, 30 to load, 285 for tests,
-and 25 for setup/log cleanup. Loading is only `docker load`, with no build fallback.
-The required `Upstream unit and conformance tests` aggregate fails unless **every
-shard succeeds**, including when the matrix is skipped by a failed amd64 build.
-Its `always()` condition also evaluates cancelled runs and rejects non-success.
-Publishing requires both native Build jobs and this aggregate.
+### What runs when
 
-Each shard runs `bazel test -c opt --jobs="$BAZEL_JOBS" --test_output=errors
---nocache_test_results --` followed by its target patterns:
+| Event | amd64 build + 8 test shards | arm64 build | Cache | Publishes |
+| --- | --- | --- | --- | --- |
+| PR to `master` | yes | no; `Build (arm64)` is skipped | read-only (reader) | no |
+| Push to `master` | yes | yes | read-write (writer) | `edge`, `sha-…` |
+| `workflow_dispatch` on `master` | yes | yes | read-write (writer) | no |
+| `workflow_dispatch` on another branch | yes | yes | read-only (reader) | no |
+| Push of a `v*-stx.*` tag | no | no | none | promotes `sha-…` |
+
+Pull requests do not build arm64. GitHub counts a job skipped by its `if:` as
+passing, so the required `Build (arm64)` check passes on PRs without a runner.
+On every other event its condition is true: it runs the real build and, like
+before, fails rather than skips if `Dependencies (arm64)` did not succeed.
+Publishing needs both `Build` jobs and the test aggregate, so `edge` and every
+`sha-…` image, and hence every release tag, has a passing arm64 build. An
+arm64-only breakage therefore surfaces on the `master` push after the merge,
+not on the PR; run the workflow on the PR branch with `workflow_dispatch` to
+check arm64 before merging.
+
+### Bazel on the runner
+
+CI runs Bazel on the runner inside a toolchain container, not in `docker build`.
+Each job starts the container from the `toolchain` stage of
+`build/docker/Dockerfile.ubuntu` (`test-toolchain` on amd64, which adds the
+pinned Google Cloud CLI for `tests/gcloud`), with the checkout at `/src` and a
+fixed output base, so actions have the same paths in every job and run. Each
+architecture builds that image once per run; later jobs load the same archive.
+
+`Build` jobs build `//binaries:emulator_main` and `//binaries:gateway_main`, then
+stage exactly the files the release stage copies (the two binaries, the
+toolchain's `libstdc++.so.6` and `licenses.txt.gz`, from the Dockerfile's
+license loop) at their `build`-stage paths. The runtime image is built with
+`--build-context build=<staged dir>`: a named context replaces the Dockerfile's
+`build` stage, so the release stage itself, and with it the gateway, entrypoint,
+ports and environment handling, is unchanged. The smoke test runs against that
+image as before.
+
+CI flags live in the `ci` config in `.bazelrc`, including `--jobs=2`: generated
+C++ files exceed 5 GiB per compiler, and two workers leave room for Bazel,
+linking and the OS on 16-GiB runners. Raising it needs CI peak-memory evidence.
+Local builds keep `--jobs=auto`.
+
+### Remote cache
+
+Bazel caches action outputs and test results in a GCS bucket over its HTTP cache
+protocol (`--remote_cache=https://storage.googleapis.com/<bucket>`). Unchanged
+tests report `(cached) PASSED` and do not run. Jobs download only what local
+actions need (`--remote_download_minimal`; `Build` jobs also fetch their
+binaries).
+
+Configure it with these repository **variables** (Settings → Secrets and
+variables → Actions → Variables); none is secret:
+
+| Variable | Value |
+| --- | --- |
+| `BAZEL_CACHE_BUCKET` | Bucket name, e.g. `stelaxis-bazel-cache-staging` |
+| `GCP_WIF_PROVIDER` | `projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>` |
+| `GCP_CACHE_SERVICE_ACCOUNT` | Writer: service account email with object read/write on the bucket |
+| `GCP_CACHE_READER_SERVICE_ACCOUNT` | Reader: service account email with object read-only (`objectViewer`) on the bucket |
+
+`google-github-actions/auth` exchanges the job's GitHub OIDC token through
+Workload Identity Federation and writes a short-lived credentials file that is
+mounted into the container for `--google_credentials`. Only the Bazel jobs have
+`id-token: write`.
+
+**PRs can read the cache but never write it; IAM enforces this.** Pushes to
+`master` and `workflow_dispatch` runs on `master` impersonate the writer and
+upload. Every other run, including every PR and every dispatch on another
+branch, impersonates the reader and also passes `--noremote_upload_local_results`,
+so Bazel does not attempt uploads the reader would be refused. The workflow's
+choice is not the safeguard: a PR can edit the workflow to request the writer, but
+the writer is impersonable only by the OIDC subject
+`repo:stelaxis@236181695/cloud-spanner-emulator@1386109810:ref:refs/heads/master`,
+which only runs on the `master` ref present. The repository has GitHub's
+immutable OIDC subjects enabled, so the subject carries the owner and repository
+IDs. A PR run's subject is `…:pull_request`; the reader is
+impersonable by any run of this repository. Pushes to `master` require a
+reviewed PR.
+
+**No Bazel job may declare an `environment:`.** A job with an environment
+presents the subject `repo:…:environment:<name>` instead of the ref, so the
+writer binding would refuse even `master`.
+
+| Event and ref | Identity | Uploads |
+| --- | --- | --- |
+| Push to `master` | writer | yes |
+| `workflow_dispatch` on `master` | writer | yes |
+| `workflow_dispatch` on another branch | reader | no |
+| PR from this repository | reader | no |
+| PR from a fork | none, builds cold | no |
+| Tag push | none, no Bazel jobs | no |
+
+If `BAZEL_CACHE_BUCKET` or `GCP_WIF_PROVIDER` is unset, or the run's own
+account variable is unset (the writer on `master`, the reader elsewhere), the
+run has no credentials and builds cold with no remote cache; it still goes
+green, just slowly. A `master` run never falls back to the reader.
+
+Bazel does not hash the system compiler or headers into action keys. The
+toolchain stage records the architecture, the Bazel version and the installed
+versions of GCC, libstdc++, libc6-dev, binutils, protoc and Python in
+`/etc/bazel-toolchain.txt`; its hash is the `cache-silo-key` exec property,
+which is part of every action key. When one of those packages changes, CI
+starts a fresh cache rather than mixing objects from two compilers. Each job
+summary shows the cache mode, the key and its inputs.
+
+`linux-libc-dev` (kernel UAPI headers) is deliberately left out. Ubuntu updates
+it with every kernel security release, every few weeks, and each change would
+discard the whole cache; those headers are a stable ABI. The gcloud CLI is also
+not in the key, because only tests run it: its version is part of `GCLOUD_DIR`,
+and `--test_env=GCLOUD_DIR` puts that in every test's key. A new CLI re-runs
+the tests but reuses compiled outputs.
+
+The bucket deletes objects 30 days after they were written, even if they are
+still read. Bazel retries a build (`--experimental_remote_cache_eviction_retries`)
+when an entry disappears mid-build, and the next `master` run rewrites what it
+had to rebuild.
+
+**Warming the cache.** Every `master` push warms it. To warm it without a
+push, for example after creating the bucket or after a toolchain change:
+
+```sh
+gh workflow run emulator.yml --repo stelaxis/cloud-spanner-emulator --ref master
+```
+
+A cold `master` run takes about as long as CI did before the cache (hours, see
+below). Until it finishes, PRs get few cache hits.
+
+### Jobs and the cold path
+
+The job chains are `Build (amd64)` → eight test shards → the aggregate, and, off
+PRs, `Dependencies (arm64)` → `Build (arm64)`. A cold build must still fit
+GitHub's six-hour job limit whether the cache is empty, evicted or unset:
+
+- `Build (amd64)` compiles gRPC, protobuf, GoogleSQL and the emulator in one job.
+  Cold, the previous stages took about 34 + 67 + 137 minutes, around four hours.
+- arm64 is slower: about 35 + 96 minutes for dependencies and up to 255 for the
+  emulator. `Dependencies (arm64)` builds gRPC, protobuf and the GoogleSQL
+  analyzer in its own job, so each arm64 job stays under about 4.5 hours.
+- Each Bazel job that others depend on uploads a `bazel-handoff-<arch>` artifact:
+  the toolchain image and a Bazel `--disk_cache` holding every result it
+  computed locally. The next jobs use it alongside the remote cache. Without a
+  writable remote cache (PRs, unset variables, forks), this is what stops each
+  test shard from recompiling the dependencies; with a warm cache the disk
+  cache is small.
+  Artifacts expire after three days; rerun the producer if they have.
+
+The GitHub Actions cache is not used: it cannot hold these outputs within the
+10-GB repository quota.
+
+### Tests
+
+Each test shard runs `bazel test --config=ci --` followed by its target
+patterns on native amd64. The shards depend only on `Build (amd64)`.
 
 | Shard | Patterns |
 | --- | --- |
@@ -76,72 +217,19 @@ inventory of tracked `BUILD`/`BUILD.bazel` files verified every included package
 and all 227 `cc_test` plus six `py_test` declarations belong to exactly one shard.
 The one `test_suite` expands only tests in its own package; four other `cc_test`
 declarations are under the excluded PostgreSQL `src` tree. These are target
-counts, not test-case counts. No local Bazel query/build was needed for this check;
-cold shard durations still need measurement in CI.
+counts, not test-case counts.
 
-The test image adds a pinned, checksum-verified Google Cloud CLI and `GCLOUD_DIR`
-for `tests/gcloud`. Tests run via `docker run`, so BuildKit cannot clip their logs.
-Failures upload `bazel-testlogs-<area>` and the full console log for seven days.
-Build and test job summaries include `df -h`, including after loading the builder
-and before test-container cleanup. Tests use the builder's compiled dependencies;
-the image includes `/src` and `/root/.cache/bazel` in ordinary layers, and Bazel
-is shut down before export. Build and test use the same working directory, user,
-Bazel version, `-c opt` and `BAZEL_JOBS`. Only test-specific actions need compiling.
-There is no separate Bazel disk cache or per-shard Docker build.
+The shards stay because of the cold path: test-only compilation took 14–100
+minutes per shard in the last cold run, about eight runner-hours in total, which
+one six-hour job cannot hold. With a warm cache most shards finish in minutes.
 
-Separate native jobs per architecture build gRPC/protobuf, GoogleSQL, and the
-runtime, each with a six-hour budget. GoogleSQL still builds value, parser,
-resolved AST, resolver and analyzer in order on one runner. RPC and GoogleSQL jobs
-each export one complete BuildKit local cache (`mode=max`, zstd) as an artifact for the next
-job. Export/upload failure fails the producer; artifacts contain both the manifest
-and every referenced layer. `Build (amd64)` also exports `test-builder` from its
-live BuildKit builder, adds the pinned Google Cloud CLI, and uploads the Docker
-export `.tar` directly, without another gzip pass. All eight test shards load that
-same archive, retaining compiled outputs. The amd64 BuildKit OCI worker has GC
-disabled so it retains the `build` stage until the test-builder export finishes.
+The required `Upstream unit and conformance tests` aggregate fails unless
+**every shard succeeds**, including when the matrix is skipped by a failed amd64
+build. Its `always()` condition also evaluates cancelled runs and rejects
+non-success. Failures upload `bazel-testlogs-<area>` and the full console log
+for seven days. Job summaries include `df -h` and the handoff size.
 
-This replaces all `type=gha` layer caches. Run
-[36067621737](https://github.com/stelaxis/cloud-spanner-emulator/actions/runs/36067621737)
-imported cache manifests, then all eight shards reported 16 missing layer blobs
-and rebuilt dependencies until their 75-minute builder step timed out. The
-Dockerfile had no cache mounts. The repository was near its 10-GB cache limit;
-`CACHED` metadata alone did not guarantee its layer data still existed.
-
-This workflow writes **zero compilation data to the Actions cache quota**;
-Buildx binary caching is disabled too. Dependency/builder artifacts use separate
-Actions artifact storage, expire after three days, and are replaced on job reruns.
-This allows next-day retries of failed downstream jobs. Runtime image artifacts
-retain their one-day lifetime; failure logs retain seven days. Cache directories
-are fresh per job, with no cross-run accumulation or prefix restore. This costs
-artifact storage/transfer and rebuilds dependencies on each new workflow run.
-Rerun all producer jobs if their artifacts have expired. A partial GoogleSQL job
-does not publish a reusable snapshot; its last successful upstream job does.
-Image archive size and runner free disk are reported in job summaries.
-
-Planning estimates from that run, excluding queue time: RPC 35–55 minutes per
-architecture; GoogleSQL 50–70 minutes amd64 / 95–115 arm64; Build 150–180 minutes
-amd64 / 260–285 arm64. These allow transfer/export overhead beyond observed
-31/35, 45/90 and 141/255-minute jobs respectively. Test shards are unmeasured:
-allow roughly 45–210 minutes each for transfer and test-only compilation/execution,
-with a 285-minute test-step ceiling. The next CI run must confirm those estimates.
-
-The independent job chains are `rpc-deps-amd64` → `deps-amd64` → `Build (amd64)`
-and `rpc-deps-arm64` → `deps-arm64` → `Build (arm64)`. Only the amd64 Build leads
-to the eight shards and their aggregate; publishing still joins both Builds and
-the aggregate. No amd64 job or shard waits for any arm64 job. The observed amd64
-durations total **3h37 (31 + 45 + 141 minutes)**, giving a target of about **3h40
-from push to shard jobs starting**, plus queue and artifact transfer/export
-overhead. The planning allowances above put this at roughly 3h55–5h05 excluding
-queue time; the next run must measure the overhead. All dependency and Build jobs
-are ordinary jobs, preserving the exact `Build (amd64)` and `Build (arm64)` check
-names without reusable-workflow prefixes. Tag promotion remains independent and
-does not compile.
-
-CI sets `BAZEL_JOBS=2` once for all builds and tests. Observed generated C++ files
-exceed 5 GiB per compiler; two workers leave room for Bazel, linking, and the OS
-on the 4-vCPU/16-GiB runners. Raising this to three or four needs CI peak-memory
-evidence. **Changing `BAZEL_JOBS` invalidates the dependency layers and rebuilds
-GoogleSQL from scratch.**
+### Publishing
 
 Publication waits for both native smoke tests and the full suite. Only publication
 and release promotion receive `packages: write` via `GITHUB_TOKEN`; they do not
@@ -166,7 +254,9 @@ docker run --rm --name stelaxis-emulator -p 9010:9010 -p 9020:9020 stelaxis-emul
 curl --fail localhost:9020/v1/projects/test/instances
 ```
 
-The default Docker platform on an arm64 engine is arm64. Upstream selects
+The default Docker platform on an arm64 engine is arm64. The local build compiles
+everything in Docker and does not use the remote cache. Upstream selects
 `build --jobs=auto` in `.bazelrc`; this fork's `ARG BAZEL_JOBS=auto` preserves that
 local default. Use `--build-arg BAZEL_JOBS=2` to limit memory use on smaller Docker
-VMs. Allow ample disk space and retain the build cache.
+VMs. Allow ample disk space and retain the build cache: the compiled dependencies
+are their own `deps` layer.

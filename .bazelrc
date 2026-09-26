@@ -105,3 +105,18 @@ test --test_env=GCLOUD_DIR
 # Inform GoogleTest and gMock that Abseil libraries are available
 build --define=absl=1
 build --cxxopt=-DGTEST_HAS_ABSL=1
+
+# =============================================================================
+# 6. CI (see FORK.md)
+# =============================================================================
+# CI passes --config=ci on the command line, so it overrides --jobs=auto above.
+# Per-job cache, credential and cache-silo flags come from /etc/bazel.bazelrc.
+# Generated C++ files can exceed 5 GiB per compiler: two jobs fit 16-GiB runners.
+build:ci --jobs=2
+build:ci --compilation_mode=opt
+# Fetch only what local actions need; the build job asks for its binaries.
+build:ci --remote_download_minimal
+# Re-run actions whose cached outputs were deleted by the bucket lifecycle.
+build:ci --experimental_remote_cache_eviction_retries=5
+build:ci --verbose_failures
+test:ci --test_output=errors
