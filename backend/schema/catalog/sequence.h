@@ -23,6 +23,7 @@
 #include "absl/base/thread_annotations.h"
 #include "absl/memory/memory.h"
 #include "absl/status/status.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "backend/common/ids.h"
 #include "backend/schema/ddl/operations.pb.h"
@@ -83,6 +84,11 @@ class Sequence : public SchemaNode {
 
   // Remove the sequence from the last values map.
   void RemoveSequenceFromLastValuesMap() const
+      ABSL_LOCKS_EXCLUDED(SequenceMutex);
+
+  // Removes from the last values map every sequence whose id starts with
+  // `prefix`.
+  static void RemoveSequenceCountersWithIdPrefix(absl::string_view prefix)
       ABSL_LOCKS_EXCLUDED(SequenceMutex);
 
   // SchemaNode interface implementation.

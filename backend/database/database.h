@@ -68,8 +68,8 @@ class Database {
       Clock* clock, std::string_view database_id,
       const SchemaChangeOperation& schema_change_operation);
 
-  // Releases this database's sequence counters, which live in a process-wide
-  // map.
+  // Releases the counters of every sequence this database created, which live
+  // in a process-wide map, including those of failed schema changes.
   ~Database();
 
   // Creates a read only transaction attached to this database.
@@ -166,6 +166,9 @@ class Database {
 
   // Holds the database id.
   std::string database_id_;
+
+  // Prefix of the ids of this database's sequences, unique in the process.
+  std::string sequence_id_prefix_;
 
   // Unique ID generator for TransactionID.
   TransactionIDGenerator transaction_id_generator_;

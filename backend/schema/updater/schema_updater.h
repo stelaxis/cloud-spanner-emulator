@@ -73,6 +73,11 @@ struct SchemaChangeContext {
 
   // The database id for the schema change.
   std::string database_id;
+
+  // Prefix of the ids of the sequences the schema change creates. A database
+  // gives its own, to release every counter of its sequences
+  // (Sequence::RemoveSequenceCountersWithIdPrefix).
+  std::string sequence_id_prefix = "seq_";
 };
 
 // The result of processing a set of DDL statements for a schema change request.
