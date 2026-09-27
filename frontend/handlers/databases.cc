@@ -259,22 +259,7 @@ absl::Status DropDatabase(RequestContext* ctx,
   GOOGLESQL_ASSIGN_OR_RETURN(std::shared_ptr<Instance> instance,
                    GetInstance(ctx, MakeInstanceUri(project_id, instance_id)));
 
-  // Clean up resources associated with the database.
-  auto maybe_database =
-      ctx->env()->database_manager()->GetDatabase(request->database());
-  if (maybe_database.ok()) {
-    GOOGLESQL_ASSIGN_OR_RETURN(
-        std::vector<std::shared_ptr<Session>> sessions,
-        ctx->env()->session_manager()->ListSessions(
-            request->database(), /*include_multiplex_sessions=*/true));
-    for (const auto& session : sessions) {
-      GOOGLESQL_RETURN_IF_ERROR(ctx->env()->session_manager()->DeleteSession(
-          session->session_uri(), /*delete_multiplex_sessions=*/true));
-    }
-  }
-
-  // Clean up the database.
-  return ctx->env()->database_manager()->DeleteDatabase(request->database());
+  return DeleteDatabase(ctx, request->database());
 }
 REGISTER_GRPC_HANDLER(DatabaseAdmin, DropDatabase);
 

@@ -18,8 +18,10 @@
 #include <string>
 #include <vector>
 
+#include "google/longrunning/operations.pb.h"
 #include "google/protobuf/any.pb.h"
 #include "google/spanner/admin/database/v1/spanner_database_admin.pb.h"
+#include "google/spanner/admin/instance/v1/spanner_instance_admin.pb.h"
 #include "google/spanner/v1/commit_response.pb.h"
 #include "google/protobuf/descriptor.pb.h"
 #include "gmock/gmock.h"
@@ -28,15 +30,22 @@
 #include "tests/common/proto_matchers.h"
 #include "absl/flags/flag.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
+#include "backend/common/ids.h"
 #include "backend/database/database.h"
 #include "backend/schema/catalog/sequence.h"
 #include "backend/schema/printer/print_ddl.h"
 #include "common/constants.h"
+#include "common/errors.h"
 #include "common/limits.h"
 #include "frontend/collections/database_manager.h"
+#include "frontend/collections/multiplexed_session_transaction_manager.h"
+#include "frontend/common/protos.h"
 #include "frontend/common/uris.h"
+#include "frontend/entities/database.h"
 #include "tests/common/scoped_feature_flags_setter.h"
 #include "tests/common/test_env.h"
 
@@ -48,9 +57,11 @@ namespace frontend {
 namespace {
 
 using google::spanner::emulator::backend::Sequence;
+using googlesql_base::testing::IsOkAndHolds;
 using googlesql_base::testing::StatusIs;
 
 namespace database_api = ::google::spanner::admin::database::v1;
+namespace instance_api = ::google::spanner::admin::instance::v1;
 namespace operations_api = ::google::longrunning;
 namespace protobuf_api = ::google::protobuf;
 namespace spanner_api = ::google::spanner::v1;
@@ -595,6 +606,217 @@ TEST_F(DatabaseApiTest, CreateSameNameSequencesInTwoDatabases) {
     absl::MutexLock lock(Sequence::SequenceMutex);
     ASSERT_EQ(Sequence::SequenceLastValues.size(), 2);
   }
+}
+
+// Tests for what DropDatabase releases.
+
+std::vector<std::string> SequenceTableSchema() {
+  return {R"(CREATE SEQUENCE test_sequence OPTIONS (
+  sequence_kind = 'bit_reversed_positive'))",
+          R"(CREATE TABLE test_table (
+  id INT64 DEFAULT (GET_NEXT_SEQUENCE_VALUE(SEQUENCE test_sequence)),
+  col INT64,
+) PRIMARY KEY(id))"};
+}
+
+size_t SequenceCounterCount() {
+  absl::MutexLock lock(Sequence::SequenceMutex);
+  return Sequence::SequenceLastValues.size();
+}
+
+class DropDatabaseTest : public DatabaseApiTest {
+ protected:
+  std::weak_ptr<Database> GetDatabaseWeakPtr(const std::string& database_uri) {
+    absl::StatusOr<std::shared_ptr<Database>> database =
+        test_env()->env()->database_manager()->GetDatabase(database_uri);
+    if (!database.ok()) return {};
+    return *database;
+  }
+
+  absl::Status Select1(const std::string& session) {
+    spanner_api::ExecuteSqlRequest request;
+    request.set_session(session);
+    request.set_sql("SELECT 1");
+    spanner_api::ResultSet result;
+    return ExecuteSql(request, &result);
+  }
+
+  absl::StatusOr<std::vector<int64_t>> SelectIds(const std::string& session) {
+    spanner_api::ExecuteSqlRequest request;
+    request.set_session(session);
+    request.set_sql("SELECT id FROM test_table ORDER BY col");
+    spanner_api::ResultSet result;
+    GOOGLESQL_RETURN_IF_ERROR(ExecuteSql(request, &result));
+    std::vector<int64_t> ids;
+    for (const auto& row : result.rows()) {
+      ids.push_back(std::stoll(row.values(0).string_value()));
+    }
+    return ids;
+  }
+
+  absl::Status UpdateDdlWithOperationId(const std::string& database_uri,
+                                        const std::string& operation_id) {
+    grpc::ClientContext context;
+    database_api::UpdateDatabaseDdlRequest request;
+    request.set_database(database_uri);
+    request.set_operation_id(operation_id);
+    request.add_statements("CREATE INDEX test_index ON test_table(col)");
+    operations_api::Operation operation;
+    return test_env()->database_admin_client()->UpdateDatabaseDdl(
+        &context, request, &operation);
+  }
+
+  absl::StatusOr<int> CountOperations(const std::string& resource_uri) {
+    grpc::ClientContext context;
+    operations_api::ListOperationsRequest request;
+    request.set_name(absl::StrCat(resource_uri, "/operations"));
+    operations_api::ListOperationsResponse response;
+    GOOGLESQL_RETURN_IF_ERROR(test_env()->operations_client()->ListOperations(
+        &context, request, &response));
+    return response.operations_size();
+  }
+};
+
+TEST_F(DropDatabaseTest, ReleasesDatabaseWithIdleSessions) {
+  GOOGLESQL_ASSERT_OK(CreateDatabase(test_instance_uri_, test_database_name_));
+  std::weak_ptr<Database> database = GetDatabaseWeakPtr(test_database_uri_);
+  ASSERT_FALSE(database.expired());
+  GOOGLESQL_ASSERT_OK(CreateTestSession(/*multiplexed=*/false).status());
+  // Past the one-hour expiration of idle sessions.
+  test_env()->AdvanceClock(absl::Hours(2));
+  GOOGLESQL_ASSERT_OK(CreateTestSession(/*multiplexed=*/false).status());
+  GOOGLESQL_ASSERT_OK(CreateTestSession(/*multiplexed=*/true).status());
+
+  GOOGLESQL_ASSERT_OK(DropDatabase(test_database_uri_));
+
+  EXPECT_TRUE(database.expired());
+}
+
+TEST_F(DropDatabaseTest, DeleteInstanceReleasesDatabaseWithIdleSessions) {
+  GOOGLESQL_ASSERT_OK(CreateDatabase(test_instance_uri_, test_database_name_));
+  std::weak_ptr<Database> database = GetDatabaseWeakPtr(test_database_uri_);
+  GOOGLESQL_ASSERT_OK(CreateTestSession(/*multiplexed=*/false).status());
+  test_env()->AdvanceClock(absl::Hours(2));
+
+  grpc::ClientContext context;
+  instance_api::DeleteInstanceRequest request;
+  request.set_name(test_instance_uri_);
+  protobuf_api::Empty response;
+  GOOGLESQL_ASSERT_OK(test_env()->instance_admin_client()->DeleteInstance(
+      &context, request, &response));
+
+  EXPECT_TRUE(database.expired());
+  // For TearDown.
+  GOOGLESQL_ASSERT_OK(CreateTestInstance());
+}
+
+TEST_F(DropDatabaseTest, SessionsOfDroppedDatabaseFailAsUpstream) {
+  GOOGLESQL_ASSERT_OK(CreateDatabase(test_instance_uri_, test_database_name_));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(std::string idle_session,
+                                 CreateTestSession(/*multiplexed=*/false));
+  test_env()->AdvanceClock(absl::Hours(2));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(std::string recent_session,
+                                 CreateTestSession(/*multiplexed=*/false));
+  GOOGLESQL_ASSERT_OK(DropDatabase(test_database_uri_));
+
+  // A session's database is looked up before the session itself.
+  const absl::Status database_not_found =
+      error::DatabaseNotFound(test_database_uri_);
+  for (const std::string& session : {idle_session, recent_session}) {
+    EXPECT_THAT(Select1(session),
+                StatusIs(database_not_found.code(),
+                         std::string(database_not_found.message())));
+  }
+
+  GOOGLESQL_ASSERT_OK(CreateDatabase(test_instance_uri_, test_database_name_));
+  for (const std::string& session : {idle_session, recent_session}) {
+    const absl::Status session_not_found = error::SessionNotFound(session);
+    EXPECT_THAT(Select1(session),
+                StatusIs(session_not_found.code(),
+                         std::string(session_not_found.message())));
+  }
+}
+
+TEST_F(DropDatabaseTest, ReleasesSequenceCounters) {
+  const size_t counters = SequenceCounterCount();
+  GOOGLESQL_ASSERT_OK(CreateDatabase(test_instance_uri_, test_database_name_,
+                                     SequenceTableSchema()));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(const std::string session,
+                                 CreateTestSession(/*multiplexed=*/false));
+  spanner_api::CommitResponse commit_response;
+  GOOGLESQL_ASSERT_OK(
+      Commit(GenerateSequenceTableInsert(session), &commit_response));
+  ASSERT_EQ(SequenceCounterCount(), counters + 1);
+
+  GOOGLESQL_ASSERT_OK(DropDatabase(test_database_uri_));
+
+  EXPECT_EQ(SequenceCounterCount(), counters);
+}
+
+TEST_F(DropDatabaseTest, DeletesOperations) {
+  GOOGLESQL_ASSERT_OK(CreateDatabase(test_instance_uri_, test_database_name_,
+                                     SequenceTableSchema()));
+  GOOGLESQL_ASSERT_OK(UpdateDdlWithOperationId(test_database_uri_, "ddl1"));
+  EXPECT_THAT(CountOperations(test_database_uri_), IsOkAndHolds(2));
+
+  GOOGLESQL_ASSERT_OK(DropDatabase(test_database_uri_));
+
+  EXPECT_THAT(CountOperations(test_database_uri_), IsOkAndHolds(0));
+  operations_api::Operation operation;
+  EXPECT_THAT(
+      GetOperation(MakeOperationUri(test_database_uri_, "ddl1"), &operation),
+      StatusIs(absl::StatusCode::kNotFound));
+}
+
+TEST_F(DropDatabaseTest, RemovesMultiplexedSessionTransactions) {
+  GOOGLESQL_ASSERT_OK(CreateDatabase(test_instance_uri_, test_database_name_));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(const std::string session,
+                                 CreateTestSession(/*multiplexed=*/true));
+  spanner_api::BeginTransactionRequest request;
+  request.set_session(session);
+  request.mutable_options()->mutable_read_write();
+  spanner_api::Transaction transaction;
+  GOOGLESQL_ASSERT_OK(BeginTransaction(request, &transaction));
+  const backend::TransactionID id = TransactionIDFromProto(transaction.id());
+  MultiplexedSessionTransactionManager* mux_txn_manager =
+      test_env()->env()->mux_txn_manager();
+  GOOGLESQL_ASSERT_OK(
+      mux_txn_manager->GetCurrentTransactionOnMultiplexedSession(
+          test_database_uri_, id));
+
+  GOOGLESQL_ASSERT_OK(DropDatabase(test_database_uri_));
+
+  EXPECT_THAT(mux_txn_manager->GetCurrentTransactionOnMultiplexedSession(
+                  test_database_uri_, id),
+              StatusIs(absl::StatusCode::kNotFound));
+}
+
+TEST_F(DropDatabaseTest, RecreatedDatabaseStartsClean) {
+  const size_t counters = SequenceCounterCount();
+  GOOGLESQL_ASSERT_OK(CreateDatabase(test_instance_uri_, test_database_name_,
+                                     SequenceTableSchema()));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(std::string session,
+                                 CreateTestSession(/*multiplexed=*/false));
+  spanner_api::CommitResponse commit_response;
+  GOOGLESQL_ASSERT_OK(
+      Commit(GenerateSequenceTableInsert(session), &commit_response));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(std::vector<int64_t> first_ids,
+                                 SelectIds(session));
+  ASSERT_EQ(first_ids.size(), 2);
+  GOOGLESQL_ASSERT_OK(UpdateDdlWithOperationId(test_database_uri_, "ddl1"));
+  GOOGLESQL_ASSERT_OK(DropDatabase(test_database_uri_));
+
+  GOOGLESQL_ASSERT_OK(CreateDatabase(test_instance_uri_, test_database_name_,
+                                     SequenceTableSchema()));
+  EXPECT_EQ(SequenceCounterCount(), counters);
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(session,
+                                 CreateTestSession(/*multiplexed=*/false));
+  EXPECT_THAT(SelectIds(session), IsOkAndHolds(testing::IsEmpty()));
+  GOOGLESQL_ASSERT_OK(
+      Commit(GenerateSequenceTableInsert(session), &commit_response));
+  EXPECT_THAT(SelectIds(session), IsOkAndHolds(first_ids));
+  // The dropped database's operation ids are free again.
+  GOOGLESQL_EXPECT_OK(UpdateDdlWithOperationId(test_database_uri_, "ddl1"));
 }
 
 }  // namespace

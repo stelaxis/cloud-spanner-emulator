@@ -16,6 +16,7 @@
 
 #include "frontend/collections/multiplexed_session_transaction_manager.h"
 
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -75,6 +76,16 @@ MultiplexedSessionTransactionManager::GetCurrentTransactionOnMultiplexedSession(
 void MultiplexedSessionTransactionManager::RemoveFromCurrentTransactionsLocked(
     const std::string& database_uri, backend::TransactionID txn_id) {
   current_transactions_.erase(std::make_pair(database_uri, txn_id));
+}
+
+void MultiplexedSessionTransactionManager::RemoveDatabaseTransactions(
+    const std::string& database_uri) {
+  absl::MutexLock lock(mu_);
+  auto it = current_transactions_.lower_bound(std::make_pair(
+      database_uri, std::numeric_limits<backend::TransactionID>::min()));
+  while (it != current_transactions_.end() && it->first.first == database_uri) {
+    it = current_transactions_.erase(it);
+  }
 }
 
 void MultiplexedSessionTransactionManager::ClearOldTransactionsLocked() {

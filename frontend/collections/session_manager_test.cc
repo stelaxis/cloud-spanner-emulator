@@ -283,6 +283,48 @@ TEST_F(SessionManagerTest, ListSessionsWithSimilarPrefix) {
   }
 }
 
+TEST_F(SessionManagerTest, CreateSessionFailsOnDroppedDatabase) {
+  database_->MarkDropped();
+  EXPECT_THAT(
+      session_manager_.CreateSession(test_labels_, multiplexed_, database_,
+                                     /*mux_txn_manager=*/nullptr),
+      googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
+}
+
+TEST(SessionManagerDropTest, DeleteDatabaseSessionsReleasesTheDatabase) {
+  absl::Time now = absl::FromUnixSeconds(1700000000);
+  Clock clock([&now] { return now; });
+  SessionManager session_manager(&clock);
+  DatabaseManager database_manager(&clock);
+  const std::string uri = "projects/test-p/instances/test-i/databases/db";
+  const std::string similar_uri = uri + "2";
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(std::shared_ptr<Database> database,
+                                 database_manager.CreateDatabase(uri, {}));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Database> similar_database,
+      database_manager.CreateDatabase(similar_uri, {}));
+  GOOGLESQL_ASSERT_OK(session_manager.CreateSession({}, /*multiplexed=*/false,
+                                                    database, nullptr));
+  // Past the one-hour expiration of idle sessions.
+  now += absl::Hours(2);
+  GOOGLESQL_ASSERT_OK(session_manager.CreateSession({}, /*multiplexed=*/false,
+                                                    database, nullptr));
+  GOOGLESQL_ASSERT_OK(session_manager.CreateSession({}, /*multiplexed=*/true,
+                                                    database, nullptr));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Session> other,
+      session_manager.CreateSession({}, /*multiplexed=*/false, similar_database,
+                                    nullptr));
+  std::weak_ptr<Database> released = database;
+  database.reset();
+  GOOGLESQL_ASSERT_OK(database_manager.DeleteDatabase(uri));
+
+  session_manager.DeleteDatabaseSessions(uri);
+
+  EXPECT_TRUE(released.expired());
+  GOOGLESQL_EXPECT_OK(session_manager.GetSession(other->session_uri()));
+}
+
 }  // namespace frontend
 }  // namespace emulator
 }  // namespace spanner

@@ -68,6 +68,10 @@ class Database {
       Clock* clock, std::string_view database_id,
       const SchemaChangeOperation& schema_change_operation);
 
+  // Releases this database's sequence counters, which live in a process-wide
+  // map.
+  ~Database();
+
   // Creates a read only transaction attached to this database.
   absl::StatusOr<std::unique_ptr<ReadOnlyTransaction>>
   CreateReadOnlyTransaction(const ReadOnlyOptions& options);

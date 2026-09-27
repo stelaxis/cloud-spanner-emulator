@@ -19,8 +19,10 @@
 #include <memory>
 #include <string>
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "frontend/common/uris.h"
+#include "frontend/entities/database.h"
 #include "frontend/entities/instance.h"
 #include "googlesql/base/status_macros.h"
 
@@ -47,6 +49,23 @@ absl::StatusOr<std::shared_ptr<Database>> GetDatabase(
   GOOGLESQL_ASSIGN_OR_RETURN(std::shared_ptr<Instance> instance,
                    GetInstance(ctx, MakeInstanceUri(project_id, instance_id)));
   return ctx->env()->database_manager()->GetDatabase(database_uri);
+}
+
+absl::Status DeleteDatabase(RequestContext* ctx,
+                            const std::string& database_uri) {
+  ServerEnv* env = ctx->env();
+  absl::StatusOr<std::shared_ptr<Database>> database =
+      env->database_manager()->GetDatabase(database_uri);
+  if (database.ok()) {
+    // Swept while the database is still registered, so that a database
+    // re-created under the same URI cannot have sessions, transactions or
+    // operations yet.
+    (*database)->MarkDropped();
+    env->session_manager()->DeleteDatabaseSessions(database_uri);
+    env->mux_txn_manager()->RemoveDatabaseTransactions(database_uri);
+    env->operation_manager()->DeleteResourceOperations(database_uri);
+  }
+  return env->database_manager()->DeleteDatabase(database_uri);
 }
 
 absl::StatusOr<std::shared_ptr<Session>> GetSession(

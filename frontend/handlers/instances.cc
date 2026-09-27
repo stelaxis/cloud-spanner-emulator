@@ -223,16 +223,7 @@ absl::Status DeleteInstance(RequestContext* ctx,
       std::vector<std::shared_ptr<Database>> databases,
       ctx->env()->database_manager()->ListDatabases(request->name()));
   for (const auto& database : databases) {
-    GOOGLESQL_ASSIGN_OR_RETURN(
-        std::vector<std::shared_ptr<Session>> sessions,
-        ctx->env()->session_manager()->ListSessions(
-            database->database_uri(), /*include_multiplex_sessions=*/true));
-    for (const auto& session : sessions) {
-      GOOGLESQL_RETURN_IF_ERROR(ctx->env()->session_manager()->DeleteSession(
-          session->session_uri(), /*delete_multiplex_sessions=*/true));
-    }
-    GOOGLESQL_RETURN_IF_ERROR(ctx->env()->database_manager()->DeleteDatabase(
-        database->database_uri()));
+    GOOGLESQL_RETURN_IF_ERROR(DeleteDatabase(ctx, database->database_uri()));
   }
 
   // Clean up instance partitions associated with the instance.

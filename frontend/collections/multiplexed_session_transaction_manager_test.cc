@@ -221,6 +221,33 @@ TEST_F(MultiplexedSessionTransactionManagerTest, TransactionCollision) {
   ASSERT_NE(txn_from_manager1, txn_from_manager2);
 }
 
+TEST_F(MultiplexedSessionTransactionManagerTest,
+       RemoveDatabaseTransactionsKeepsOtherDatabases) {
+  MultiplexedSessionTransactionManager mux_txn_manager;
+  spanner_api::TransactionOptions options;
+  options.mutable_read_write();
+  for (int id : {1, 2}) {
+    GOOGLESQL_ASSERT_OK(mux_txn_manager.AddToCurrentTransactions(
+        std::make_shared<Transaction>(CreateReadWriteTransaction(id), nullptr,
+                                      options, Transaction::Usage::kMultiUse),
+        kDatabaseUri, id));
+  }
+  GOOGLESQL_ASSERT_OK(mux_txn_manager.AddToCurrentTransactions(
+      std::make_shared<Transaction>(CreateReadWriteTransaction(1), nullptr,
+                                    options, Transaction::Usage::kMultiUse),
+      kDatabaseUri2, 1));
+
+  mux_txn_manager.RemoveDatabaseTransactions(kDatabaseUri);
+
+  for (int id : {1, 2}) {
+    EXPECT_THAT(mux_txn_manager.GetCurrentTransactionOnMultiplexedSession(
+                    kDatabaseUri, id),
+                StatusIs(absl::StatusCode::kNotFound));
+  }
+  GOOGLESQL_EXPECT_OK(mux_txn_manager.GetCurrentTransactionOnMultiplexedSession(
+      kDatabaseUri2, 1));
+}
+
 }  // namespace
 
 }  // namespace frontend

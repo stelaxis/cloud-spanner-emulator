@@ -50,6 +50,7 @@
 #include "common/errors.h"
 #include "googlesql/base/status_macros.h"
 #include "absl/status/status.h"
+#include "backend/schema/catalog/sequence.h"
 
 namespace google {
 namespace spanner {
@@ -60,6 +61,14 @@ namespace backend {
 // value for an invalid transaction.
 Database::Database()
     : transaction_id_generator_(absl::ToUnixMicros(absl::Now())) {}
+
+Database::~Database() {
+  // Null if Create failed before building the catalog.
+  if (versioned_catalog_ == nullptr) return;
+  for (const Sequence* sequence : GetLatestSchema()->sequences()) {
+    sequence->RemoveSequenceFromLastValuesMap();
+  }
+}
 
 absl::StatusOr<std::unique_ptr<Database>> Database::Create(
     Clock* clock, std::string_view database_id,

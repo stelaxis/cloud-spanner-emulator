@@ -138,6 +138,21 @@ TEST_F(OperationManagerTest, ListsOperationsWithSimilarInstanceURI) {
             operation_pb.name());
 }
 
+TEST_F(OperationManagerTest, DeleteResourceOperationsKeepsOtherResources) {
+  const std::string database = "projects/1/instances/2/databases/db";
+  const std::string similar_database = "projects/1/instances/2/databases/db2";
+  GOOGLESQL_ASSERT_OK(manager()->CreateOperation(database, "a"));
+  GOOGLESQL_ASSERT_OK(manager()->CreateOperation(database, ""));
+  GOOGLESQL_ASSERT_OK(manager()->CreateOperation(similar_database, "a"));
+
+  manager()->DeleteResourceOperations(database);
+
+  EXPECT_THAT(manager()->ListOperations(database + "/operations/"),
+              googlesql_base::testing::IsOkAndHolds(testing::IsEmpty()));
+  GOOGLESQL_EXPECT_OK(
+      manager()->GetOperation(similar_database + "/operations/a"));
+}
+
 }  // namespace frontend
 }  // namespace emulator
 }  // namespace spanner

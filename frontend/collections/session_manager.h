@@ -39,7 +39,8 @@ class SessionManager {
  public:
   explicit SessionManager(Clock* clock) : clock_(clock) {}
 
-  // Creates a session attached to the given database.
+  // Creates a session attached to the given database. Returns
+  // DatabaseNotFound if the database has been dropped.
   absl::StatusOr<std::shared_ptr<Session>> CreateSession(
       const Labels& labels, bool multiplexed,
       std::shared_ptr<Database> database,
@@ -53,6 +54,11 @@ class SessionManager {
   // Deletes a session with the given URI.
   absl::Status DeleteSession(const std::string& session_uri,
                              bool delete_multiplex_sessions = false)
+      ABSL_LOCKS_EXCLUDED(mu_);
+
+  // Deletes every session of the given database, including idle and
+  // multiplexed ones, so that none of them keeps the database alive.
+  void DeleteDatabaseSessions(const std::string& database_uri)
       ABSL_LOCKS_EXCLUDED(mu_);
 
   // Lists sessions attached to the given database URI.

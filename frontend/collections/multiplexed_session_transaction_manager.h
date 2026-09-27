@@ -57,6 +57,10 @@ class MultiplexedSessionTransactionManager {
   GetCurrentTransactionOnMultiplexedSession(const std::string& database_uri,
                                             backend::TransactionID txn_id);
 
+  // Removes every transaction of the given database.
+  void RemoveDatabaseTransactions(const std::string& database_uri)
+      ABSL_LOCKS_EXCLUDED(mu_);
+
   // Called occasionally to clear old transactions.
   void ClearOldTransactions();
 

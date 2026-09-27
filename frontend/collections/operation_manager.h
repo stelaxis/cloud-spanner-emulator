@@ -81,6 +81,10 @@ class OperationManager {
   absl::Status DeleteOperation(const std::string& operation_uri)
       ABSL_LOCKS_EXCLUDED(mu_);
 
+  // Deletes every operation of the given resource.
+  void DeleteResourceOperations(const std::string& resource_uri)
+      ABSL_LOCKS_EXCLUDED(mu_);
+
   // Lists all the operations registered with the operation manager.
   absl::StatusOr<std::vector<std::shared_ptr<Operation>>> ListOperations(
       const std::string& resource_uri) ABSL_LOCKS_EXCLUDED(mu_);

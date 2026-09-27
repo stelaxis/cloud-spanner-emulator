@@ -44,6 +44,11 @@ absl::StatusOr<std::shared_ptr<Session>> SessionManager::CreateSession(
     std::shared_ptr<Database> database,
     MultiplexedSessionTransactionManager* mux_txn_manager) {
   absl::MutexLock lock(mu_);
+  // DeleteDatabaseSessions takes mu_ after the flag is set, so a session
+  // either sees the flag here or is deleted there.
+  if (database->dropped()) {
+    return error::DatabaseNotFound(database->database_uri());
+  }
   const std::string session_id = absl::StrCat(next_session_id_++);
   std::string session_uri =
       MakeSessionUri(database->database_uri(), session_id);
@@ -106,6 +111,19 @@ SessionManager::ListSessions(const std::string& database_uri,
     }
   }
   return sessions;
+}
+
+void SessionManager::DeleteDatabaseSessions(const std::string& database_uri) {
+  const std::string session_uri_prefix = absl::StrCat(database_uri, "/");
+  // Released after mu_: the last session may destroy the whole database.
+  std::vector<std::shared_ptr<Session>> deleted;
+  absl::MutexLock lock(mu_);
+  auto itr = session_map_.lower_bound(session_uri_prefix);
+  while (itr != session_map_.end() &&
+         absl::StartsWith(itr->first, session_uri_prefix)) {
+    deleted.push_back(std::move(itr->second));
+    itr = session_map_.erase(itr);
+  }
 }
 
 absl::Status SessionManager::DeleteSession(const std::string& session_uri,

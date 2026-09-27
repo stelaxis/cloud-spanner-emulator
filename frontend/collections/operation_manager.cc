@@ -77,6 +77,16 @@ absl::Status OperationManager::DeleteOperation(
   return absl::OkStatus();
 }
 
+void OperationManager::DeleteResourceOperations(
+    const std::string& resource_uri) {
+  const std::string prefix = MakeOperationUri(resource_uri, "");
+  absl::MutexLock lock(mu_);
+  auto itr = operations_map_.lower_bound(prefix);
+  while (itr != operations_map_.end() && absl::StartsWith(itr->first, prefix)) {
+    itr = operations_map_.erase(itr);
+  }
+}
+
 absl::StatusOr<std::vector<std::shared_ptr<Operation>>>
 OperationManager::ListOperations(const std::string& resource_uri) {
   absl::MutexLock lock(mu_);
