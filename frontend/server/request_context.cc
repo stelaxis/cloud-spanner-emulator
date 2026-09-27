@@ -54,18 +54,20 @@ absl::StatusOr<std::shared_ptr<Database>> GetDatabase(
 absl::Status DeleteDatabase(RequestContext* ctx,
                             const std::string& database_uri) {
   ServerEnv* env = ctx->env();
-  absl::StatusOr<std::shared_ptr<Database>> database =
-      env->database_manager()->GetDatabase(database_uri);
-  if (database.ok()) {
-    // Swept while the database is still registered, so that a database
-    // re-created under the same URI cannot have sessions, transactions or
-    // operations yet.
-    (*database)->MarkDropped();
-    env->session_manager()->DeleteDatabaseSessions(database_uri);
-    env->mux_txn_manager()->RemoveDatabaseTransactions(database_uri);
-    env->operation_manager()->DeleteResourceOperations(database_uri);
+  // Unregistering picks the database object this drop owns and marks it
+  // dropped. The sweeps below match that object, not the URI, so they leave
+  // alone a database re-created under the same URI meanwhile.
+  GOOGLESQL_ASSIGN_OR_RETURN(
+      std::shared_ptr<Database> database,
+      env->database_manager()->ReleaseDatabase(database_uri));
+  if (database == nullptr) {
+    return absl::OkStatus();
   }
-  return env->database_manager()->DeleteDatabase(database_uri);
+  if (env->drop_database_hook()) env->drop_database_hook()();
+  env->session_manager()->DeleteDatabaseSessions(*database);
+  env->mux_txn_manager()->RemoveDatabaseTransactions(*database);
+  env->operation_manager()->DeleteDatabaseOperations(database);
+  return absl::OkStatus();
 }
 
 absl::StatusOr<std::shared_ptr<Session>> GetSession(

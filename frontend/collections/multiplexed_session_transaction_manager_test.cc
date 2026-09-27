@@ -36,6 +36,7 @@
 #include "backend/transaction/options.h"
 #include "backend/transaction/read_write_transaction.h"
 #include "common/clock.h"
+#include "frontend/entities/database.h"
 #include "frontend/entities/transaction.h"
 #include "tests/common/schema_constructor.h"
 
@@ -86,6 +87,11 @@ class MultiplexedSessionTransactionManagerTest : public testing::Test {
 
   Clock clock_;
 
+  std::shared_ptr<Database> database_ =
+      std::make_shared<Database>(kDatabaseUri, nullptr, absl::Now());
+  std::shared_ptr<Database> database2_ =
+      std::make_shared<Database>(kDatabaseUri2, nullptr, absl::Now());
+
   // The type factory must outlive the type objects that it has made.
   std::unique_ptr<googlesql::TypeFactory> type_factory_;
 
@@ -115,19 +121,17 @@ TEST_F(MultiplexedSessionTransactionManagerTest, ValidateTransactionAdded) {
       std::move(backend_txn), nullptr, options, Transaction::Usage::kMultiUse);
 
   GOOGLESQL_ASSERT_OK(
-      mux_txn_manager.AddToCurrentTransactions(txn_to_add, kDatabaseUri, 1));
+      mux_txn_manager.AddToCurrentTransactions(txn_to_add, database_, 1));
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<Transaction> txn_from_manager,
-      mux_txn_manager.GetCurrentTransactionOnMultiplexedSession(kDatabaseUri,
-                                                                1));
+      mux_txn_manager.GetCurrentTransactionOnMultiplexedSession(*database_, 1));
   ASSERT_EQ(txn_from_manager->id(), 1);
   // Check that the transaction is not cleared here since its neither closed nor
   // has become stale
   mux_txn_manager.ClearOldTransactions();
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<Transaction> txn_from_manager_2,
-      mux_txn_manager.GetCurrentTransactionOnMultiplexedSession(kDatabaseUri,
-                                                                1));
+      mux_txn_manager.GetCurrentTransactionOnMultiplexedSession(*database_, 1));
 }
 
 TEST_F(MultiplexedSessionTransactionManagerTest, ClearStaleTransactions) {
@@ -146,14 +150,13 @@ TEST_F(MultiplexedSessionTransactionManagerTest, ClearStaleTransactions) {
       std::move(backend_txn), nullptr, spanner_api::TransactionOptions(),
       Transaction::Usage::kMultiUse);
   GOOGLESQL_ASSERT_OK(
-      mux_txn_manager.AddToCurrentTransactions(txn_to_add, kDatabaseUri, 1));
+      mux_txn_manager.AddToCurrentTransactions(txn_to_add, database_, 1));
   // Sleep for 4 seconds to make this transaction stale.
   absl::SleepFor(absl::Seconds(4));
   // Run the clear the old transactions method.
   mux_txn_manager.ClearOldTransactions();
   absl::StatusOr<std::shared_ptr<Transaction>> txn_from_manager =
-      mux_txn_manager.GetCurrentTransactionOnMultiplexedSession(kDatabaseUri,
-                                                                1);
+      mux_txn_manager.GetCurrentTransactionOnMultiplexedSession(*database_, 1);
   ASSERT_THAT(txn_from_manager, StatusIs(absl::StatusCode::kNotFound));
 }
 
@@ -170,14 +173,13 @@ TEST_F(MultiplexedSessionTransactionManagerTest, ClearClosedTransactions) {
       std::move(backend_txn), nullptr, spanner_api::TransactionOptions(),
       Transaction::Usage::kMultiUse);
   GOOGLESQL_ASSERT_OK(
-      mux_txn_manager.AddToCurrentTransactions(txn_to_add, kDatabaseUri, 1));
+      mux_txn_manager.AddToCurrentTransactions(txn_to_add, database_, 1));
   // Close the transaction.
   txn_to_add->Close();
   // Run the clear the old transactions method and it should clear it out.
   mux_txn_manager.ClearOldTransactions();
   absl::StatusOr<std::shared_ptr<Transaction>> txn_from_manager =
-      mux_txn_manager.GetCurrentTransactionOnMultiplexedSession(kDatabaseUri,
-                                                                1);
+      mux_txn_manager.GetCurrentTransactionOnMultiplexedSession(*database_, 1);
   ASSERT_THAT(txn_from_manager, StatusIs(absl::StatusCode::kNotFound));
 }
 
@@ -199,20 +201,21 @@ TEST_F(MultiplexedSessionTransactionManagerTest, TransactionCollision) {
       std::move(backend_txn2), nullptr, options, Transaction::Usage::kMultiUse);
 
   // Add both transactions to the manager.
-  GOOGLESQL_ASSERT_OK(mux_txn_manager.AddToCurrentTransactions(txn1, kDatabaseUri, 1));
-  GOOGLESQL_ASSERT_OK(mux_txn_manager.AddToCurrentTransactions(txn2, kDatabaseUri2, 1));
+  GOOGLESQL_ASSERT_OK(
+      mux_txn_manager.AddToCurrentTransactions(txn1, database_, 1));
+  GOOGLESQL_ASSERT_OK(
+      mux_txn_manager.AddToCurrentTransactions(txn2, database2_, 1));
 
   // Verify we can retrieve them correctly.
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<Transaction> txn_from_manager1,
-      mux_txn_manager.GetCurrentTransactionOnMultiplexedSession(kDatabaseUri,
-                                                                1));
+      mux_txn_manager.GetCurrentTransactionOnMultiplexedSession(*database_, 1));
   ASSERT_EQ(txn_from_manager1->id(), 1);
   ASSERT_EQ(txn_from_manager1, txn1);
 
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<Transaction> txn_from_manager2,
-      mux_txn_manager.GetCurrentTransactionOnMultiplexedSession(kDatabaseUri2,
+      mux_txn_manager.GetCurrentTransactionOnMultiplexedSession(*database2_,
                                                                 1));
   ASSERT_EQ(txn_from_manager2->id(), 1);
   ASSERT_EQ(txn_from_manager2, txn2);
@@ -230,22 +233,61 @@ TEST_F(MultiplexedSessionTransactionManagerTest,
     GOOGLESQL_ASSERT_OK(mux_txn_manager.AddToCurrentTransactions(
         std::make_shared<Transaction>(CreateReadWriteTransaction(id), nullptr,
                                       options, Transaction::Usage::kMultiUse),
-        kDatabaseUri, id));
+        database_, id));
   }
   GOOGLESQL_ASSERT_OK(mux_txn_manager.AddToCurrentTransactions(
       std::make_shared<Transaction>(CreateReadWriteTransaction(1), nullptr,
                                     options, Transaction::Usage::kMultiUse),
-      kDatabaseUri2, 1));
+      database2_, 1));
 
-  mux_txn_manager.RemoveDatabaseTransactions(kDatabaseUri);
+  mux_txn_manager.RemoveDatabaseTransactions(*database_);
 
   for (int id : {1, 2}) {
     EXPECT_THAT(mux_txn_manager.GetCurrentTransactionOnMultiplexedSession(
-                    kDatabaseUri, id),
+                    *database_, id),
                 StatusIs(absl::StatusCode::kNotFound));
   }
   GOOGLESQL_EXPECT_OK(mux_txn_manager.GetCurrentTransactionOnMultiplexedSession(
-      kDatabaseUri2, 1));
+      *database2_, 1));
+}
+
+TEST_F(MultiplexedSessionTransactionManagerTest,
+       TransactionsBelongToOneDatabaseObject) {
+  MultiplexedSessionTransactionManager mux_txn_manager;
+  spanner_api::TransactionOptions options;
+  options.mutable_read_write();
+  // A database re-created under the same URI.
+  auto recreated =
+      std::make_shared<Database>(kDatabaseUri, nullptr, absl::Now());
+  GOOGLESQL_ASSERT_OK(mux_txn_manager.AddToCurrentTransactions(
+      std::make_shared<Transaction>(CreateReadWriteTransaction(1), nullptr,
+                                    options, Transaction::Usage::kMultiUse),
+      database_, 1));
+
+  EXPECT_THAT(
+      mux_txn_manager.GetCurrentTransactionOnMultiplexedSession(*recreated, 1),
+      StatusIs(absl::StatusCode::kNotFound));
+  mux_txn_manager.RemoveDatabaseTransactions(*recreated);
+  GOOGLESQL_EXPECT_OK(
+      mux_txn_manager.GetCurrentTransactionOnMultiplexedSession(*database_, 1));
+}
+
+TEST_F(MultiplexedSessionTransactionManagerTest,
+       RefusesTransactionsOfDroppedDatabase) {
+  MultiplexedSessionTransactionManager mux_txn_manager;
+  spanner_api::TransactionOptions options;
+  options.mutable_read_write();
+  database_->MarkDropped();
+
+  EXPECT_THAT(
+      mux_txn_manager.AddToCurrentTransactions(
+          std::make_shared<Transaction>(CreateReadWriteTransaction(1), nullptr,
+                                        options, Transaction::Usage::kMultiUse),
+          database_, 1),
+      StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(
+      mux_txn_manager.GetCurrentTransactionOnMultiplexedSession(*database_, 1),
+      StatusIs(absl::StatusCode::kNotFound));
 }
 
 }  // namespace

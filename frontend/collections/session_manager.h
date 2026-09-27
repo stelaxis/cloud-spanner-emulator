@@ -56,9 +56,10 @@ class SessionManager {
                              bool delete_multiplex_sessions = false)
       ABSL_LOCKS_EXCLUDED(mu_);
 
-  // Deletes every session of the given database, including idle and
-  // multiplexed ones, so that none of them keeps the database alive.
-  void DeleteDatabaseSessions(const std::string& database_uri)
+  // Deletes every session attached to the given database object, including
+  // idle and multiplexed ones, so that none of them keeps it alive. Sessions
+  // of another database with the same URI are kept.
+  void DeleteDatabaseSessions(const Database& database)
       ABSL_LOCKS_EXCLUDED(mu_);
 
   // Lists sessions attached to the given database URI.

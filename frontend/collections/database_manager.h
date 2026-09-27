@@ -60,6 +60,11 @@ class DatabaseManager {
   absl::Status DeleteDatabase(const std::string& database_uri)
       ABSL_LOCKS_EXCLUDED(mu_);
 
+  // Unregisters the database with the given URI and marks it dropped.
+  // Returns it, or null if no such database is registered.
+  absl::StatusOr<std::shared_ptr<Database>> ReleaseDatabase(
+      const std::string& database_uri) ABSL_LOCKS_EXCLUDED(mu_);
+
   // Lists all databases associated with the given instance URI.
   absl::StatusOr<std::vector<std::shared_ptr<Database>>> ListDatabases(
       const std::string& instance_uri) const ABSL_LOCKS_EXCLUDED(mu_);

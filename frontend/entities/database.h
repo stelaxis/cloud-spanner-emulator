@@ -51,8 +51,10 @@ class Database {
   // Returns the handle to the backend database.
   backend::Database* backend() const { return backend_.get(); }
 
-  // Set when the database is dropped, before its sessions are deleted, so
-  // that a racing CreateSession cannot attach a new session to it.
+  // Set when the database is unregistered. Everything published for the
+  // database (sessions, multiplexed-session transactions, operations) checks
+  // it under the lock its drop-time sweep takes, so nothing is published
+  // after the sweep.
   void MarkDropped() { dropped_.store(true); }
   bool dropped() const { return dropped_.load(); }
 

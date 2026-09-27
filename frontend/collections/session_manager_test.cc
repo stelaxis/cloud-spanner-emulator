@@ -315,14 +315,35 @@ TEST(SessionManagerDropTest, DeleteDatabaseSessionsReleasesTheDatabase) {
       std::shared_ptr<Session> other,
       session_manager.CreateSession({}, /*multiplexed=*/false, similar_database,
                                     nullptr));
-  std::weak_ptr<Database> released = database;
+  std::weak_ptr<Database> weak_database = database;
   database.reset();
-  GOOGLESQL_ASSERT_OK(database_manager.DeleteDatabase(uri));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(std::shared_ptr<Database> released,
+                                 database_manager.ReleaseDatabase(uri));
+  // Re-created under the same URI before the sweep.
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(std::shared_ptr<Database> recreated,
+                                 database_manager.CreateDatabase(uri, {}));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Session> recreated_session,
+      session_manager.CreateSession({}, /*multiplexed=*/false, recreated,
+                                    nullptr));
 
-  session_manager.DeleteDatabaseSessions(uri);
+  session_manager.DeleteDatabaseSessions(*released);
+  released.reset();
 
-  EXPECT_TRUE(released.expired());
+  EXPECT_TRUE(weak_database.expired());
   GOOGLESQL_EXPECT_OK(session_manager.GetSession(other->session_uri()));
+  GOOGLESQL_EXPECT_OK(
+      session_manager.GetSession(recreated_session->session_uri()));
+}
+
+TEST_F(SessionManagerTest, GetSessionFailsOnDroppedDatabase) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<Session> session,
+      session_manager_.CreateSession(test_labels_, multiplexed_, database_,
+                                     /*mux_txn_manager=*/nullptr));
+  database_->MarkDropped();
+  EXPECT_THAT(session_manager_.GetSession(session->session_uri()),
+              googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
 }
 
 }  // namespace frontend

@@ -29,6 +29,7 @@
 #include "absl/time/time.h"
 #include "backend/common/ids.h"
 #include "common/errors.h"
+#include "frontend/entities/database.h"
 #include "frontend/entities/transaction.h"
 
 namespace google {
@@ -54,21 +55,32 @@ MultiplexedSessionTransactionManager::MultiplexedSessionTransactionManager(
       staleness_check_duration_(staleness_check_duration) {}
 
 absl::Status MultiplexedSessionTransactionManager::AddToCurrentTransactions(
-    std::shared_ptr<Transaction> txn, const std::string& database_uri,
+    std::shared_ptr<Transaction> txn, std::shared_ptr<Database> database,
     backend::TransactionID txn_id) {
+  if (before_add_hook_) before_add_hook_(txn_id);
   absl::MutexLock lock(mu_);
-  current_transactions_.emplace(std::make_pair(database_uri, txn_id), txn);
+  // RemoveDatabaseTransactions takes mu_ after the flag is set, so a
+  // transaction either sees the flag here or is removed there.
+  if (database->dropped()) {
+    return error::DatabaseNotFound(database->database_uri());
+  }
+  std::pair<std::string, backend::TransactionID> key(database->database_uri(),
+                                                     txn_id);
+  current_transactions_.emplace(
+      std::move(key), Entry{.database = std::move(database), .txn = txn});
   return absl::OkStatus();
 }
 
 absl::StatusOr<std::shared_ptr<Transaction>>
 MultiplexedSessionTransactionManager::GetCurrentTransactionOnMultiplexedSession(
-    const std::string& database_uri, backend::TransactionID txn_id) {
+    const Database& database, backend::TransactionID txn_id) {
   absl::ReaderMutexLock lock(mu_);
-  auto it = current_transactions_.find(std::make_pair(database_uri, txn_id));
-  if (it != current_transactions_.end()) {
+  auto it = current_transactions_.find(
+      std::make_pair(database.database_uri(), txn_id));
+  if (it != current_transactions_.end() &&
+      it->second.database.get() == &database) {
     // Transaction exists
-    return it->second;
+    return it->second.txn;
   }
   return error::TransactionNotFound(txn_id);
 }
@@ -79,12 +91,17 @@ void MultiplexedSessionTransactionManager::RemoveFromCurrentTransactionsLocked(
 }
 
 void MultiplexedSessionTransactionManager::RemoveDatabaseTransactions(
-    const std::string& database_uri) {
+    const Database& database) {
+  const std::string& database_uri = database.database_uri();
   absl::MutexLock lock(mu_);
   auto it = current_transactions_.lower_bound(std::make_pair(
       database_uri, std::numeric_limits<backend::TransactionID>::min()));
   while (it != current_transactions_.end() && it->first.first == database_uri) {
-    it = current_transactions_.erase(it);
+    if (it->second.database.get() == &database) {
+      it = current_transactions_.erase(it);
+    } else {
+      ++it;
+    }
   }
 }
 
@@ -92,9 +109,9 @@ void MultiplexedSessionTransactionManager::ClearOldTransactionsLocked() {
   std::vector<std::pair<std::string, backend::TransactionID>>
       transactions_to_remove;
   absl::Time now = absl::Now();
-  for (auto const& [key, txn] : current_transactions_) {
-    if (txn->IsClosed() ||
-        (now - txn->GetCreateTime() > old_transaction_staleness_duration_)) {
+  for (auto const& [key, entry] : current_transactions_) {
+    if (entry.txn->IsClosed() || (now - entry.txn->GetCreateTime() >
+                                  old_transaction_staleness_duration_)) {
       transactions_to_remove.push_back(key);
     }
   }

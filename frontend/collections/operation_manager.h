@@ -17,14 +17,17 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_FRONTEND_COLLECTIONS_OPERATION_MANAGER_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_FRONTEND_COLLECTIONS_OPERATION_MANAGER_H_
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "absl/base/thread_annotations.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
+#include "frontend/entities/database.h"
 #include "frontend/entities/operation.h"
 #include "absl/status/status.h"
 
@@ -71,6 +74,12 @@ class OperationManager {
       const std::string& resource_uri, const std::string& operation_id)
       ABSL_LOCKS_EXCLUDED(mu_);
 
+  // Creates an operation of `database`, as CreateOperation does. Returns
+  // DatabaseNotFound if `database` has been dropped.
+  absl::StatusOr<std::shared_ptr<Operation>> CreateDatabaseOperation(
+      const std::shared_ptr<Database>& database,
+      const std::string& operation_id) ABSL_LOCKS_EXCLUDED(mu_);
+
   // Gets the operation with the specified URI, or returns NOT_FOUND if no such
   // operation is registered with the manager.
   absl::StatusOr<std::shared_ptr<Operation>> GetOperation(
@@ -81,8 +90,16 @@ class OperationManager {
   absl::Status DeleteOperation(const std::string& operation_uri)
       ABSL_LOCKS_EXCLUDED(mu_);
 
-  // Deletes every operation of the given resource.
-  void DeleteResourceOperations(const std::string& resource_uri)
+  // Runs `hook` at the start of every operation creation. For tests; set
+  // before concurrent use.
+  void set_before_create_hook_for_testing(std::function<void()> hook) {
+    before_create_hook_ = std::move(hook);
+  }
+
+  // Deletes every operation created by CreateDatabaseOperation for the given
+  // database object. Operations of another database with the same URI are
+  // kept.
+  void DeleteDatabaseOperations(const std::shared_ptr<Database>& database)
       ABSL_LOCKS_EXCLUDED(mu_);
 
   // Lists all the operations registered with the operation manager.
@@ -90,6 +107,18 @@ class OperationManager {
       const std::string& resource_uri) ABSL_LOCKS_EXCLUDED(mu_);
 
  private:
+  struct Entry {
+    std::shared_ptr<Operation> operation;
+    // The database whose operation this is, if any.
+    std::weak_ptr<Database> database;
+  };
+
+  absl::StatusOr<std::shared_ptr<Operation>> CreateOperationLocked(
+      const std::string& resource_uri, const std::string& operation_id,
+      std::weak_ptr<Database> database) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+  std::function<void()> before_create_hook_;
+
   // Mutex to guard state below.
   absl::Mutex mu_;
 
@@ -97,8 +126,7 @@ class OperationManager {
   int next_operation_id_ ABSL_GUARDED_BY(mu_) = 0;
 
   // Map from operation URI to actual operation.
-  std::map<std::string, std::shared_ptr<Operation>> operations_map_
-      ABSL_GUARDED_BY(mu_);
+  std::map<std::string, Entry> operations_map_ ABSL_GUARDED_BY(mu_);
 };
 
 }  // namespace frontend
