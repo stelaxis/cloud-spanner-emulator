@@ -17,6 +17,8 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_TESTS_COMMON_TEST_ENV_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_TESTS_COMMON_TEST_ENV_H_
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <thread>  // NOLINT(build/c++11)
@@ -36,6 +38,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "common/constants.h"
 #include "frontend/common/uris.h"
 #include "frontend/server/server.h"
@@ -72,6 +75,16 @@ class TestEnv {
   OperationsStub* operations_client() const { return operations_client_.get(); }
   SpannerStub* spanner_client() const { return spanner_client_.get(); }
 
+  // The server's environment, for inspecting its state.
+  frontend::ServerEnv* env() const { return server_->env(); }
+
+  // Moves the server's clock forward. Reads then wait for the system clock to
+  // reach their timestamp (LockManager::WaitForSafeRead), so a test must not
+  // read after advancing it.
+  void AdvanceClock(absl::Duration duration) {
+    clock_offset_micros_ += absl::ToInt64Microseconds(duration);
+  }
+
  private:
   void SetupServer();
   void SetupClientStubs();
@@ -85,6 +98,7 @@ class TestEnv {
   std::unique_ptr<frontend::Server> server_;
   std::string host_port_;
   absl::Notification ready_;
+  std::atomic<int64_t> clock_offset_micros_ = 0;
 };
 
 // A convenience class that sets up a TestEnv as a class member. Test fixtures

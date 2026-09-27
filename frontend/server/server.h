@@ -17,9 +17,11 @@
 #ifndef STORAGE_SPANNER_CLOUD_EMULATOR_FRONTEND_SERVER_H_
 #define STORAGE_SPANNER_CLOUD_EMULATOR_FRONTEND_SERVER_H_
 
+#include <functional>
 #include <memory>
 #include <string>
 
+#include "absl/time/time.h"
 #include "frontend/server/environment.h"
 #include "grpcpp/impl/service_type.h"
 #include "grpcpp/server.h"
@@ -54,6 +56,10 @@ class Server {
  public:
   struct Options {
     std::string server_address;
+
+    // The system clock for the emulator's Clock; absl::Now if empty. For
+    // tests.
+    std::function<absl::Time()> system_now;
   };
 
   // Returns an initialized Server, or nullptr if the initialization failed.

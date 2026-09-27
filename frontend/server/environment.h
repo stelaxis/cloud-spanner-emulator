@@ -18,6 +18,7 @@
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_FRONTEND_SERVER_ENV_H_
 
 #include <memory>
+#include <utility>
 
 #include "common/clock.h"
 #include "frontend/collections/database_manager.h"
@@ -35,8 +36,10 @@ namespace frontend {
 // ServerEnv encapsulates global objects for Cloud Spanner Emulator.
 class ServerEnv {
  public:
-  ServerEnv()
-      : clock_(new Clock()),
+  ServerEnv() : ServerEnv(std::make_unique<Clock>()) {}
+
+  explicit ServerEnv(std::unique_ptr<Clock> clock)
+      : clock_(std::move(clock)),
         database_manager_(new DatabaseManager(clock_.get())),
         instance_manager_(new InstanceManager()),
         instance_partition_manager_(new InstancePartitionManager()),
