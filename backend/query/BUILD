@@ -905,6 +905,7 @@ cc_library(
         "//common:constants",
         "//common:errors",
         "//common:feature_flags",
+        "//common:settings_generation",
         "//common:pg_literals",
         "//third_party/spanner_pg/catalog:emulator_function_evaluators",
         "//third_party/spanner_pg/catalog:emulator_functions",

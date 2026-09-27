@@ -16,6 +16,7 @@
 
 #include "backend/database/schema_create_cache.h"
 
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include <string>
@@ -28,7 +29,10 @@
 #include "googlesql/public/functions/uuid.h"
 #include "googlesql/public/type.h"
 #include "googlesql/public/types/type_factory.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/flags/commandlineflag.h"
 #include "absl/flags/flag.h"
+#include "absl/flags/reflection.h"
 #include "absl/random/random.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -53,6 +57,7 @@
 #include "backend/schema/graph/schema_node.h"
 #include "backend/schema/updater/schema_validation_context.h"
 #include "common/feature_flags.h"
+#include "common/settings_generation.h"
 #include "googlesql/base/ret_check.h"
 #include "googlesql/base/status_macros.h"
 
@@ -212,7 +217,7 @@ std::atomic<bool> global_overridden{false};
 
 static_assert(std::has_unique_object_representations_v<
                   EmulatorFeatureFlags::Flags>,
-              "Key compares the flags' bytes");
+              "Settings compare the flags' bytes");
 
 }  // namespace
 
@@ -251,13 +256,78 @@ SchemaCreateCache* SchemaCreateCache::SetGlobalForTesting(
   return previous;
 }
 
-std::string SchemaCreateCache::Key(const SchemaChangeOperation& operation) {
+namespace {
+
+// Flags that the emulator writes at runtime and DDL processing never reads:
+// every database's change stream churner sets its intervals when
+// --override_change_stream_partition_token_alive_seconds is set, and this
+// cache's size is read once.
+bool IsExcludedFromSettings(absl::string_view flag_name) {
+  static const auto* excluded = new absl::flat_hash_set<absl::string_view>{
+      "change_stream_churning_interval",
+      "change_stream_churn_thread_sleep_interval",
+      "change_stream_churn_thread_retry_sleep_interval",
+      "schema_create_cache_size",
+  };
+  return excluded->contains(flag_name);
+}
+
+// The flags in the settings, by name. The flags linked into a process are
+// registered before main() runs and never change.
+const std::vector<absl::CommandLineFlag*>& SettingsFlags() {
+  static const auto* flags = [] {
+    auto* flags = new std::vector<absl::CommandLineFlag*>();
+    for (const auto& [name, flag] : absl::GetAllFlags()) {
+      if (!IsExcludedFromSettings(name)) flags->push_back(flag);
+    }
+    std::sort(flags->begin(), flags->end(),
+              [](const absl::CommandLineFlag* a,
+                 const absl::CommandLineFlag* b) {
+                return a->Name() < b->Name();
+              });
+    return flags;
+  }();
+  return *flags;
+}
+
+std::string SettingsValues() {
   EmulatorFeatureFlags::Flags flags = EmulatorFeatureFlags::instance().flags();
+  // Every part is length-prefixed, so different settings have different
+  // values.
+  std::string values = absl::StrCat(
+      sizeof(flags), ":",
+      std::string_view(reinterpret_cast<const char*>(&flags), sizeof(flags)));
+  for (const absl::CommandLineFlag* flag : SettingsFlags()) {
+    std::string value = flag->CurrentValue();
+    absl::StrAppend(&values, ";", flag->Name(), "=", value.size(), ":",
+                    value);
+  }
+  return values;
+}
+
+}  // namespace
+
+SchemaCreateCache::Settings SchemaCreateCache::CurrentSettings() {
+  // The generation first: a change that the values miss bumps it later.
+  Settings settings;
+  settings.generation = SettingsGeneration();
+  settings.values = SettingsValues();
+  return settings;
+}
+
+bool SchemaCreateCache::SettingsUnchanged(const Settings& before) {
+  // The values first, then the generation (see CurrentSettings).
+  return SettingsValues() == before.values &&
+         SettingsGeneration() == before.generation;
+}
+
+std::string SchemaCreateCache::Key(const SchemaChangeOperation& operation,
+                                   const Settings& settings) {
   // Every part is length-prefixed, so different requests have different keys.
   std::string key = absl::StrCat(
-      static_cast<int>(operation.database_dialect), ";", sizeof(flags), ":",
-      std::string_view(reinterpret_cast<const char*>(&flags), sizeof(flags)),
-      ";", operation.proto_descriptor_bytes.size(), ":",
+      static_cast<int>(operation.database_dialect), ";",
+      settings.values.size(), ":", settings.values, ";",
+      operation.proto_descriptor_bytes.size(), ":",
       operation.proto_descriptor_bytes);
   for (const std::string& statement : operation.statements) {
     absl::StrAppend(&key, ";", statement.size(), ":", statement);
@@ -299,6 +369,36 @@ void SchemaCreateCache::Insert(const std::string& key,
     index_.erase(lru_.back().first);
     lru_.pop_back();
   }
+}
+
+void SchemaCreateCache::RecordCopy() {
+  absl::MutexLock lock(mu_);
+  ++copies_;
+}
+
+void SchemaCreateCache::RecordFallback() {
+  absl::MutexLock lock(mu_);
+  ++fallbacks_;
+}
+
+void SchemaCreateCache::RecordRejected() {
+  absl::MutexLock lock(mu_);
+  ++rejected_;
+}
+
+int64_t SchemaCreateCache::copies() const {
+  absl::MutexLock lock(mu_);
+  return copies_;
+}
+
+int64_t SchemaCreateCache::fallbacks() const {
+  absl::MutexLock lock(mu_);
+  return fallbacks_;
+}
+
+int64_t SchemaCreateCache::rejected() const {
+  absl::MutexLock lock(mu_);
+  return rejected_;
 }
 
 int64_t SchemaCreateCache::hits() const {

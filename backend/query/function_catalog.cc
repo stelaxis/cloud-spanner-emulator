@@ -68,6 +68,7 @@
 #include "common/constants.h"
 #include "common/errors.h"
 #include "common/feature_flags.h"
+#include "common/settings_generation.h"
 #include "common/pg_literals.h"
 #include "third_party/spanner_pg/catalog/emulator_function_evaluators.h"
 #include "third_party/spanner_pg/catalog/emulator_functions.h"
@@ -705,6 +706,10 @@ const FunctionCatalog::SharedFunctions* FunctionCatalog::GetSharedFunctions(
   static auto* cache =
       new absl::flat_hash_map<std::string,
                               std::unique_ptr<const SharedFunctions>>();
+  // The generation first, then the key; after building, the key, then the
+  // generation. A flag change during the build then changes one of them,
+  // even if it is undone before the build ends.
+  const int64_t generation = SettingsGeneration();
   std::string key = SharedFunctionsKey(catalog_name, dialect);
   absl::MutexLock lock(mu);
   if (auto it = cache->find(key); it != cache->end()) {
@@ -713,10 +718,13 @@ const FunctionCatalog::SharedFunctions* FunctionCatalog::GetSharedFunctions(
   if (cache->size() >= kMaxSharedFunctionSets) {
     return nullptr;
   }
+  if (before_shared_build_hook_ != nullptr) before_shared_build_hook_();
   std::unique_ptr<const SharedFunctions> shared =
       BuildSharedFunctions(catalog_name, dialect);
+  if (after_shared_build_hook_ != nullptr) after_shared_build_hook_();
   // Flags changed while building: the functions may not match the key.
-  if (SharedFunctionsKey(catalog_name, dialect) != key) {
+  if (SharedFunctionsKey(catalog_name, dialect) != key ||
+      SettingsGeneration() != generation) {
     return nullptr;
   }
   // A null entry records that this key cannot share.

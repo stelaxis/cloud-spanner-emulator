@@ -18,6 +18,7 @@
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_DATABASE_SCHEMA_CREATE_CACHE_H_
 
 #include <cstdint>
+#include <functional>
 #include <list>
 #include <memory>
 #include <optional>
@@ -57,12 +58,12 @@ absl::StatusOr<std::unique_ptr<const Schema>> CopySchema(
 // of processing the DDL again, which takes time quadratic in the number of
 // statements.
 //
-// A request's key is everything the DDL's outcome depends on: the statements,
-// the dialect, the proto descriptors and the emulator feature flags. The
-// database's name only names the schema; command-line flags are fixed for the
-// life of the process, which is the life of the cache. Only schemas of
+// A request's key is everything the DDL's outcome may depend on: the
+// statements, the dialect, the proto descriptors, and the settings (see
+// Settings). The database's name only names the schema. Only schemas of
 // successful creates are added, so a failing request always processes its DDL
-// and fails as it would without the cache.
+// and fails as it would without the cache. A schema is added only if the
+// settings did not change while it was created (SettingsUnchanged).
 //
 // The cache holds at most `capacity` schemas and evicts the least recently
 // used. It is thread-safe.
@@ -91,7 +92,25 @@ class SchemaCreateCache {
   // the cache it returned before. Not thread-safe with Global().
   static SchemaCreateCache* SetGlobalForTesting(SchemaCreateCache* cache);
 
-  static std::string Key(const SchemaChangeOperation& operation);
+  // The settings DDL processing may read: the emulator feature flags and the
+  // value of every command-line flag linked into the process, except the few
+  // that the emulator writes at runtime and DDL processing never reads (the
+  // change stream churner's intervals, and this cache's size).
+  struct Settings {
+    int64_t generation = 0;  // SettingsGeneration()
+    std::string values;
+  };
+  static Settings CurrentSettings();
+
+  // True if no setting changed since `before` was taken: the values are the
+  // same and the generation did not move, which catches a change undone
+  // before now. The values catch a change to a flag that does not bump the
+  // generation, unless it was undone again before now; outside tests, the
+  // emulator writes no such flag after startup.
+  static bool SettingsUnchanged(const Settings& before);
+
+  static std::string Key(const SchemaChangeOperation& operation,
+                         const Settings& settings);
 
   // Returns the entry for `key`, or null.
   std::shared_ptr<const Entry> Lookup(const std::string& key)
@@ -105,9 +124,36 @@ class SchemaCreateCache {
   void Insert(const std::string& key, std::shared_ptr<const Entry> entry)
       ABSL_LOCKS_EXCLUDED(mu_);
 
+  // Outcomes of creates, for tests and logs.
+  void RecordCopy() ABSL_LOCKS_EXCLUDED(mu_);
+  void RecordFallback() ABSL_LOCKS_EXCLUDED(mu_);
+  void RecordRejected() ABSL_LOCKS_EXCLUDED(mu_);
+
   int64_t hits() const ABSL_LOCKS_EXCLUDED(mu_);
   int64_t misses() const ABSL_LOCKS_EXCLUDED(mu_);
+  // Creates completed from a copy of an entry's schema.
+  int64_t copies() const ABSL_LOCKS_EXCLUDED(mu_);
+  // Creates that found an entry with a schema but could not copy it, and so
+  // processed their DDL.
+  int64_t fallbacks() const ABSL_LOCKS_EXCLUDED(mu_);
+  // Schemas not added because the settings changed while they were created.
+  int64_t rejected() const ABSL_LOCKS_EXCLUDED(mu_);
   int size() const ABSL_LOCKS_EXCLUDED(mu_);
+
+  // For tests: Database::Create runs `after_key` once it has taken the
+  // settings and looked up its key, and `before_publish` just before it
+  // checks the settings to add a schema it created. Set before concurrent use.
+  static void SetCreateHooksForTesting(std::function<void()> after_key,
+                                       std::function<void()> before_publish) {
+    after_key_hook_ = std::move(after_key);
+    before_publish_hook_ = std::move(before_publish);
+  }
+  static void RunAfterKeyHook() {
+    if (after_key_hook_ != nullptr) after_key_hook_();
+  }
+  static void RunBeforePublishHook() {
+    if (before_publish_hook_ != nullptr) before_publish_hook_();
+  }
 
  private:
   using Lru = std::list<std::pair<std::string, std::shared_ptr<const Entry>>>;
@@ -119,6 +165,12 @@ class SchemaCreateCache {
   absl::flat_hash_map<std::string, Lru::iterator> index_ ABSL_GUARDED_BY(mu_);
   int64_t hits_ ABSL_GUARDED_BY(mu_) = 0;
   int64_t misses_ ABSL_GUARDED_BY(mu_) = 0;
+  int64_t copies_ ABSL_GUARDED_BY(mu_) = 0;
+  int64_t fallbacks_ ABSL_GUARDED_BY(mu_) = 0;
+  int64_t rejected_ ABSL_GUARDED_BY(mu_) = 0;
+
+  inline static std::function<void()> after_key_hook_;
+  inline static std::function<void()> before_publish_hook_;
 };
 
 }  // namespace backend

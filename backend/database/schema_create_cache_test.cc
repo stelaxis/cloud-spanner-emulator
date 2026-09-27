@@ -32,6 +32,9 @@
 #include "googlesql/base/testing/status_matchers.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/flags/commandlineflag.h"
+#include "absl/flags/flag.h"
+#include "absl/flags/reflection.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/clock.h"
@@ -41,6 +44,7 @@
 #include "backend/schema/catalog/sequence.h"
 #include "backend/schema/catalog/table.h"
 #include "backend/schema/printer/print_ddl.h"
+#include "backend/database/change_stream/change_stream_partition_churner.h"
 #include "backend/schema/updater/schema_updater.h"
 #include "common/clock.h"
 #include "common/feature_flags.h"
@@ -204,6 +208,7 @@ TEST_P(SchemaCreateCacheTest, CachedDatabaseMatchesUncached) {
   EXPECT_EQ(cache_.misses(), 1);
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Database> cached, Create(operation()));
   EXPECT_EQ(cache_.hits(), 1);
+  EXPECT_EQ(cache_.copies(), 1);
 
   EXPECT_THAT(Ddl(*cached), ElementsAreArray(Ddl(*uncached)));
   EXPECT_THAT(Ids(*cached), ElementsAreArray(Ids(*uncached)));
@@ -275,6 +280,7 @@ TEST_P(SchemaCreateCacheTest, SequencesAreIndependent) {
     GOOGLESQL_ASSERT_OK_AND_ASSIGN(databases.emplace_back(), Create(operation()));
   }
   EXPECT_EQ(cache_.hits(), kDatabases - 1);
+  EXPECT_EQ(cache_.copies(), kDatabases - 1);
   std::vector<std::thread> threads;
   for (const std::unique_ptr<Database>& database : databases) {
     threads.emplace_back([&, db = database.get()] {
@@ -328,6 +334,8 @@ TEST_P(SchemaCreateCacheTest, ConcurrentCreatesOfTheSameDdl) {
   }
   for (std::thread& thread : threads) thread.join();
   EXPECT_GT(cache_.hits(), 0);
+  EXPECT_EQ(cache_.copies(), cache_.hits());
+  EXPECT_EQ(cache_.fallbacks(), 0);
 }
 
 // A database created from an entry keeps working after the entry is evicted
@@ -340,6 +348,7 @@ TEST_P(SchemaCreateCacheTest, DatabaseOutlivesItsEntry) {
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Database> cached,
                        Database::Create(&clock_, "db", operation()));
   EXPECT_EQ(small.hits(), 1);
+  EXPECT_EQ(small.copies(), 1);
   const std::vector<std::string> expected = Ddl(*source);
 
   SchemaChangeOperation other = operation();
@@ -370,6 +379,7 @@ TEST_P(SchemaCreateCacheTest, DatabaseOutlivesItsEntry) {
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Database> again,
                        Database::Create(&clock_, "db", operation()));
   EXPECT_EQ(small.hits(), 1);
+  EXPECT_EQ(small.copies(), 1);
   EXPECT_THAT(Ddl(*again), ElementsAreArray(expected));
   SchemaCreateCache::SetGlobalForTesting(&cache_);
 }
@@ -424,27 +434,162 @@ TEST(CopySchemaTest, CopyOwnsItsTypes) {
 }
 
 TEST(SchemaCreateCacheKeyTest, KeyCoversTheWholeRequest) {
+  absl::FlagSaver flag_saver;
+  auto key = [](const SchemaChangeOperation& operation) {
+    return SchemaCreateCache::Key(operation,
+                                  SchemaCreateCache::CurrentSettings());
+  };
   const std::vector<std::string> statements = {"CREATE TABLE t (k INT64) "
                                                "PRIMARY KEY (k)"};
   SchemaChangeOperation base{.statements = statements};
-  const std::string key = SchemaCreateCache::Key(base);
-  EXPECT_EQ(SchemaCreateCache::Key(base), key);
+  const std::string base_key = key(base);
+  EXPECT_EQ(key(base), base_key);
 
   const std::vector<std::string> split = {"CREATE TABLE t (k INT64)",
                                           " PRIMARY KEY (k)"};
-  EXPECT_NE(SchemaCreateCache::Key(SchemaChangeOperation{.statements = split}),
-            key);
-  EXPECT_NE(SchemaCreateCache::Key(SchemaChangeOperation{
+  EXPECT_NE(key(SchemaChangeOperation{.statements = split}), base_key);
+  EXPECT_NE(key(SchemaChangeOperation{
                 .statements = statements,
                 .database_dialect = database_api::DatabaseDialect::POSTGRESQL}),
-            key);
-  EXPECT_NE(SchemaCreateCache::Key(SchemaChangeOperation{
-                .statements = statements, .proto_descriptor_bytes = "x"}),
-            key);
+            base_key);
+  EXPECT_NE(key(SchemaChangeOperation{.statements = statements,
+                                      .proto_descriptor_bytes = "x"}),
+            base_key);
+
+  // Command-line flags, such as the one DDL validation reads for change
+  // stream retention, and a GoogleSQL analyzer flag.
+  absl::SetFlag(&FLAGS_cloud_spanner_emulator_disable_cs_retention_check,
+                true);
+  const std::string retention_key = key(base);
+  EXPECT_NE(retention_key, base_key);
+  absl::SetFlag(&FLAGS_cloud_spanner_emulator_disable_cs_retention_check,
+                false);
+  EXPECT_EQ(key(base), base_key);
+  absl::CommandLineFlag* googlesql_flag = absl::FindCommandLineFlag(
+      "googlesql_min_length_required_for_edit_distance");
+  ASSERT_NE(googlesql_flag, nullptr);
+  std::string error;
+  ASSERT_TRUE(googlesql_flag->ParseFrom("1000", &error)) << error;
+  EXPECT_NE(key(base), base_key);
+  ASSERT_TRUE(
+      googlesql_flag->ParseFrom(googlesql_flag->DefaultValue(), &error));
+  EXPECT_EQ(key(base), base_key);
+
+  // The flags the emulator writes at runtime and DDL never reads are not.
+  absl::SetFlag(&FLAGS_change_stream_churning_interval, absl::Seconds(7));
+  EXPECT_EQ(key(base), base_key);
+
   EmulatorFeatureFlags::Flags flags;
   flags.enable_identity_columns = false;
   test::ScopedEmulatorFeatureFlagsSetter setter(flags);
-  EXPECT_NE(SchemaCreateCache::Key(base), key);
+  EXPECT_NE(key(base), base_key);
+}
+
+// A create publishes its schema only if the settings it was keyed by held
+// throughout: a change during the create, even one undone before it ends,
+// means the DDL may have read other settings than the key's.
+class SchemaCreateCacheInterleavingTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    previous_ = SchemaCreateCache::SetGlobalForTesting(&cache_);
+  }
+  void TearDown() override {
+    SchemaCreateCache::SetCreateHooksForTesting(nullptr, nullptr);
+    SchemaCreateCache::SetGlobalForTesting(previous_);
+    const_cast<EmulatorFeatureFlags&>(EmulatorFeatureFlags::instance())
+        .set_flags(original_flags_);
+  }
+
+  absl::Status Create(const std::vector<std::string>& statements,
+                      bool use_cache = true) {
+    SchemaCreateCache* cache =
+        SchemaCreateCache::SetGlobalForTesting(use_cache ? &cache_ : nullptr);
+    absl::Status status =
+        Database::Create(&clock_, "db",
+                         SchemaChangeOperation{.statements = statements})
+            .status();
+    SchemaCreateCache::SetGlobalForTesting(cache);
+    return status;
+  }
+
+  // Retention below a day is valid only while the check is disabled.
+  const std::vector<std::string> retention_ddl_ = {
+      "CREATE TABLE t (k INT64) PRIMARY KEY (k)",
+      "CREATE CHANGE STREAM cs FOR t OPTIONS (retention_period = '1h')"};
+  // Valid only while views are enabled.
+  const std::vector<std::string> view_ddl_ = {
+      "CREATE VIEW v SQL SECURITY INVOKER AS SELECT 1 AS a"};
+
+  absl::FlagSaver flag_saver_;
+  const EmulatorFeatureFlags::Flags original_flags_ =
+      EmulatorFeatureFlags::instance().flags();
+  Clock clock_;
+  SchemaCreateCache cache_{4};
+  SchemaCreateCache* previous_ = nullptr;
+};
+
+void SetRetentionCheckDisabled(bool disabled) {
+  absl::SetFlag(&FLAGS_cloud_spanner_emulator_disable_cs_retention_check,
+                disabled);
+}
+
+void SetViewsEnabled(bool enabled) {
+  EmulatorFeatureFlags::Flags flags = EmulatorFeatureFlags::instance().flags();
+  flags.enable_views = enabled;
+  const_cast<EmulatorFeatureFlags&>(EmulatorFeatureFlags::instance())
+      .set_flags(flags);
+}
+
+TEST_F(SchemaCreateCacheInterleavingTest, UnchangedSettingsPublish) {
+  SetRetentionCheckDisabled(true);
+  GOOGLESQL_ASSERT_OK(Create(retention_ddl_));
+  EXPECT_EQ(cache_.size(), 1);
+  EXPECT_EQ(cache_.rejected(), 0);
+}
+
+// The key is taken with the retention check on, under which the DDL fails;
+// the check is off while the DDL runs, and on again before publishing.
+TEST_F(SchemaCreateCacheInterleavingTest, FlagChangedAndRestoredMidCreate) {
+  SetRetentionCheckDisabled(false);
+  const absl::Status uncached = Create(retention_ddl_, /*use_cache=*/false);
+  ASSERT_EQ(uncached.code(), absl::StatusCode::kFailedPrecondition);
+
+  SchemaCreateCache::SetCreateHooksForTesting(
+      [] { SetRetentionCheckDisabled(true); },
+      [] { SetRetentionCheckDisabled(false); });
+  GOOGLESQL_EXPECT_OK(Create(retention_ddl_));
+  SchemaCreateCache::SetCreateHooksForTesting(nullptr, nullptr);
+  EXPECT_EQ(cache_.rejected(), 1);
+  EXPECT_EQ(cache_.size(), 0);
+
+  // Under the key's settings the DDL still fails, as without the cache.
+  EXPECT_EQ(Create(retention_ddl_), uncached);
+  EXPECT_EQ(cache_.copies(), 0);
+}
+
+TEST_F(SchemaCreateCacheInterleavingTest, FlagChangedMidCreate) {
+  SetRetentionCheckDisabled(false);
+  SchemaCreateCache::SetCreateHooksForTesting(
+      [] { SetRetentionCheckDisabled(true); }, nullptr);
+  GOOGLESQL_EXPECT_OK(Create(retention_ddl_));
+  SchemaCreateCache::SetCreateHooksForTesting(nullptr, nullptr);
+  EXPECT_EQ(cache_.rejected(), 1);
+  EXPECT_EQ(cache_.size(), 0);
+}
+
+TEST_F(SchemaCreateCacheInterleavingTest,
+       FeatureFlagChangedAndRestoredMidCreate) {
+  SetViewsEnabled(false);
+  const absl::Status uncached = Create(view_ddl_, /*use_cache=*/false);
+  ASSERT_FALSE(uncached.ok());
+
+  SchemaCreateCache::SetCreateHooksForTesting([] { SetViewsEnabled(true); },
+                                              [] { SetViewsEnabled(false); });
+  GOOGLESQL_EXPECT_OK(Create(view_ddl_));
+  SchemaCreateCache::SetCreateHooksForTesting(nullptr, nullptr);
+  EXPECT_EQ(cache_.rejected(), 1);
+  EXPECT_EQ(cache_.size(), 0);
+  EXPECT_EQ(Create(view_ddl_), uncached);
 }
 
 TEST(SchemaCreateCacheLruTest, EvictsTheLeastRecentlyUsed) {

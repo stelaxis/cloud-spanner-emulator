@@ -18,6 +18,7 @@
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_COMMON_FEATURE_FLAGS_H_
 
 #include "absl/synchronization/mutex.h"
+#include "common/settings_generation.h"
 
 namespace google {
 namespace spanner {
@@ -70,8 +71,11 @@ class EmulatorFeatureFlags {
   }
 
   void set_flags(const Flags& flags) ABSL_LOCKS_EXCLUDED(mu_) {
-    absl::MutexLock l(&mu_);
-    flags_ = flags;
+    {
+      absl::MutexLock l(&mu_);
+      flags_ = flags;
+    }
+    BumpSettingsGeneration();
   }
 
  private:

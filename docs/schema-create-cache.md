@@ -11,12 +11,26 @@ a copy of that schema, without processing its statements.
 
 Two requests are equal when they have the same `extra_statements` (the exact
 text, in order), dialect and `proto_descriptors`, and are made under the same
-emulator feature flags. The database's name is not part of the key: DDL
-processing does not depend on it. Command-line flags are fixed for the life of
-the process, and so is the cache.
+settings: the emulator feature flags, and the value of every command-line flag
+linked into the emulator. DDL processing reads some of those flags, such as
+`--cloud_spanner_emulator_disable_cs_retention_check` and the GoogleSQL and
+PostgreSQL translator limits. Keying on all of them means a flag added later
+cannot be missed. Four flags are left out: the emulator writes them at runtime,
+and DDL processing never reads them (the change stream churner's three
+intervals, and `--schema_create_cache_size`). The database's name is not part
+of the key: DDL processing does not depend on it.
 
 Only schemas of successful creates are remembered. A request that fails always
 processes its statements, so it fails exactly as it would without the cache.
+
+A schema is also not remembered if a setting changed while it was being
+created, since its statements may then have been processed under settings other
+than the key's. Each change to a feature flag, or to a flag defined in the
+emulator that DDL processing reads, bumps a counter. The create compares that
+counter, and the value of every flag, before and after. Any other flag that is
+changed and changed back within one create goes unnoticed. Outside tests,
+though, the emulator writes no flag after startup except the churner's
+intervals.
 
 ## What a database created from the cache gets
 

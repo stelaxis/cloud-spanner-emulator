@@ -122,6 +122,7 @@ cc_library(
     ],
     tags = ["keep_dep"],
     deps = [
+        "//common:settings_generation",
         ":interfaces_with_stub_implementations",
         ":memory_reservation_manager",
         ":parser_interface",

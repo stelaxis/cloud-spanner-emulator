@@ -40,6 +40,9 @@
 #include "gtest/gtest.h"
 #include "googlesql/base/testing/status_matchers.h"
 #include "tests/common/proto_matchers.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/flags/flag.h"
+#include "absl/flags/reflection.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -161,14 +164,70 @@ std::vector<DdlCase> AllDdlCases() {
   return cases;
 }
 
+// Corpus cases whose schema CopySchema does not support (see
+// schema_create_cache.h), so every create of them processes its DDL.
+const absl::flat_hash_set<std::string>& ExpectedUncopyable() {
+  static const auto* names = new absl::flat_hash_set<std::string>{};
+  return *names;
+}
+
 // What a client can observe of a database, or of a request that failed.
 struct Observed {
   absl::StatusCode code = absl::StatusCode::kOk;
   std::string message;
   std::vector<std::string> ddl;
+  // GetDatabaseDdlResponse.proto_descriptors.
+  std::string proto_descriptors;
   // "TABLE: metadata" then "TABLE: row" for every INFORMATION_SCHEMA table.
   std::vector<std::string> information_schema;
 };
+
+// Puts in a canonical order what two databases created from the same DDL
+// without the cache return in different orders, and nothing else:
+// * PostgreSQL GetDatabaseDdl prints Schema::Dump(), whose indexes come from
+//   a hash map (schema.cc, `index_map_`), so its run of CREATE INDEX
+//   statements is sorted. Every other statement keeps its position.
+// * A property graph label's property names come from an absl::flat_hash_set,
+//   so they are sorted within their JSON array.
+// * INFORMATION_SCHEMA rows, which Observe reads without ORDER BY, are sorted
+//   there, within each table.
+Observed NormalizeOrder(Observed observed, DatabaseDialect dialect) {
+  if (dialect == DatabaseDialect::POSTGRESQL) {
+    static const LazyRE2 kCreateIndex = {
+        R"re((?i)^CREATE\s+(UNIQUE\s+|SEARCH\s+|VECTOR\s+)*INDEX\s)re"};
+    std::vector<std::string>& ddl = observed.ddl;
+    for (auto begin = ddl.begin(); begin != ddl.end();) {
+      if (!RE2::PartialMatch(*begin, *kCreateIndex)) {
+        ++begin;
+        continue;
+      }
+      auto end = begin;
+      while (end != ddl.end() && RE2::PartialMatch(*end, *kCreateIndex)) ++end;
+      std::sort(begin, end);
+      begin = end;
+    }
+  }
+  static const LazyRE2 kPropertyNames = {
+      R"re(\\"propertyDeclarationNames\\":\[([^\]]*)\])re"};
+  for (std::string& row : observed.information_schema) {
+    std::string out;
+    absl::string_view in(row), names;
+    const char* done = row.data();
+    while (RE2::FindAndConsume(&in, *kPropertyNames, &names)) {
+      std::vector<std::string> sorted = absl::StrSplit(names, ',');
+      std::sort(sorted.begin(), sorted.end());
+      absl::StrAppend(&out, absl::string_view(done, names.data() - done),
+                      absl::StrJoin(sorted, ","));
+      done = names.data() + names.size();
+    }
+    if (!out.empty()) {
+      absl::StrAppend(&out,
+                      absl::string_view(done, row.data() + row.size() - done));
+      row = std::move(out);
+    }
+  }
+  return observed;
+}
 
 class SchemaCreateCacheTest : public DatabaseTest {
  public:
@@ -367,6 +426,7 @@ class SchemaCreateCacheTest : public DatabaseTest {
           raw_database_client()->GetDatabaseDdl(&context, request, &response)));
       observed.ddl.assign(response.statements().begin(),
                           response.statements().end());
+      observed.proto_descriptors = response.proto_descriptors();
     }
     const bool pg = dialect == DatabaseDialect::POSTGRESQL;
     GOOGLESQL_ASSIGN_OR_RETURN(
@@ -418,46 +478,18 @@ class SchemaCreateCacheTest : public DatabaseTest {
                   << reference.size() << " rows):" << diff;
   }
 
-  // Removes the orders that differ between two databases created from the
-  // same DDL without the cache, and nothing else:
-  // * PostgreSQL GetDatabaseDdl prints Schema::Dump(), whose order of
-  //   statements varies; each statement is still compared byte for byte.
-  // * A property graph label's property names are an absl::flat_hash_set,
-  //   whose iteration order is salted per instance.
-  static Observed Normalize(Observed observed, DatabaseDialect dialect) {
-    if (dialect == DatabaseDialect::POSTGRESQL) {
-      std::sort(observed.ddl.begin(), observed.ddl.end());
-    }
-    static const LazyRE2 kPropertyNames = {
-        R"re(\\"propertyDeclarationNames\\":\[([^\]]*)\])re"};
-    for (std::string& row : observed.information_schema) {
-      std::string out;
-      absl::string_view in(row), names;
-      const char* done = row.data();
-      while (RE2::FindAndConsume(&in, *kPropertyNames, &names)) {
-        std::vector<std::string> sorted = absl::StrSplit(names, ',');
-        std::sort(sorted.begin(), sorted.end());
-        absl::StrAppend(&out, absl::string_view(done, names.data() - done),
-                        absl::StrJoin(sorted, ","));
-        done = names.data() + names.size();
-      }
-      if (!out.empty()) {
-        absl::StrAppend(&out,
-                        absl::string_view(done, row.data() + row.size() - done));
-        row = std::move(out);
-      }
-    }
-    return observed;
-  }
-
   void ExpectSame(const Observed& cached_observed,
                   const Observed& reference_observed,
                   DatabaseDialect dialect) {
-    const Observed cached = Normalize(cached_observed, dialect);
-    const Observed reference = Normalize(reference_observed, dialect);
+    const Observed cached = NormalizeOrder(cached_observed, dialect);
+    const Observed reference = NormalizeOrder(reference_observed, dialect);
     EXPECT_EQ(cached.code, reference.code);
     EXPECT_EQ(cached.message, reference.message);
     ExpectSameRows("GetDatabaseDdl", cached.ddl, reference.ddl);
+    EXPECT_TRUE(cached.proto_descriptors == reference.proto_descriptors)
+        << "GetDatabaseDdl proto_descriptors differ ("
+        << cached.proto_descriptors.size() << " vs "
+        << reference.proto_descriptors.size() << " bytes)";
     ExpectSameRows("INFORMATION_SCHEMA", cached.information_schema,
                    reference.information_schema);
   }
@@ -471,17 +503,30 @@ class SchemaCreateCacheTest : public DatabaseTest {
     absl::Status warm_status =
         Create(/*reference=*/false, absl::StrCat(id, "w"), ddl);
     const int64_t hits = cache_.hits();
+    const int64_t copies = cache_.copies();
     absl::Status cached_status = Create(/*reference=*/false, id, ddl);
     // Its database has another name, which an error message may include.
     EXPECT_EQ(warm_status.code(), reference_status.code());
+    EXPECT_EQ(cache_.fallbacks(), 0) << "a create fell back to its DDL";
+    EXPECT_EQ(cache_.rejected(), 0);
     if (reference_status.ok()) {
-      // The second create came from the cache, unless the schema is one the
-      // cache cannot copy.
-      std::shared_ptr<const SchemaCreateCache::Entry> entry =
-          cache_.Peek(SchemaCreateCache::Key(Operation(ddl)));
+      // The second create was completed from a copy of the cached schema,
+      // unless the case is one the cache cannot copy.
+      std::shared_ptr<const SchemaCreateCache::Entry> entry = cache_.Peek(
+          SchemaCreateCache::Key(Operation(ddl),
+                                 SchemaCreateCache::CurrentSettings()));
       EXPECT_NE(entry, nullptr);
       EXPECT_EQ(cache_.hits(), hits + 1);
-      if (entry != nullptr && entry->schema != nullptr) ++copied_;
+      if (ExpectedUncopyable().contains(ddl.name)) {
+        EXPECT_TRUE(entry == nullptr || entry->schema == nullptr)
+            << ddl.name << " is listed as uncopyable but was copied";
+        EXPECT_EQ(cache_.copies(), copies);
+      } else {
+        EXPECT_TRUE(entry != nullptr && entry->schema != nullptr)
+            << ddl.name << ": the cache could not copy the schema";
+        EXPECT_EQ(cache_.copies(), copies + 1)
+            << ddl.name << ": the create was not completed from the cache";
+      }
     } else {
       // Failed creates are not cached.
       EXPECT_EQ(cache_.size(), size);
@@ -510,7 +555,6 @@ class SchemaCreateCacheTest : public DatabaseTest {
   // Databases to drop after the test. Tests create databases concurrently.
   std::vector<std::string> created_ ABSL_GUARDED_BY(created_mu_);
   std::string proto_descriptors_;
-  int copied_ = 0;
 };
 
 class SchemaCreateCacheDdlTest
@@ -573,6 +617,78 @@ const DdlCase& SequenceDdl() {
   return *ddl;
 }
 
+// NormalizeOrder reorders only the run of PostgreSQL CREATE INDEX statements:
+// a change in any other statement's position, such as a child table or a
+// view printed before what it depends on, still fails the comparison.
+TEST(SchemaCreateCacheNormalizeTest, KeepsDependencyOrder) {
+  const std::vector<std::string> ddl = {
+      "CREATE SEQUENCE s",
+      "CREATE TABLE p (k bigint PRIMARY KEY)",
+      "CREATE TABLE c (k bigint PRIMARY KEY) INTERLEAVE IN PARENT p",
+      "CREATE INDEX a ON p (k)",
+      "CREATE UNIQUE INDEX b ON c (k)",
+      "CREATE VIEW v SQL SECURITY INVOKER AS SELECT p.k FROM p",
+  };
+  auto normalized = [](std::vector<std::string> statements) {
+    return NormalizeOrder(Observed{.ddl = std::move(statements)},
+                          DatabaseDialect::POSTGRESQL)
+        .ddl;
+  };
+  auto swapped = [&](int i, int j) {
+    std::vector<std::string> statements = ddl;
+    std::swap(statements[i], statements[j]);
+    return statements;
+  };
+  EXPECT_EQ(normalized(swapped(3, 4)), normalized(ddl));  // the index run
+  EXPECT_NE(normalized(swapped(1, 2)), normalized(ddl));  // child first
+  EXPECT_NE(normalized(swapped(4, 5)), normalized(ddl));  // view in the run
+  EXPECT_NE(normalized(swapped(0, 1)), normalized(ddl));  // sequence later
+  // GoogleSQL DDL is compared as is.
+  EXPECT_NE(NormalizeOrder(Observed{.ddl = swapped(3, 4)},
+                           DatabaseDialect::GOOGLE_STANDARD_SQL)
+                .ddl,
+            ddl);
+}
+
+// A setting that changes the outcome of DDL is part of the key: after it
+// changes, the same request is not served from a schema created under the
+// old value, and fails exactly as it does without the cache.
+TEST_F(SchemaCreateCacheTest, SettingChangeBetweenCreates) {
+  absl::FlagSaver flag_saver;
+  const DdlCase retention{
+      "retention",
+      DatabaseDialect::GOOGLE_STANDARD_SQL,
+      {"CREATE TABLE t (k INT64) PRIMARY KEY (k)",
+       "CREATE CHANGE STREAM cs FOR t OPTIONS (retention_period = '1h')"}};
+  absl::SetFlag(&FLAGS_cloud_spanner_emulator_disable_cs_retention_check,
+                true);
+  GOOGLESQL_ASSERT_OK(Create(/*reference=*/false, "r1", retention));
+  GOOGLESQL_ASSERT_OK(Create(/*reference=*/false, "r2", retention));
+  EXPECT_EQ(cache_.copies(), 1);
+
+  absl::SetFlag(&FLAGS_cloud_spanner_emulator_disable_cs_retention_check,
+                false);
+  absl::Status reference = Create(/*reference=*/true, "r3", retention);
+  absl::Status cached = Create(/*reference=*/false, "r3", retention);
+  EXPECT_EQ(reference.code(), absl::StatusCode::kFailedPrecondition);
+  EXPECT_EQ(cached, reference);
+  EXPECT_EQ(cache_.copies(), 1);
+
+  // An emulator feature flag.
+  const DdlCase view{"view",
+                     DatabaseDialect::GOOGLE_STANDARD_SQL,
+                     {"CREATE VIEW v SQL SECURITY INVOKER AS SELECT 1 AS a"}};
+  GOOGLESQL_ASSERT_OK(Create(/*reference=*/false, "v1", view));
+  EmulatorFeatureFlags::Flags flags = EmulatorFeatureFlags::instance().flags();
+  flags.enable_views = false;
+  ScopedEmulatorFeatureFlagsSetter without_views(flags);
+  reference = Create(/*reference=*/true, "v2", view);
+  cached = Create(/*reference=*/false, "v2", view);
+  EXPECT_FALSE(reference.ok());
+  EXPECT_EQ(cached, reference);
+  EXPECT_EQ(cache_.copies(), 1);
+}
+
 // The keys a database's sequences and identity column give its first rows.
 absl::StatusOr<std::vector<std::string>> InsertRows(
     cloud::spanner::Client& client, int rows) {
@@ -615,6 +731,7 @@ TEST_F(SchemaCreateCacheTest, SequencesAreIndependent) {
     GOOGLESQL_ASSERT_OK(Create(/*reference=*/false, absl::StrCat("s", i), SequenceDdl()));
   }
   EXPECT_EQ(cache_.hits(), kDatabases - 1);
+  EXPECT_EQ(cache_.copies(), kDatabases - 1);
   std::vector<std::thread> threads;
   for (int i = 0; i < kDatabases; ++i) {
     threads.emplace_back([&, i] {
@@ -633,6 +750,7 @@ TEST_F(SchemaCreateCacheTest, ChangeStreamPartitions) {
   GOOGLESQL_ASSERT_OK(Create(/*reference=*/false, "cw", SequenceDdl()));
   GOOGLESQL_ASSERT_OK(Create(/*reference=*/false, "c", SequenceDdl()));
   EXPECT_EQ(cache_.hits(), 1);
+  EXPECT_EQ(cache_.copies(), 1);
   std::vector<std::vector<std::string>> tokens;
   for (bool reference : {true, false}) {
     GOOGLESQL_ASSERT_OK_AND_ASSIGN(
@@ -676,6 +794,14 @@ TEST_F(SchemaCreateCacheTest, ConcurrentCreatesOfTheSameDdl) {
                 SequenceDdl().dialect, absl::OkStatus()));
     EXPECT_THAT(observed.ddl, testing::ElementsAreArray(expected.ddl));
   }
+  // Every create that found the entry was completed from it, and the entry
+  // is there for the next one.
+  EXPECT_EQ(cache_.copies(), cache_.hits());
+  GOOGLESQL_ASSERT_OK(CreateUsingCurrentCache(/*reference=*/false, "rafter",
+                                    SequenceDdl()));
+  EXPECT_EQ(cache_.copies(), cache_.hits());
+  EXPECT_GT(cache_.copies(), 0);
+  EXPECT_EQ(cache_.fallbacks(), 0);
 }
 
 // After its entry is evicted, a database created from it keeps working, and
@@ -688,10 +814,12 @@ TEST_F(SchemaCreateCacheTest, CreateAfterEviction) {
   GOOGLESQL_ASSERT_OK(CreateUsingCurrentCache(false, "e1", SequenceDdl()));
   GOOGLESQL_ASSERT_OK(CreateUsingCurrentCache(false, "e2", SequenceDdl()));
   EXPECT_EQ(small.hits(), 1);
+  EXPECT_EQ(small.copies(), 1);
   GOOGLESQL_ASSERT_OK(CreateUsingCurrentCache(false, "e3", other));
   EXPECT_EQ(small.size(), 1);
   GOOGLESQL_ASSERT_OK(CreateUsingCurrentCache(false, "e4", SequenceDdl()));
   EXPECT_EQ(small.hits(), 1);
+  EXPECT_EQ(small.copies(), 1);
   SchemaCreateCache::SetGlobalForTesting(&cache_);
 
   GOOGLESQL_ASSERT_OK(Create(/*reference=*/true, "e2", SequenceDdl()));

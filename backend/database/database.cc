@@ -90,19 +90,24 @@ absl::StatusOr<std::unique_ptr<Database>> Database::Create(
   SchemaCreateCache* cache = schema_change_operation.statements.empty()
                                  ? nullptr
                                  : SchemaCreateCache::Global();
+  SchemaCreateCache::Settings settings;
   std::string cache_key;
   std::shared_ptr<const SchemaCreateCache::Entry> cached;
   if (cache != nullptr) {
-    cache_key = SchemaCreateCache::Key(schema_change_operation);
+    settings = SchemaCreateCache::CurrentSettings();
+    cache_key = SchemaCreateCache::Key(schema_change_operation, settings);
     cached = cache->Lookup(cache_key);
+    SchemaCreateCache::RunAfterKeyHook();
   }
   if (cached != nullptr && cached->schema != nullptr) {
     absl::StatusOr<std::unique_ptr<Database>> database =
         CreateFromCache(clock, database_id,
                         schema_change_operation.database_dialect, *cached);
     if (database.ok()) {
+      cache->RecordCopy();
       return database;
     }
+    cache->RecordFallback();
     ABSL_LOG(WARNING) << "Creating database " << database_id
                       << " from DDL: cannot copy its cached schema: "
                       << database.status();
@@ -132,7 +137,15 @@ absl::StatusOr<std::unique_ptr<Database>> Database::Create(
     // All-no-op statements leave no schema to copy.
     if (cache != nullptr && cached == nullptr &&
         database->versioned_catalog_->GetLatestSchema() != nullptr) {
-      cache->Insert(cache_key, database->MakeSchemaCreateCacheEntry());
+      std::shared_ptr<const SchemaCreateCache::Entry> entry =
+          database->MakeSchemaCreateCacheEntry();
+      SchemaCreateCache::RunBeforePublishHook();
+      // The DDL may have read other settings than the key's.
+      if (SchemaCreateCache::SettingsUnchanged(settings)) {
+        cache->Insert(cache_key, std::move(entry));
+      } else {
+        cache->RecordRejected();
+      }
     }
   }
   database->Initialize();

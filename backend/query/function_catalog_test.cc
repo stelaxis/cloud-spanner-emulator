@@ -271,6 +271,37 @@ TEST(FunctionCatalogTest, FeatureFlagsKeyTheSharedFunctions) {
   EXPECT_EQ(Describe(shared), Describe(unshared));
 }
 
+// A set of shared functions built while a feature flag changed, even if the
+// change was undone before the build ended, is not shared: its functions may
+// not match the key's flags.
+TEST(FunctionCatalogTest, FlagChangeDuringSharedBuildIsNotShared) {
+  googlesql::TypeFactory type_factory;
+  const EmulatorFeatureFlags::Flags original =
+      EmulatorFeatureFlags::instance().flags();
+  auto& instance =
+      const_cast<EmulatorFeatureFlags&>(EmulatorFeatureFlags::instance());
+  EmulatorFeatureFlags::Flags flipped = original;
+  flipped.enable_protos = !original.enable_protos;
+  // A catalog name no other test uses, so this key's set is not built yet.
+  const std::string catalog_name = "shared_build_interleaving";
+
+  FunctionCatalog::SetSharedBuildHooksForTesting(
+      [&] { instance.set_flags(flipped); },
+      [&] { instance.set_flags(original); });
+  FunctionCatalog during_change(&type_factory, catalog_name);
+  FunctionCatalog::SetSharedBuildHooksForTesting(nullptr, nullptr);
+  EXPECT_FALSE(during_change.uses_shared_functions());
+
+  // The next catalog builds and shares the set under unchanged flags.
+  FunctionCatalog after(&type_factory, catalog_name);
+  EXPECT_TRUE(after.uses_shared_functions());
+  FunctionCatalog::SetSharingEnabledForTesting(false);
+  FunctionCatalog unshared(&type_factory, catalog_name);
+  FunctionCatalog::SetSharingEnabledForTesting(true);
+  EXPECT_EQ(Describe(after), Describe(unshared));
+  EXPECT_EQ(Describe(during_change), Describe(unshared));
+}
+
 // Catalogs are built and evaluated concurrently, for ThreadSanitizer, while
 // another thread changes the feature flags.
 TEST(FunctionCatalogTest, ConcurrentConstructionAndEvaluation) {

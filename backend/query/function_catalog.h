@@ -99,6 +99,14 @@ class FunctionCatalog {
   // own functions. Set before concurrent use.
   static void SetSharingEnabledForTesting(bool enabled);
 
+  // For tests: run just before and just after building a set of shared
+  // functions. Set before concurrent use.
+  static void SetSharedBuildHooksForTesting(std::function<void()> before,
+                                            std::function<void()> after) {
+    before_shared_build_hook_ = std::move(before);
+    after_shared_build_hook_ = std::move(after);
+  }
+
   // Hooks that every sequence or identity function evaluation, in any catalog,
   // runs just before and just after loading the latest schema. For tests; set
   // before concurrent use.
@@ -195,6 +203,10 @@ class FunctionCatalog {
   // See SetEvaluationHooksForTesting.
   inline static std::function<void()> before_schema_load_hook_;
   inline static std::function<void()> after_schema_load_hook_;
+
+  // See SetSharedBuildHooksForTesting.
+  inline static std::function<void()> before_shared_build_hook_;
+  inline static std::function<void()> after_shared_build_hook_;
 };
 
 }  // namespace backend

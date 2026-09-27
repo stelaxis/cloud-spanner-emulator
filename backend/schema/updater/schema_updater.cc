@@ -136,10 +136,12 @@
 
 #include "googlesql/base/ret_check.h"
 #include "googlesql/base/status_macros.h"
+#include "common/settings_generation.h"
 
 ABSL_FLAG(bool, cloud_spanner_emulator_disable_cs_retention_check, false,
           "whether we want to check the retention limit when altering a change "
-          "stream's retention period.");
+          "stream's retention period.")
+    .OnUpdate(google::spanner::emulator::BumpSettingsGeneration);
 
 namespace google {
 namespace spanner {

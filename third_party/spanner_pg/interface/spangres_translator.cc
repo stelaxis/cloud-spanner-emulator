@@ -86,12 +86,15 @@
 #include "third_party/spanner_pg/util/postgres.h"
 #include "googlesql/base/ret_check.h"
 #include "googlesql/base/status_macros.h"
+#include "common/settings_generation.h"
 
 ABSL_FLAG(int64_t, spangres_sql_length_limit, 100'000,
-          "The maximum length of a supported SQL text.");
+          "The maximum length of a supported SQL text.")
+    .OnUpdate(google::spanner::emulator::BumpSettingsGeneration);
 ABSL_FLAG(int64_t, spangres_stub_memory_reservation_size, 64'000'000,
           "The reservable amount of memory for the test stub memory "
-          "reservation system, 0 for no limit.");
+          "reservation system, 0 for no limit.")
+    .OnUpdate(google::spanner::emulator::BumpSettingsGeneration);
 
 namespace postgres_translator {
 namespace spangres {
