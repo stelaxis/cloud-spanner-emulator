@@ -25,12 +25,13 @@ processes its statements, so it fails exactly as it would without the cache.
 
 A schema is also not remembered if a setting changed while it was being
 created, since its statements may then have been processed under settings other
-than the key's. Each change to a feature flag, or to a flag defined in the
-emulator that DDL processing reads, bumps a counter. The create compares that
-counter, and the value of every flag, before and after. Any other flag that is
-changed and changed back within one create goes unnoticed. Outside tests,
-though, the emulator writes no flag after startup except the churner's
-intervals.
+than the key's. Every write to the feature flags counts as a change, even one
+undone before the create ends: the create compares the feature flags' write
+count, which moves under the same lock as the flags, before and after. A
+command-line flag counts as changed only if its value differs at the end of the
+create; one changed and changed back within a single create goes unnoticed.
+Outside tests, the emulator writes no command-line flag in the key after
+startup.
 
 ## What a database created from the cache gets
 

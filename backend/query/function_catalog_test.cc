@@ -36,6 +36,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/synchronization/notification.h"
 #include "backend/schema/catalog/schema.h"
 #include "common/constants.h"
 #include "common/feature_flags.h"
@@ -300,6 +301,47 @@ TEST(FunctionCatalogTest, FlagChangeDuringSharedBuildIsNotShared) {
   FunctionCatalog::SetSharingEnabledForTesting(true);
   EXPECT_EQ(Describe(after), Describe(unshared));
   EXPECT_EQ(Describe(during_change), Describe(unshared));
+}
+
+// Two writers of the feature flags, each paused just after its write became
+// visible: the first flips a flag before the shared set is built, the second
+// flips it back before the catalog checks the flags. The flags then equal the
+// key's, but they were written twice, so the set is not shared.
+TEST(FunctionCatalogTest, TwoWritersRestoringFlagsDuringSharedBuild) {
+  googlesql::TypeFactory type_factory;
+  auto& instance =
+      const_cast<EmulatorFeatureFlags&>(EmulatorFeatureFlags::instance());
+  const EmulatorFeatureFlags::Flags original = instance.flags();
+  EmulatorFeatureFlags::Flags flipped = original;
+  flipped.enable_protos = !original.enable_protos;
+  // A catalog name no other test uses, so this key's set is not built yet.
+  const std::string catalog_name = "two_writer_interleaving";
+
+  absl::Notification paused[2];
+  absl::Notification release[2];
+  std::atomic<int> writes = 0;
+  EmulatorFeatureFlags::SetAfterSetHookForTesting([&] {
+    const int i = writes++;
+    paused[i].Notify();
+    release[i].WaitForNotification();
+  });
+  std::vector<std::thread> writers;
+  auto write = [&](const EmulatorFeatureFlags::Flags& flags) {
+    const int i = writers.size();
+    writers.emplace_back([&instance, flags] { instance.set_flags(flags); });
+    paused[i].WaitForNotification();
+  };
+  FunctionCatalog::SetSharedBuildHooksForTesting([&] { write(flipped); },
+                                                 [&] { write(original); });
+  FunctionCatalog during_writes(&type_factory, catalog_name);
+  FunctionCatalog::SetSharedBuildHooksForTesting(nullptr, nullptr);
+  for (absl::Notification& notification : release) notification.Notify();
+  for (std::thread& writer : writers) writer.join();
+  EmulatorFeatureFlags::SetAfterSetHookForTesting(nullptr);
+
+  EXPECT_FALSE(during_writes.uses_shared_functions());
+  FunctionCatalog after(&type_factory, catalog_name);
+  EXPECT_TRUE(after.uses_shared_functions());
 }
 
 // Catalogs are built and evaluated concurrently, for ThreadSanitizer, while

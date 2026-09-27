@@ -97,16 +97,17 @@ class SchemaCreateCache {
   // that the emulator writes at runtime and DDL processing never reads (the
   // change stream churner's intervals, and this cache's size).
   struct Settings {
-    int64_t generation = 0;  // SettingsGeneration()
+    // EmulatorFeatureFlags::Snapshot::generation, read with the flags.
+    int64_t generation = 0;
     std::string values;
   };
   static Settings CurrentSettings();
 
-  // True if no setting changed since `before` was taken: the values are the
-  // same and the generation did not move, which catches a change undone
-  // before now. The values catch a change to a flag that does not bump the
-  // generation, unless it was undone again before now; outside tests, the
-  // emulator writes no such flag after startup.
+  // True if no setting changed since `before` was taken. Any write to the
+  // feature flags since then is caught, even one undone before now, since it
+  // moves their generation. A command-line flag is caught only if its value
+  // differs now: outside tests, nothing writes the flags in the settings
+  // after startup.
   static bool SettingsUnchanged(const Settings& before);
 
   static std::string Key(const SchemaChangeOperation& operation,

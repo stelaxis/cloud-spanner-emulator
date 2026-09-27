@@ -79,7 +79,6 @@
 #include "third_party/spanner_pg/util/postgres.h"
 #include "googlesql/base/ret_check.h"
 #include "googlesql/base/status_macros.h"
-#include "common/settings_generation.h"
 
 // TODO: Augment ParserOutput with the query string length data to
 // fill in the statement end location in the case where PG puts an end location
@@ -87,27 +86,23 @@
 ABSL_FLAG(bool, spangres_include_invalid_statement_parse_locations, true,
           "Include a start parse location for statements even when the end "
           "location is not known.  By convention, the end location will be set "
-          "to 0 to indicate that it is the remainder of the query string.")
-    .OnUpdate(google::spanner::emulator::BumpSettingsGeneration);
+          "to 0 to indicate that it is the remainder of the query string.");
 
 ABSL_FLAG(int64_t, spangres_expression_recursion_limit, 1'000,
           "The maximum depth of expression recursion tree in a SQL query. The "
           "transformer will return an error if it sees a tree depth higher "
-          "than the limit.")
-    .OnUpdate(google::spanner::emulator::BumpSettingsGeneration);
+          "than the limit.");
 
 ABSL_FLAG(
     int64_t, spangres_set_operation_recursion_limit, 100,
     "The maximum depth of set operation recursion tree in a SQL query. The "
     "transformer will return an error if it sees a tree depth higher "
-    "than the limit.")
-    .OnUpdate(google::spanner::emulator::BumpSettingsGeneration);
+    "than the limit.");
 
 ABSL_FLAG(bool, spangres_use_emulator_ordinality_transformer, false,
           "When true, array scans with array_offset_column will be wrapped in "
           "a ProjectScan that adds one to the offset column to convert "
-          "zero-based offset to one-based ordinal values")
-    .OnUpdate(google::spanner::emulator::BumpSettingsGeneration);
+          "zero-based offset to one-based ordinal values");
 
 namespace postgres_translator {
 

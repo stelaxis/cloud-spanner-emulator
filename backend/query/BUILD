@@ -653,6 +653,7 @@ cc_test(
     name = "function_catalog_test",
     srcs = ["function_catalog_test.cc"],
     deps = [
+        "@com_google_absl//absl/synchronization",
         ":function_catalog",
         "//backend/schema/catalog:schema",
         "//common:constants",
@@ -905,7 +906,6 @@ cc_library(
         "//common:constants",
         "//common:errors",
         "//common:feature_flags",
-        "//common:settings_generation",
         "//common:pg_literals",
         "//third_party/spanner_pg/catalog:emulator_function_evaluators",
         "//third_party/spanner_pg/catalog:emulator_functions",

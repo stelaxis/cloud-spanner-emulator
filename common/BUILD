@@ -112,14 +112,8 @@ cc_library(
     name = "feature_flags",
     hdrs = ["feature_flags.h"],
     deps = [
-        ":settings_generation",
         "@com_google_absl//absl/synchronization",
     ],
-)
-
-cc_library(
-    name = "settings_generation",
-    hdrs = ["settings_generation.h"],
 )
 
 cc_test(

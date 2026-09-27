@@ -146,7 +146,6 @@ cc_library(
         "schema_updater.h",
     ],
     deps = [
-        "//common:settings_generation",
         ":ddl_type_conversion",
         ":global_schema_names",
         ":schema_validation_context",

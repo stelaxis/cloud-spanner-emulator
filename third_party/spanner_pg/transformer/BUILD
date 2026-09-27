@@ -102,7 +102,6 @@ cc_library(
         "forward_transformer.h",
     ],
     deps = [
-        "//common:settings_generation",
         ":transformer_helper",
         "//third_party/spanner_pg/bootstrap_catalog",
         "//third_party/spanner_pg/catalog:catalog_adapter",

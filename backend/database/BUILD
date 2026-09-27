@@ -81,7 +81,6 @@ cc_library(
         "//backend/schema/updater:schema_updater",
         "//backend/schema/updater:schema_validation_context",
         "//common:feature_flags",
-        "//common:settings_generation",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",
@@ -106,6 +105,7 @@ cc_test(
     name = "schema_create_cache_test",
     srcs = ["schema_create_cache_test.cc"],
     deps = [
+        "@com_google_absl//absl/synchronization",
         "//backend/database/change_stream:change_stream_partition_churner",
         "@com_google_absl//absl/flags:commandlineflag",
         "@com_google_absl//absl/flags:flag",

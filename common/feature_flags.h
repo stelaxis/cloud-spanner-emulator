@@ -17,8 +17,11 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_COMMON_FEATURE_FLAGS_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_COMMON_FEATURE_FLAGS_H_
 
+#include <cstdint>
+#include <functional>
+#include <utility>
+
 #include "absl/synchronization/mutex.h"
-#include "common/settings_generation.h"
 
 namespace google {
 namespace spanner {
@@ -70,18 +73,42 @@ class EmulatorFeatureFlags {
     return flags_;
   }
 
+  // The flags, and the number of set_flags() calls that wrote them.
+  struct Snapshot {
+    Flags flags;
+    int64_t generation = 0;
+  };
+
+  // A result computed from the flags is valid for a snapshot taken before it
+  // if the generation has not moved since: a reader that sees a written value
+  // also sees its generation, because both change under one lock.
+  Snapshot snapshot() const ABSL_LOCKS_EXCLUDED(mu_) {
+    absl::ReaderMutexLock l(&mu_);
+    return Snapshot{flags_, generation_};
+  }
+
   void set_flags(const Flags& flags) ABSL_LOCKS_EXCLUDED(mu_) {
     {
       absl::MutexLock l(&mu_);
       flags_ = flags;
+      ++generation_;
     }
-    BumpSettingsGeneration();
+    if (after_set_hook_ != nullptr) after_set_hook_();
+  }
+
+  // For tests: runs at the end of every set_flags(), once the new flags are
+  // visible. Set before concurrent use.
+  static void SetAfterSetHookForTesting(std::function<void()> hook) {
+    after_set_hook_ = std::move(hook);
   }
 
  private:
   EmulatorFeatureFlags() = default;
   Flags flags_ ABSL_GUARDED_BY(mu_);
+  int64_t generation_ ABSL_GUARDED_BY(mu_) = 0;
   mutable absl::Mutex mu_;
+
+  inline static std::function<void()> after_set_hook_;
 };
 
 }  // namespace emulator

@@ -57,7 +57,6 @@
 #include "backend/schema/graph/schema_node.h"
 #include "backend/schema/updater/schema_validation_context.h"
 #include "common/feature_flags.h"
-#include "common/settings_generation.h"
 #include "googlesql/base/ret_check.h"
 #include "googlesql/base/status_macros.h"
 
@@ -290,8 +289,7 @@ const std::vector<absl::CommandLineFlag*>& SettingsFlags() {
   return *flags;
 }
 
-std::string SettingsValues() {
-  EmulatorFeatureFlags::Flags flags = EmulatorFeatureFlags::instance().flags();
+std::string SettingsValues(const EmulatorFeatureFlags::Flags& flags) {
   // Every part is length-prefixed, so different settings have different
   // values.
   std::string values = absl::StrCat(
@@ -308,17 +306,15 @@ std::string SettingsValues() {
 }  // namespace
 
 SchemaCreateCache::Settings SchemaCreateCache::CurrentSettings() {
-  // The generation first: a change that the values miss bumps it later.
-  Settings settings;
-  settings.generation = SettingsGeneration();
-  settings.values = SettingsValues();
-  return settings;
+  EmulatorFeatureFlags::Snapshot snapshot =
+      EmulatorFeatureFlags::instance().snapshot();
+  return Settings{.generation = snapshot.generation,
+                  .values = SettingsValues(snapshot.flags)};
 }
 
 bool SchemaCreateCache::SettingsUnchanged(const Settings& before) {
-  // The values first, then the generation (see CurrentSettings).
-  return SettingsValues() == before.values &&
-         SettingsGeneration() == before.generation;
+  Settings now = CurrentSettings();
+  return now.generation == before.generation && now.values == before.values;
 }
 
 std::string SchemaCreateCache::Key(const SchemaChangeOperation& operation,

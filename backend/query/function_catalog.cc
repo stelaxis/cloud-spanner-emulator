@@ -68,7 +68,6 @@
 #include "common/constants.h"
 #include "common/errors.h"
 #include "common/feature_flags.h"
-#include "common/settings_generation.h"
 #include "common/pg_literals.h"
 #include "third_party/spanner_pg/catalog/emulator_function_evaluators.h"
 #include "third_party/spanner_pg/catalog/emulator_functions.h"
@@ -639,8 +638,8 @@ static_assert(std::has_unique_object_representations_v<
 
 // Everything the functions of a SharedFunctions depend on.
 std::string SharedFunctionsKey(const std::string& catalog_name,
-                               database_api::DatabaseDialect dialect) {
-  EmulatorFeatureFlags::Flags flags = EmulatorFeatureFlags::instance().flags();
+                               database_api::DatabaseDialect dialect,
+                               const EmulatorFeatureFlags::Flags& flags) {
   return absl::StrCat(
       catalog_name, "/", static_cast<int>(dialect), "/",
       absl::string_view(reinterpret_cast<const char*>(&flags), sizeof(flags)));
@@ -706,11 +705,9 @@ const FunctionCatalog::SharedFunctions* FunctionCatalog::GetSharedFunctions(
   static auto* cache =
       new absl::flat_hash_map<std::string,
                               std::unique_ptr<const SharedFunctions>>();
-  // The generation first, then the key; after building, the key, then the
-  // generation. A flag change during the build then changes one of them,
-  // even if it is undone before the build ends.
-  const int64_t generation = SettingsGeneration();
-  std::string key = SharedFunctionsKey(catalog_name, dialect);
+  const EmulatorFeatureFlags::Snapshot flags =
+      EmulatorFeatureFlags::instance().snapshot();
+  std::string key = SharedFunctionsKey(catalog_name, dialect, flags.flags);
   absl::MutexLock lock(mu);
   if (auto it = cache->find(key); it != cache->end()) {
     return it->second.get();
@@ -722,9 +719,10 @@ const FunctionCatalog::SharedFunctions* FunctionCatalog::GetSharedFunctions(
   std::unique_ptr<const SharedFunctions> shared =
       BuildSharedFunctions(catalog_name, dialect);
   if (after_shared_build_hook_ != nullptr) after_shared_build_hook_();
-  // Flags changed while building: the functions may not match the key.
-  if (SharedFunctionsKey(catalog_name, dialect) != key ||
-      SettingsGeneration() != generation) {
+  // Flags written while building, even if changed back: the functions may not
+  // match the key.
+  if (EmulatorFeatureFlags::instance().snapshot().generation !=
+      flags.generation) {
     return nullptr;
   }
   // A null entry records that this key cannot share.

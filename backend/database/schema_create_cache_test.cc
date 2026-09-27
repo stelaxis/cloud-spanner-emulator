@@ -16,6 +16,7 @@
 
 #include "backend/database/schema_create_cache.h"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -37,6 +38,7 @@
 #include "absl/flags/reflection.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "backend/database/database.h"
 #include "backend/schema/catalog/column.h"
@@ -495,6 +497,7 @@ class SchemaCreateCacheInterleavingTest : public ::testing::Test {
   }
   void TearDown() override {
     SchemaCreateCache::SetCreateHooksForTesting(nullptr, nullptr);
+    EmulatorFeatureFlags::SetAfterSetHookForTesting(nullptr);
     SchemaCreateCache::SetGlobalForTesting(previous_);
     const_cast<EmulatorFeatureFlags&>(EmulatorFeatureFlags::instance())
         .set_flags(original_flags_);
@@ -547,26 +550,6 @@ TEST_F(SchemaCreateCacheInterleavingTest, UnchangedSettingsPublish) {
   EXPECT_EQ(cache_.rejected(), 0);
 }
 
-// The key is taken with the retention check on, under which the DDL fails;
-// the check is off while the DDL runs, and on again before publishing.
-TEST_F(SchemaCreateCacheInterleavingTest, FlagChangedAndRestoredMidCreate) {
-  SetRetentionCheckDisabled(false);
-  const absl::Status uncached = Create(retention_ddl_, /*use_cache=*/false);
-  ASSERT_EQ(uncached.code(), absl::StatusCode::kFailedPrecondition);
-
-  SchemaCreateCache::SetCreateHooksForTesting(
-      [] { SetRetentionCheckDisabled(true); },
-      [] { SetRetentionCheckDisabled(false); });
-  GOOGLESQL_EXPECT_OK(Create(retention_ddl_));
-  SchemaCreateCache::SetCreateHooksForTesting(nullptr, nullptr);
-  EXPECT_EQ(cache_.rejected(), 1);
-  EXPECT_EQ(cache_.size(), 0);
-
-  // Under the key's settings the DDL still fails, as without the cache.
-  EXPECT_EQ(Create(retention_ddl_), uncached);
-  EXPECT_EQ(cache_.copies(), 0);
-}
-
 TEST_F(SchemaCreateCacheInterleavingTest, FlagChangedMidCreate) {
   SetRetentionCheckDisabled(false);
   SchemaCreateCache::SetCreateHooksForTesting(
@@ -587,6 +570,43 @@ TEST_F(SchemaCreateCacheInterleavingTest,
                                               [] { SetViewsEnabled(false); });
   GOOGLESQL_EXPECT_OK(Create(view_ddl_));
   SchemaCreateCache::SetCreateHooksForTesting(nullptr, nullptr);
+  EXPECT_EQ(cache_.rejected(), 1);
+  EXPECT_EQ(cache_.size(), 0);
+  EXPECT_EQ(Create(view_ddl_), uncached);
+}
+
+// Two writers of the feature flags, each paused just after its write became
+// visible: the first enables views before the DDL runs, the second disables
+// them again before the create checks the settings. The flags then equal the
+// key's, but they were written twice, so the schema is not published.
+TEST_F(SchemaCreateCacheInterleavingTest,
+       TwoWritersRestoreFeatureFlagsMidCreate) {
+  SetViewsEnabled(false);
+  const absl::Status uncached = Create(view_ddl_, /*use_cache=*/false);
+  ASSERT_FALSE(uncached.ok());
+
+  absl::Notification paused[2];
+  absl::Notification release[2];
+  std::atomic<int> writes = 0;
+  EmulatorFeatureFlags::SetAfterSetHookForTesting([&] {
+    const int i = writes++;
+    paused[i].Notify();
+    release[i].WaitForNotification();
+  });
+  std::vector<std::thread> writers;
+  auto write = [&](bool views) {
+    const int i = writers.size();
+    writers.emplace_back([views] { SetViewsEnabled(views); });
+    paused[i].WaitForNotification();
+  };
+  SchemaCreateCache::SetCreateHooksForTesting([&] { write(true); },
+                                              [&] { write(false); });
+  GOOGLESQL_EXPECT_OK(Create(view_ddl_));
+  SchemaCreateCache::SetCreateHooksForTesting(nullptr, nullptr);
+  for (absl::Notification& notification : release) notification.Notify();
+  for (std::thread& writer : writers) writer.join();
+  EmulatorFeatureFlags::SetAfterSetHookForTesting(nullptr);
+
   EXPECT_EQ(cache_.rejected(), 1);
   EXPECT_EQ(cache_.size(), 0);
   EXPECT_EQ(Create(view_ddl_), uncached);
