@@ -48,6 +48,12 @@ std::unique_ptr<googlesql::Function> CreateSecureContextFunction(
 //
 // The FunctionCatalog supports looking up a function by name and enumerating
 // all existing functions.
+//
+// Building every function takes milliseconds, and schema changes build a
+// catalog for each expression they analyze. So catalogs share one immutable
+// copy of the functions that depend only on the catalog name, the dialect of
+// the schema given at construction and the emulator feature flags, and build
+// only the functions whose evaluators read this catalog's latest schema.
 class FunctionCatalog {
  public:
   // catalog_name allows tests to override the catalog name.
@@ -86,6 +92,13 @@ class FunctionCatalog {
   std::shared_ptr<const backend::Schema> GetOwnedLatestSchema() const
       ABSL_LOCKS_EXCLUDED(latest_schema_mu_);
 
+  // Whether this catalog uses shared functions rather than building its own.
+  bool uses_shared_functions() const { return shared_ != nullptr; }
+
+  // For tests: when false, every catalog built afterwards builds all of its
+  // own functions. Set before concurrent use.
+  static void SetSharingEnabledForTesting(bool enabled);
+
   // Hooks that every sequence or identity function evaluation, in any catalog,
   // runs just before and just after loading the latest schema. For tests; set
   // before concurrent use.
@@ -96,12 +109,38 @@ class FunctionCatalog {
   }
 
  private:
+  struct SharedFunctions;
+  struct BuildAllTag {};
+
+  // Builds every function, including the schema-bound ones, into this
+  // catalog's own maps. The template for SharedFunctions.
+  FunctionCatalog(BuildAllTag, googlesql::TypeFactory* type_factory,
+                  const std::string& catalog_name,
+                  database_api::DatabaseDialect dialect);
+
+  // The shared functions for this key, built on first use, or null if they
+  // cannot be shared (see BuildSharedFunctions) or the cache is full.
+  static const SharedFunctions* GetSharedFunctions(
+      const std::string& catalog_name, database_api::DatabaseDialect dialect);
+  static std::unique_ptr<const SharedFunctions> BuildSharedFunctions(
+      const std::string& catalog_name, database_api::DatabaseDialect dialect);
+
+  void BuildAllFunctions(googlesql::TypeFactory* type_factory,
+                         database_api::DatabaseDialect dialect);
+
+  // Adds a function whose evaluator reads this catalog's latest schema.
+  void AddSchemaBoundFunction(std::unique_ptr<googlesql::Function> function);
+  // Records that a function about to be added copies `source`'s options.
+  void NoteDerivedFrom(const googlesql::Function* source);
+
   void AddGoogleSQLBuiltInFunctions(googlesql::TypeFactory* type_factory);
   void AddPGLambdaFunctions();
   void AddSpannerFunctions();
+  void AddSequenceFunctions();
   void AddGraphSafeToJsonSignatures();
   void AddMlFunctions(googlesql::TypeFactory* type_factory);
-  void AddSearchFunctions(googlesql::TypeFactory* type_factory);
+  void AddSearchFunctions(googlesql::TypeFactory* type_factory,
+                          database_api::DatabaseDialect dialect);
 
   void AddSpannerPGFunctions();
   void AddFunctionAliases();
@@ -130,10 +169,19 @@ class FunctionCatalog {
   std::unique_ptr<googlesql::Function> GetNextSequenceValueFunction(
       const std::string& catalog_name);
 
+  // This catalog's own functions: only the schema-bound ones if `shared_` is
+  // set, else all of them. No name is in both.
   CaseInsensitiveStringMap<std::unique_ptr<googlesql::Function>> functions_;
   CaseInsensitiveStringMap<std::unique_ptr<googlesql::TableValuedFunction>>
       table_valued_functions_;
+  const SharedFunctions* shared_ = nullptr;
   const std::string catalog_name_;
+
+  // Only while building all functions: the schema-bound functions added, and
+  // whether another function copied one of them (then the functions cannot be
+  // shared, because the copy would evaluate against this catalog's schema).
+  absl::flat_hash_set<const googlesql::Function*> schema_bound_functions_;
+  bool derived_from_schema_bound_ = false;
   // Returns the latest schema for a function evaluation, running the test
   // hooks around the load.
   std::shared_ptr<const backend::Schema> LoadLatestSchemaForEvaluation() const;

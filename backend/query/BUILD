@@ -650,6 +650,29 @@ cc_test(
 )
 
 cc_test(
+    name = "function_catalog_test",
+    srcs = ["function_catalog_test.cc"],
+    deps = [
+        ":function_catalog",
+        "//backend/schema/catalog:schema",
+        "//common:constants",
+        "//common:feature_flags",
+        "//tests/common:scoped_feature_flags_setter",
+        "//tests/common:test_schema_constructor",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_googleapis//google/spanner/admin/database/v1:database_cc_proto",
+        "@com_google_googlesql//googlesql/base/testing:status_matchers",
+        "@com_google_googlesql//googlesql/public:function",
+        "@com_google_googlesql//googlesql/public:type",
+        "@com_google_googlesql//googlesql/public:value",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
     name = "queryable_table_test",
     srcs = ["queryable_table_test.cc"],
     deps = [

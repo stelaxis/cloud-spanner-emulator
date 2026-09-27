@@ -318,6 +318,28 @@ minutes (not diagnosed further).
 Issue #282 does not reproduce on the fork: 161,111 concurrent #282-pattern
 commits, none lost.
 
+### Create benchmark
+
+`verification/createbench` times `CreateDatabase` with a DDL list at several
+levels of concurrency, each create followed by an untimed drop, and samples
+the emulator's CPU time and resident memory. `-ddl` takes a JSON array of
+statements, or a `.sql` file that it splits the way the Stelaxis adapter's
+`structure_load` does. With `-migration N` it instead creates a database
+without the first `N` `CREATE INDEX` statements, fills every table with rows,
+and times one `UpdateDatabaseDdl` that adds them.
+
+```sh
+cd verification/createbench
+../../bazel-bin/binaries/emulator_main --host_port localhost:19310 &
+SPANNER_EMULATOR_HOST=localhost:19310 mise exec go@1.25 -- go run . \
+  -ddl structure.sql -levels 1,16,64 -pid $!
+SPANNER_EMULATOR_HOST=localhost:19310 mise exec go@1.25 -- go run . \
+  -ddl structure.sql -migration 51 -pid $!
+```
+
+`cpu_ms/crt` is the emulator's CPU time per create. Unlike latency and
+throughput, it does not depend on what else the machine runs.
+
 ## Running
 
 ### Proofs and the model executable
