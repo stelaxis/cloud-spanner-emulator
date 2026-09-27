@@ -126,6 +126,11 @@ class SchemaGraphEditor {
   // after edits and calling validation on the node graph being edited.
   absl::StatusOr<std::unique_ptr<SchemaGraph>> CanonicalizeGraph();
 
+  // Returns a copy of the original graph, in which every node is a clone that
+  // refers only to other clones. Only for an editor without edits; runs no
+  // validation.
+  absl::StatusOr<std::unique_ptr<SchemaGraph>> CloneGraph();
+
   // Deep-clones starting from the SchemaNode 'node' in schema graph. Any
   // nodes reachable from 'node' in the schema graph will also be cloned and
   // owned by the 'cloned_pool_'. As a result this method doesn't guarantee to
@@ -254,6 +259,10 @@ class SchemaGraphEditor {
 
   // Returns OK if 'node' is present in the original graph.
   bool IsOriginalNode(const SchemaNode* node) const;
+
+  // The original graph's nodes, only in CloneGraph. It calls IsOriginalNode for
+  // every edge of the graph, where a scan of the nodes would be quadratic.
+  absl::flat_hash_set<const SchemaNode*> original_nodes_;
 
   // Creates and registers a clone for 'node'.
   SchemaNode* MakeNewClone(const SchemaNode* node);

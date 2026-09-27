@@ -113,6 +113,15 @@ class View::Editor {
     return *this;
   }
 
+  Editor& set_columns(std::vector<View::Column> columns) {
+    instance_->columns_map_.clear();
+    for (const View::Column& column : columns) {
+      instance_->columns_map_.emplace(column.name, column);
+    }
+    instance_->columns_ = std::move(columns);
+    return *this;
+  }
+
  private:
   // Not owned.
   View* instance_;

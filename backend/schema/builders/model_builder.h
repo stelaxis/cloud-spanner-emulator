@@ -103,6 +103,16 @@ class Model::Editor {
     return *this;
   }
 
+  Editor& set_input(std::vector<Model::ModelColumn> input) {
+    instance_->input_ = std::move(input);
+    return *this;
+  }
+
+  Editor& set_output(std::vector<Model::ModelColumn> output) {
+    instance_->output_ = std::move(output);
+    return *this;
+  }
+
   Editor& copy_from(const Model* model) {
     instance_->name_ = model->name_;
     instance_->is_remote_ = model->is_remote_;

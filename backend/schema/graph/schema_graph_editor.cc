@@ -133,6 +133,9 @@ absl::Status SchemaGraphEditor::AddNode(
 }
 
 bool SchemaGraphEditor::IsOriginalNode(const SchemaNode* node) const {
+  if (!original_nodes_.empty()) {
+    return original_nodes_.contains(node);
+  }
   for (const auto* schema_node : original_graph_->GetSchemaNodes()) {
     if (schema_node == node) {
       return true;
@@ -205,6 +208,19 @@ SchemaGraphEditor::CanonicalizeGraph() {
       << cloned_pool_ptr->DebugString();
 
   return cloned_graph;
+}
+
+absl::StatusOr<std::unique_ptr<SchemaGraph>> SchemaGraphEditor::CloneGraph() {
+  GOOGLESQL_RET_CHECK(!HasModifications());
+  GOOGLESQL_RET_CHECK(clone_map_.empty());
+  original_nodes_.insert(original_graph_->GetSchemaNodes().begin(),
+                         original_graph_->GetSchemaNodes().end());
+  // As for an edit: nodes derive state from their neighbours in DeepClone
+  // (such as an index column's nullability), which is only right once the
+  // second pass sees every neighbour's clone.
+  GOOGLESQL_RETURN_IF_ERROR(CanonicalizeEdits());
+  return std::make_unique<SchemaGraph>(std::move(new_nodes_),
+                                       std::move(cloned_pool_));
 }
 
 absl::Status SchemaGraphEditor::CanonicalizeEdits() {

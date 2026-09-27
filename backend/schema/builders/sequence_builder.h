@@ -144,6 +144,11 @@ class Sequence::Editor {
     return *this;
   }
 
+  Editor& set_id(SequenceID id) {
+    instance_->id_ = std::move(id);
+    return *this;
+  }
+
   Editor& clear_skip_range_max() {
     instance_->skip_range_max_.reset();
     return *this;

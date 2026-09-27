@@ -57,6 +57,7 @@ type Options struct {
 	RemoteFunctionsHostPort                        string
 	AbortCurrentTransactionProbability             int
 	DisableQueryKeyPushdown                        bool
+	SchemaCreateCacheSize                          int
 }
 
 // Gateway implements the emulator gateway server.
@@ -103,6 +104,8 @@ func (gw *Gateway) Run() {
 	emulatorArgs = append(emulatorArgs,
 		fmt.Sprintf("--override_change_stream_partition_token_alive_seconds=%d",
 			gw.opts.OverrideChangeStreamPartitionTokenAliveSeconds))
+	emulatorArgs = append(emulatorArgs,
+		fmt.Sprintf("--schema_create_cache_size=%d", gw.opts.SchemaCreateCacheSize))
 
 
 	cmd := exec.Command(gw.opts.FrontendBinary, emulatorArgs...)

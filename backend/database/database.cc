@@ -23,6 +23,7 @@
 #include "google/spanner/admin/database/v1/common.pb.h"
 #include "googlesql/public/types/type_factory.h"
 #include "absl/functional/bind_front.h"
+#include "absl/log/log.h"
 #include "absl/memory/memory.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -34,13 +35,17 @@
 #include "backend/common/ids.h"
 #include "backend/database/change_stream/change_stream_partition_churner.h"
 #include "backend/database/pg_oid_assigner/pg_oid_assigner.h"
+#include "backend/database/schema_create_cache.h"
 #include "backend/locking/manager.h"
 #include "backend/query/query_engine.h"
+#include "backend/schema/backfills/change_stream_backfill.h"
+#include "backend/schema/catalog/change_stream.h"
 #include "backend/schema/catalog/proto_bundle.h"
 #include "backend/schema/catalog/schema.h"
 #include "backend/schema/catalog/versioned_catalog.h"
 #include "backend/schema/graph/schema_graph.h"
 #include "backend/schema/updater/schema_updater.h"
+#include "backend/schema/updater/schema_validation_context.h"
 #include "backend/schema/updater/scoped_schema_change_lock.h"
 #include "backend/storage/in_memory_storage.h"
 #include "backend/transaction/options.h"
@@ -48,6 +53,7 @@
 #include "backend/transaction/read_write_transaction.h"
 #include "common/clock.h"
 #include "common/errors.h"
+#include "googlesql/base/logging.h"
 #include "googlesql/base/status_macros.h"
 #include "absl/status/status.h"
 
@@ -61,9 +67,9 @@ namespace backend {
 Database::Database()
     : transaction_id_generator_(absl::ToUnixMicros(absl::Now())) {}
 
-absl::StatusOr<std::unique_ptr<Database>> Database::Create(
+std::unique_ptr<Database> Database::New(
     Clock* clock, std::string_view database_id,
-    const SchemaChangeOperation& schema_change_operation) {
+    database_api::DatabaseDialect dialect) {
   auto database = absl::WrapUnique(new Database());
   database->clock_ = clock;
   database->database_id_ = database_id;
@@ -72,11 +78,38 @@ absl::StatusOr<std::unique_ptr<Database>> Database::Create(
       std::make_unique<LockManager>(clock, database->storage_.get());
   database->type_factory_ = std::make_unique<googlesql::TypeFactory>();
   database->action_manager_ = std::make_unique<ActionManager>();
-  database->dialect_ = schema_change_operation.database_dialect;
+  database->dialect_ = dialect;
   database->pg_oid_assigner_ = std::make_unique<PgOidAssigner>(
-      schema_change_operation.database_dialect ==
-      database_api::DatabaseDialect::POSTGRESQL);
+      dialect == database_api::DatabaseDialect::POSTGRESQL);
+  return database;
+}
 
+absl::StatusOr<std::unique_ptr<Database>> Database::Create(
+    Clock* clock, std::string_view database_id,
+    const SchemaChangeOperation& schema_change_operation) {
+  SchemaCreateCache* cache = schema_change_operation.statements.empty()
+                                 ? nullptr
+                                 : SchemaCreateCache::Global();
+  std::string cache_key;
+  std::shared_ptr<const SchemaCreateCache::Entry> cached;
+  if (cache != nullptr) {
+    cache_key = SchemaCreateCache::Key(schema_change_operation);
+    cached = cache->Lookup(cache_key);
+  }
+  if (cached != nullptr && cached->schema != nullptr) {
+    absl::StatusOr<std::unique_ptr<Database>> database =
+        CreateFromCache(clock, database_id,
+                        schema_change_operation.database_dialect, *cached);
+    if (database.ok()) {
+      return database;
+    }
+    ABSL_LOG(WARNING) << "Creating database " << database_id
+                      << " from DDL: cannot copy its cached schema: "
+                      << database.status();
+  }
+
+  std::unique_ptr<Database> database =
+      New(clock, database_id, schema_change_operation.database_dialect);
   if (schema_change_operation.statements.empty()) {
     if (database->dialect_ == database_api::DatabaseDialect::POSTGRESQL) {
       // Create an empty schema with the dialect set.
@@ -95,36 +128,90 @@ absl::StatusOr<std::unique_ptr<Database>> Database::Create(
                                     database->GetSchemaChangeContext()));
     database->versioned_catalog_ =
         std::make_unique<VersionedCatalog>(std::move(schema));
+    // An entry without a schema records that the schema cannot be copied.
+    // All-no-op statements leave no schema to copy.
+    if (cache != nullptr && cached == nullptr &&
+        database->versioned_catalog_->GetLatestSchema() != nullptr) {
+      cache->Insert(cache_key, database->MakeSchemaCreateCacheEntry());
+    }
   }
+  database->Initialize();
+  return database;
+}
 
-  database->query_engine_ = std::make_unique<QueryEngine>(
-      database->type_factory_.get(),
-      database->versioned_catalog_->GetLatestSchema());
+absl::StatusOr<std::unique_ptr<Database>> Database::CreateFromCache(
+    Clock* clock, std::string_view database_id,
+    database_api::DatabaseDialect dialect,
+    const SchemaCreateCache::Entry& entry) {
+  std::unique_ptr<Database> database = New(clock, database_id, dialect);
+  GOOGLESQL_ASSIGN_OR_RETURN(std::unique_ptr<const Schema> schema,
+                   CopySchema(*entry.schema, database->type_factory_.get(),
+                              database_id, absl::Now()));
+  // Continue the counters from where creating the schema from DDL left them.
+  database->table_id_generator_.set_next_seq(entry.next_table_id);
+  database->column_id_generator_.set_next_seq(entry.next_column_id);
+  if (entry.next_postgresql_oid.has_value()) {
+    database->pg_oid_assigner_->SetNextPostgresqlOid(
+        *entry.next_postgresql_oid);
+  }
+  // Creating a change stream from DDL backfills its initial partitions.
+  SchemaChangeContext context = database->GetSchemaChangeContext();
+  SchemaValidationContext validation_context(
+      context.storage, /*global_names=*/nullptr, context.type_factory,
+      context.schema_change_timestamp, dialect);
+  for (const ChangeStream* change_stream : schema->change_streams()) {
+    GOOGLESQL_RETURN_IF_ERROR(BackfillChangeStream(change_stream, &validation_context));
+  }
+  database->versioned_catalog_ =
+      std::make_unique<VersionedCatalog>(std::move(schema));
+  database->Initialize();
+  return database;
+}
 
-  database->action_manager_->AddActionsForSchema(
-      database->versioned_catalog_->GetLatestSchema(),
-      database->query_engine_->function_catalog(),
-      database->query_engine_->type_factory());
+std::shared_ptr<const SchemaCreateCache::Entry>
+Database::MakeSchemaCreateCacheEntry() const {
+  auto entry = std::make_shared<SchemaCreateCache::Entry>();
+  entry->type_factory = std::make_unique<googlesql::TypeFactory>();
+  absl::StatusOr<std::unique_ptr<const Schema>> schema =
+      CopySchema(*versioned_catalog_->GetLatestSchema(),
+                 entry->type_factory.get(), /*database_id=*/"", absl::Now());
+  if (schema.ok()) {
+    entry->schema = *std::move(schema);
+  } else {
+    GOOGLESQL_VLOG(1) << "Not caching the schema of database " << database_id_
+            << ": " << schema.status();
+  }
+  entry->next_table_id = table_id_generator_.next_seq();
+  entry->next_column_id = column_id_generator_.next_seq();
+  entry->next_postgresql_oid = pg_oid_assigner_->next_postgresql_oid();
+  return entry;
+}
 
-  database->change_stream_partition_churner_ =
+void Database::Initialize() {
+  query_engine_ = std::make_unique<QueryEngine>(
+      type_factory_.get(), versioned_catalog_->GetLatestSchema());
+
+  action_manager_->AddActionsForSchema(versioned_catalog_->GetLatestSchema(),
+                                       query_engine_->function_catalog(),
+                                       query_engine_->type_factory());
+
+  change_stream_partition_churner_ =
       std::make_unique<ChangeStreamPartitionChurner>(
-          absl::bind_front(&Database::CreateReadWriteTransaction,
-                           database.get()),
-          database->clock_);
+          absl::bind_front(&Database::CreateReadWriteTransaction, this),
+          clock_);
 
-  database->change_stream_partition_churner_->Update(
-      database->versioned_catalog_->GetLatestSchema());
+  change_stream_partition_churner_->Update(
+      versioned_catalog_->GetLatestSchema());
 
   // Some functions need to access the schema (e.g. sequence functions), so
   // set the latest schema to the function catalog here.
-  database->query_engine_->SetLatestSchemaForFunctionCatalog(
-      database->versioned_catalog_->GetLatestSchemaShared());
+  query_engine_->SetLatestSchemaForFunctionCatalog(
+      versioned_catalog_->GetLatestSchemaShared());
 
-  database->storage_->SetVersionRetentionPeriod(
-      database->versioned_catalog_->version_retention_period());
-
-  return database;
+  storage_->SetVersionRetentionPeriod(
+      versioned_catalog_->version_retention_period());
 }
+
 absl::StatusOr<std::unique_ptr<ReadOnlyTransaction>>
 Database::CreateReadOnlyTransaction(const ReadOnlyOptions& options) {
   return std::make_unique<ReadOnlyTransaction>(

@@ -70,6 +70,11 @@ var (
 	overrideChangeStreamPartitionTokenAliveSeconds = flag.Int("override_change_stream_partition_token_alive_seconds", -1,
 		"If set to X seconds, and X is greater than 0, then override the default partition token alive"+
 			"time from 20-40 seconds(default for Emulator only, not for production Spanner) to X-2X seconds.")
+	schemaCreateCacheSize = flag.Int("schema_create_cache_size", 8,
+		"The number of schemas that CreateDatabase remembers, by the DDL statements and "+
+			"settings they were created with. A CreateDatabase with the same statements and "+
+			"settings as a remembered successful one copies its schema instead of processing "+
+			"the statements again. 0 disables the cache.")
 	printNotices = flag.Bool("notices", false,
 		"If true, the emulator will print all third-party notices to stdout.")
 	remoteFunctionsHostPort = flag.String("remote_functions_host_port", "",
@@ -175,6 +180,7 @@ func main() {
 		RemoteFunctionsHostPort:                        *remoteFunctionsHostPort,
 		AbortCurrentTransactionProbability:             *abortCurrentTransactionProbability,
 		DisableQueryKeyPushdown:                        !*enableQueryKeyPushdown,
+		SchemaCreateCacheSize:                          *schemaCreateCacheSize,
 	}
 	gw := gateway.New(gwopts)
 	gw.Run()

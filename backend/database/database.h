@@ -34,6 +34,7 @@
 #include "backend/common/ids.h"
 #include "backend/database/change_stream/change_stream_partition_churner.h"
 #include "backend/database/pg_oid_assigner/pg_oid_assigner.h"
+#include "backend/database/schema_create_cache.h"
 #include "backend/locking/manager.h"
 #include "backend/query/query_engine.h"
 #include "backend/schema/catalog/schema.h"
@@ -141,6 +142,24 @@ class Database {
   // Delete copy and assignment operators since database shouldn't be copyable.
   Database(const Database&) = delete;
   Database& operator=(const Database&) = delete;
+
+  // A database with no schema yet.
+  static std::unique_ptr<Database> New(Clock* clock,
+                                       std::string_view database_id,
+                                       database_api::DatabaseDialect dialect);
+
+  // Creates a database whose schema is a copy of `entry`'s.
+  static absl::StatusOr<std::unique_ptr<Database>> CreateFromCache(
+      Clock* clock, std::string_view database_id,
+      database_api::DatabaseDialect dialect,
+      const SchemaCreateCache::Entry& entry);
+
+  // Sets up what serves the schema, once the database has one.
+  void Initialize();
+
+  // An entry for this database's schema, which was just created from DDL.
+  std::shared_ptr<const SchemaCreateCache::Entry> MakeSchemaCreateCacheEntry()
+      const;
 
   SchemaChangeContext GetSchemaChangeContext();
 
