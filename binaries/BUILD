@@ -44,6 +44,7 @@ cc_binary(
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
         "@com_google_googlesql//googlesql/base",
     ],
 )

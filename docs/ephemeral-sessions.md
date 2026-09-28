@@ -83,7 +83,9 @@ emulator keeps serving sessions while it is freed.
 * Everything is in memory: each copy costs about as much memory as the base's
   schema and data.
 
-Both flags are accepted by `emulator_main` and `gateway_main`.
+Both flags are accepted by `emulator_main` and `gateway_main`. The emulator
+refuses to start with a timeout that is not positive or a negative limit;
+`--max_ephemeral_sessions=0` disables ephemeral sessions.
 
 ## Tests
 

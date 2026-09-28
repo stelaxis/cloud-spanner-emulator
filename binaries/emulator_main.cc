@@ -22,6 +22,7 @@
 #include "googlesql/base/logging.h"
 #include "absl/log/log.h"
 #include "absl/strings/str_cat.h"
+#include "absl/time/time.h"
 #include "common/config.h"
 #include "frontend/server/server.h"
 
@@ -30,6 +31,14 @@ using Server = ::google::spanner::emulator::frontend::Server;
 int main(int argc, char** argv) {
   // Start the emulator gRPC server.
   absl::ParseCommandLine(argc, argv);
+
+  namespace config = ::google::spanner::emulator::config;
+  if (config::ephemeral_session_idle_timeout() <= absl::ZeroDuration() ||
+      config::max_ephemeral_sessions() < 0) {
+    ABSL_LOG(ERROR) << "--ephemeral_session_idle_timeout_seconds must be "
+                       "positive and --max_ephemeral_sessions not negative.";
+    return EXIT_FAILURE;
+  }
 
   Server::Options options;
   options.server_address = google::spanner::emulator::config::grpc_host_port();
