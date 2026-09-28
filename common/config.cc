@@ -57,6 +57,18 @@ ABSL_FLAG(
     "statement reads, and so the ranges its transaction validates at commit. "
     "If false, every query and UPDATE/DELETE reads its tables in full.");
 
+ABSL_FLAG(int, ephemeral_session_idle_timeout_seconds, 120,
+          "Seconds an ephemeral session (a session created with the label "
+          "emulator-ephemeral=true, which has its own copy of its database) "
+          "may go without a request before the emulator deletes it and its "
+          "copy. Must be positive.");
+
+ABSL_FLAG(int, max_ephemeral_sessions, 256,
+          "The most ephemeral sessions, each with its own copy of its "
+          "database, open at once. Creating another fails with "
+          "RESOURCE_EXHAUSTED. Copies do not count towards "
+          "--override_max_databases_per_instance.");
+
 namespace google {
 namespace spanner {
 namespace emulator {
@@ -88,6 +100,24 @@ bool query_key_pushdown_enabled() {
 
 void set_query_key_pushdown_enabled(bool enabled) {
   absl::SetFlag(&FLAGS_enable_query_key_pushdown, enabled);
+}
+
+absl::Duration ephemeral_session_idle_timeout() {
+  return absl::Seconds(
+      absl::GetFlag(FLAGS_ephemeral_session_idle_timeout_seconds));
+}
+
+void set_ephemeral_session_idle_timeout(absl::Duration timeout) {
+  absl::SetFlag(&FLAGS_ephemeral_session_idle_timeout_seconds,
+                absl::ToInt64Seconds(timeout));
+}
+
+int max_ephemeral_sessions() {
+  return absl::GetFlag(FLAGS_max_ephemeral_sessions);
+}
+
+void set_max_ephemeral_sessions(int max_sessions) {
+  absl::SetFlag(&FLAGS_max_ephemeral_sessions, max_sessions);
 }
 
 }  // namespace config

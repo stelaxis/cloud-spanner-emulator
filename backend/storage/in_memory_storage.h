@@ -17,7 +17,10 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_IN_MEMORY_STORAGE_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_IN_MEMORY_STORAGE_H_
 
+#include <vector>
+
 #include "googlesql/public/value.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/time/time.h"
 #include "backend/common/ids.h"
 #include "backend/datamodel/key.h"
@@ -84,6 +87,14 @@ class InMemoryStorage : public Storage {
   void MarkDroppedColumn(absl::Time timestamp, TableID dropped_table_id,
                          ColumnID dropped_column_id) override
       ABSL_LOCKS_EXCLUDED(mu_);
+
+  // Writes into the empty `destination`, as one version at `timestamp`, every
+  // row of `columns`' tables that exists at `timestamp`, with the values its
+  // `columns` have then. Other tables and columns are not copied.
+  void CopyAt(
+      absl::Time timestamp,
+      const absl::flat_hash_map<TableID, std::vector<ColumnID>>& columns,
+      InMemoryStorage* destination) const ABSL_LOCKS_EXCLUDED(mu_);
 
  private:
   using Cell = std::map<absl::Time, googlesql::Value>;

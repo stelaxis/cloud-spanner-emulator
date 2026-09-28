@@ -58,6 +58,8 @@ type Options struct {
 	AbortCurrentTransactionProbability             int
 	DisableQueryKeyPushdown                        bool
 	SchemaCreateCacheSize                          int
+	EphemeralSessionIdleTimeoutSeconds             int
+	MaxEphemeralSessions                           int
 }
 
 // Gateway implements the emulator gateway server.
@@ -106,6 +108,11 @@ func (gw *Gateway) Run() {
 			gw.opts.OverrideChangeStreamPartitionTokenAliveSeconds))
 	emulatorArgs = append(emulatorArgs,
 		fmt.Sprintf("--schema_create_cache_size=%d", gw.opts.SchemaCreateCacheSize))
+	emulatorArgs = append(emulatorArgs,
+		fmt.Sprintf("--ephemeral_session_idle_timeout_seconds=%d",
+			gw.opts.EphemeralSessionIdleTimeoutSeconds))
+	emulatorArgs = append(emulatorArgs,
+		fmt.Sprintf("--max_ephemeral_sessions=%d", gw.opts.MaxEphemeralSessions))
 
 
 	cmd := exec.Command(gw.opts.FrontendBinary, emulatorArgs...)

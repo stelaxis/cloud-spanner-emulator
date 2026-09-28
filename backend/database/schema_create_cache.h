@@ -46,14 +46,15 @@ namespace backend {
 // Sequences get new IDs starting with `sequence_id_prefix`, so the copy's
 // sequences start where a new sequence starts, and their counters are released
 // with the prefix (Sequence::RemoveSequenceCountersWithIdPrefix). Change
-// streams are created at `now`. Table and column IDs are kept.
+// streams are created at `now`, or keep their creation time if it is unset.
+// Table and column IDs are kept.
 //
 // Fails with UNIMPLEMENTED for schemas it cannot copy: a function whose
 // signature has a type that a type factory owns, or default arguments.
 absl::StatusOr<std::unique_ptr<const Schema>> CopySchema(
     const Schema& schema, googlesql::TypeFactory* type_factory,
     std::string_view database_id, std::string_view sequence_id_prefix,
-    absl::Time now);
+    std::optional<absl::Time> now);
 
 // Remembers the schemas that CreateDatabase built from DDL, so that a later
 // CreateDatabase with the same request copies the schema (CopySchema) instead

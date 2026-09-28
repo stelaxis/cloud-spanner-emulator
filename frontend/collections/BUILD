@@ -103,7 +103,9 @@ cc_library(
     ],
     deps = [
         ":multiplexed_session_transaction_manager",
+        "//backend/database",
         "//common:clock",
+        "//common:config",
         "//common:errors",
         "//frontend/common:labels",
         "//frontend/common:uris",

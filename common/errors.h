@@ -96,6 +96,10 @@ absl::Status SessionNotFound(absl::string_view uri);
 absl::Status TooFewSessions(int session_count);
 absl::Status InvalidOperationSessionDelete();
 absl::Status InvalidOperationBatchCreateSessions();
+absl::Status EphemeralMultiplexedSession();
+absl::Status TooManyEphemeralSessions(int max_sessions);
+absl::Status EphemeralSessionCopyFailed(absl::string_view database_uri,
+                                        const absl::Status& status);
 
 // Missing required field in proto error.
 absl::Status MissingRequiredFieldError(absl::string_view field);

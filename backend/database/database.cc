@@ -19,11 +19,15 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <string>
 #include <thread>  // NOLINT
 #include <utility>
+#include <vector>
 
 #include "google/spanner/admin/database/v1/common.pb.h"
 #include "googlesql/public/types/type_factory.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/functional/bind_front.h"
 #include "absl/log/log.h"
 #include "absl/memory/memory.h"
@@ -59,7 +63,9 @@
 #include "googlesql/base/status_macros.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
+#include "backend/schema/catalog/column.h"
 #include "backend/schema/catalog/sequence.h"
+#include "backend/schema/catalog/table.h"
 
 namespace google {
 namespace spanner {
@@ -200,6 +206,69 @@ absl::StatusOr<std::unique_ptr<Database>> Database::CreateFromCache(
       std::make_unique<VersionedCatalog>(std::move(schema));
   database->Initialize();
   return database;
+}
+
+absl::StatusOr<std::unique_ptr<Database>> Database::CreateEphemeralCopy() {
+  // No schema change runs until the copy is done: none can drop or restart a
+  // sequence between T and the copy of its counter, and the ID generators are
+  // not moving.
+  absl::MutexLock schema_change_lock(schema_change_mu_);
+  std::unique_ptr<Database> copy = New(clock_, database_id_, dialect_);
+  const absl::Time timestamp = clock_->Now();
+  if (ephemeral_copy_hook_ != nullptr) {
+    ephemeral_copy_hook_(timestamp);
+  }
+  // Commits that reserved a timestamp at or before T have finished flushing;
+  // later ones write versions after T.
+  lock_manager_->WaitForSafeRead(timestamp);
+  std::shared_ptr<const Schema> schema =
+      versioned_catalog_->GetSchemaShared(timestamp);
+  GOOGLESQL_ASSIGN_OR_RETURN(
+      std::unique_ptr<const Schema> schema_copy,
+      CopySchema(*schema, copy->type_factory_.get(), database_id_,
+                 copy->sequence_id_prefix_, /*now=*/std::nullopt));
+
+  copy->table_id_generator_.set_next_seq(table_id_generator_.next_seq());
+  copy->column_id_generator_.set_next_seq(column_id_generator_.next_seq());
+  copy->change_stream_id_generator_.set_next_seq(
+      change_stream_id_generator_.next_seq());
+  if (std::optional<uint32_t> oid = pg_oid_assigner_->next_postgresql_oid();
+      oid.has_value()) {
+    copy->pg_oid_assigner_->SetNextPostgresqlOid(*oid);
+  }
+
+  // Index data and change stream tables are tables of the graph too.
+  absl::flat_hash_map<TableID, std::vector<ColumnID>> columns;
+  for (const SchemaNode* node : schema->GetSchemaGraph()->GetSchemaNodes()) {
+    if (const Table* table = node->As<const Table>(); table != nullptr) {
+      std::vector<ColumnID>& column_ids = columns[table->id()];
+      for (const Column* column : table->columns()) {
+        column_ids.push_back(column->id());
+      }
+    }
+  }
+  storage_->CopyAt(timestamp, columns, copy->storage_.get());
+
+  // Counters are not versioned. Read after T, each is at least what the rows
+  // at T drew from it.
+  absl::flat_hash_map<std::string, SequenceID> sequence_ids;
+  for (const Sequence* sequence : schema->sequences()) {
+    sequence_ids[sequence->Name()] = sequence->id();
+  }
+  std::vector<std::pair<SequenceID, SequenceID>> counters;
+  for (const Sequence* sequence : schema_copy->sequences()) {
+    if (auto it = sequence_ids.find(sequence->Name());
+        it != sequence_ids.end()) {
+      counters.emplace_back(it->second, sequence->id());
+    }
+  }
+  Sequence::CopySequenceCounters(counters);
+
+  copy->lock_manager_->SeedLastCommitTimestamp(timestamp);
+  copy->versioned_catalog_ = std::make_unique<VersionedCatalog>(
+      std::move(schema_copy), versioned_catalog_->version_retention_period());
+  copy->Initialize();
+  return copy;
 }
 
 std::shared_ptr<const SchemaCreateCache::Entry>

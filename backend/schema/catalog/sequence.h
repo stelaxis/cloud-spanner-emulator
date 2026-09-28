@@ -18,6 +18,8 @@
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_SCHEMA_CATALOG_SEQUENCE_H_
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "googlesql/public/type.h"
 #include "absl/base/thread_annotations.h"
@@ -89,6 +91,12 @@ class Sequence : public SchemaNode {
   // Removes from the last values map every sequence whose id starts with
   // `prefix`.
   static void RemoveSequenceCountersWithIdPrefix(absl::string_view prefix)
+      ABSL_LOCKS_EXCLUDED(SequenceMutex);
+
+  // Gives each `to` sequence the counter of its `from` sequence, if that has
+  // one, in one critical section.
+  static void CopySequenceCounters(
+      const std::vector<std::pair<SequenceID, SequenceID>>& from_to)
       ABSL_LOCKS_EXCLUDED(SequenceMutex);
 
   // SchemaNode interface implementation.

@@ -75,6 +75,14 @@ var (
 			"settings they were created with. A CreateDatabase with the same statements and "+
 			"settings as a remembered successful one copies its schema instead of processing "+
 			"the statements again. 0 disables the cache.")
+	ephemeralSessionIdleTimeoutSeconds = flag.Int("ephemeral_session_idle_timeout_seconds", 120,
+		"Seconds an ephemeral session (a session created with the label "+
+			"emulator-ephemeral=true, which has its own copy of its database) may go without "+
+			"a request before the emulator deletes it and its copy. Must be positive.")
+	maxEphemeralSessions = flag.Int("max_ephemeral_sessions", 256,
+		"The most ephemeral sessions, each with its own copy of its database, open at once. "+
+			"Creating another fails with RESOURCE_EXHAUSTED. Copies do not count towards "+
+			"--override_max_databases_per_instance.")
 	printNotices = flag.Bool("notices", false,
 		"If true, the emulator will print all third-party notices to stdout.")
 	remoteFunctionsHostPort = flag.String("remote_functions_host_port", "",
@@ -181,6 +189,8 @@ func main() {
 		AbortCurrentTransactionProbability:             *abortCurrentTransactionProbability,
 		DisableQueryKeyPushdown:                        !*enableQueryKeyPushdown,
 		SchemaCreateCacheSize:                          *schemaCreateCacheSize,
+		EphemeralSessionIdleTimeoutSeconds:             *ephemeralSessionIdleTimeoutSeconds,
+		MaxEphemeralSessions:                           *maxEphemeralSessions,
 	}
 	gw := gateway.New(gwopts)
 	gw.Run()

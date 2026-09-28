@@ -108,11 +108,19 @@ absl::Status BatchCreateSessions(
   for (int i = 0; i < sessions.size(); ++i) {
     // Mux does not support batch create sessions. So its ok to set the
     // mux_txn_manager to null.
-    GOOGLESQL_ASSIGN_OR_RETURN(
-        sessions[i],
+    absl::StatusOr<std::shared_ptr<Session>> session =
         ctx->env()->session_manager()->CreateSession(
             labels, request->session_template().multiplexed(), database,
-            /*mux_txn_manager=*/nullptr));
+            /*mux_txn_manager=*/nullptr);
+    if (!session.ok()) {
+      // None of the batch is returned, so none may hold an ephemeral copy.
+      for (int j = 0; j < i; ++j) {
+        GOOGLESQL_RETURN_IF_ERROR(ctx->env()->session_manager()->DeleteSession(
+            sessions[j]->session_uri()));
+      }
+      return session.status();
+    }
+    sessions[i] = *std::move(session);
   }
 
   // Return details about the newly created session.

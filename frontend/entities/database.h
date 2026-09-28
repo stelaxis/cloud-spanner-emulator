@@ -18,7 +18,10 @@
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_FRONTEND_DATABASE_H_
 
 #include <atomic>
+#include <functional>
+#include <memory>
 #include <string>
+#include <utility>
 
 #include "google/spanner/admin/database/v1/spanner_database_admin.pb.h"
 #include "absl/status/status.h"
@@ -45,8 +48,15 @@ class Database {
         backend_(std::move(backend)),
         create_time_(create_time) {}
 
+  ~Database() {
+    if (destroy_hook_ != nullptr) destroy_hook_();
+  }
+
   // Returns the URI for this database.
   const std::string& database_uri() const { return database_uri_; }
+
+  // Returns the time at which this database was created.
+  absl::Time create_time() const { return create_time_; }
 
   // Returns the handle to the backend database.
   backend::Database* backend() const { return backend_.get(); }
@@ -61,6 +71,12 @@ class Database {
   // Converts this database object to its proto representation.
   absl::Status ToProto(admin::database::v1::Database* database);
 
+  // Runs `hook` when this object is destroyed. For tests; set before the last
+  // reference can be released.
+  void set_destroy_hook_for_testing(std::function<void()> hook) {
+    destroy_hook_ = std::move(hook);
+  }
+
  private:
   // The URI for this database.
   const std::string database_uri_;
@@ -72,6 +88,8 @@ class Database {
   const absl::Time create_time_;
 
   std::atomic<bool> dropped_ = false;
+
+  std::function<void()> destroy_hook_;
 };
 
 }  // namespace frontend

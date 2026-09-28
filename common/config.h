@@ -19,6 +19,8 @@
 
 #include <string>
 
+#include "absl/time/time.h"
+
 namespace google {
 namespace spanner {
 namespace emulator {
@@ -57,6 +59,17 @@ bool query_key_pushdown_enabled();
 
 // Sets the query key pushdown flag (for tests).
 void set_query_key_pushdown_enabled(bool enabled);
+
+// How long an ephemeral session may go without a request before the emulator
+// deletes it and its copy of the database.
+absl::Duration ephemeral_session_idle_timeout();
+
+void set_ephemeral_session_idle_timeout(absl::Duration timeout);
+
+// The most ephemeral sessions, and so copies of databases, open at once.
+int max_ephemeral_sessions();
+
+void set_max_ephemeral_sessions(int max_sessions);
 
 }  // namespace config
 }  // namespace emulator

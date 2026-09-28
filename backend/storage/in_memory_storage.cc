@@ -317,6 +317,39 @@ absl::Status InMemoryStorage::Delete(absl::Time timestamp,
   return absl::OkStatus();
 }
 
+void InMemoryStorage::CopyAt(
+    absl::Time timestamp,
+    const absl::flat_hash_map<TableID, std::vector<ColumnID>>& columns,
+    InMemoryStorage* destination) const {
+  absl::MutexLock lock(mu_);
+  absl::MutexLock destination_lock(destination->mu_);
+  for (const auto& [table_id, column_ids] : columns) {
+    auto table_itr = tables_.find(table_id);
+    if (table_itr == tables_.end()) {
+      continue;
+    }
+    Table* copy = nullptr;
+    for (const auto& [key, row] : table_itr->second) {
+      if (!Exists(row, timestamp)) {
+        continue;
+      }
+      if (copy == nullptr) {
+        copy = &destination->tables_[table_id];
+        destination->NoteVersion(table_id, timestamp);
+      }
+      Row& row_copy = copy->emplace_hint(copy->end(), key, Row())->second;
+      row_copy[kExistsColumn][timestamp] = googlesql::values::Bool(true);
+      for (const ColumnID& column_id : column_ids) {
+        googlesql::Value value =
+            GetCellValueAtTimestamp(row, column_id, timestamp);
+        if (value.is_valid()) {
+          row_copy[column_id][timestamp] = std::move(value);
+        }
+      }
+    }
+  }
+}
+
 void InMemoryStorage::SetVersionRetentionPeriod(
     const absl::Duration version_retention_period) {
   absl::MutexLock lock(version_retention_period_mu_);

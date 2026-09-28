@@ -133,6 +133,9 @@ absl::StatusOr<absl::Time> LockHandle::Commit(
     }
   }
   absl::Time commit_timestamp = manager_->ReserveCommitTimestamp();
+  if (manager_->before_flush_hook_ != nullptr) {
+    manager_->before_flush_hook_(commit_timestamp);
+  }
   absl::Status flush_status = flush(commit_timestamp);
   manager_->MarkCommitted(commit_timestamp);
   GOOGLESQL_RETURN_IF_ERROR(flush_status);
