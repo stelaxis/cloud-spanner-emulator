@@ -357,12 +357,12 @@ generated foreign keys find no row), `emulator_main -c opt` on macOS arm64:
 
 | Concurrency | Sessions | p50 ms | p99 ms | Sessions/s | CPU ms per copy |
 |---|---|---|---|---|---|
-| 1 | 32 | 3.3 | 3.8 | 256 | 3.8 |
-| 16 | 128 | 13.8 | 17.9 | 1,020 | 6.6 |
+| 1 | 32 | 3.2 | 3.8 | 264 | 3.8 |
+| 16 | 128 | 14.7 | 19.6 | 994 | 6.1 |
 
 Holding 64 copies adds 1.81 MiB of resident memory per copy. Deleting them
 leaves the resident size where it is (the allocator keeps the pages), and
-holding 64 more adds nothing: their memory is reused. For comparison, a
+holding 64 more adds 0.05 MiB per copy: their memory is reused. For comparison, a
 `CreateDatabase` of the same DDL from the schema cache takes 2.8 ms at
 concurrency 1.
 
