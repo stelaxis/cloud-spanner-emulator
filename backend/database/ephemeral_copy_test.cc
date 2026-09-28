@@ -600,21 +600,34 @@ std::string TestProtoDescriptors() {
 // they must not depend on the base's proto bundle, which the base frees once
 // a schema change removes it and its schema versions expire.
 TEST_F(EphemeralCopyTest, ProtoAndEnumValuesTakeTheCopysTypes) {
+  // The bundle comes with a schema change: a database's first schema is never
+  // removed (VersionedCatalog::RemoveExpiredSchemas), so neither is what it
+  // holds.
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(
       std::unique_ptr<Database> base,
-      Database::Create(
-          &clock_, kDatabaseId,
-          SchemaChangeOperation{
-              .statements =
-                  {"CREATE PROTO BUNDLE (emulator.tests.common.Simple, "
-                   "emulator.tests.common.TestEnum)",
-                   "CREATE TABLE T (k INT64 NOT NULL, "
-                   "e emulator.tests.common.TestEnum, "
-                   "p emulator.tests.common.Simple, "
-                   "a ARRAY<emulator.tests.common.TestEnum>) PRIMARY KEY (k)",
-                   "CREATE TABLE K (e emulator.tests.common.TestEnum NOT NULL, "
-                   "v INT64) PRIMARY KEY (e)"},
-              .proto_descriptor_bytes = TestProtoDescriptors()}));
+      Create({"CREATE TABLE Z (k INT64) PRIMARY KEY (k)"}));
+  GOOGLESQL_ASSERT_OK(UpdateSchema(base.get(),
+                                   "ALTER DATABASE `test-db` SET OPTIONS "
+                                   "(version_retention_period = '1s')"));
+  {
+    int completed_statements;
+    absl::Time commit_ts;
+    absl::Status backfill_status;
+    GOOGLESQL_ASSERT_OK(base->UpdateSchema(
+        SchemaChangeOperation{
+            .statements =
+                {"CREATE PROTO BUNDLE (emulator.tests.common.Simple, "
+                 "emulator.tests.common.TestEnum)",
+                 "CREATE TABLE T (k INT64 NOT NULL, "
+                 "e emulator.tests.common.TestEnum, "
+                 "p emulator.tests.common.Simple, "
+                 "a ARRAY<emulator.tests.common.TestEnum>) PRIMARY KEY (k)",
+                 "CREATE TABLE K (e emulator.tests.common.TestEnum NOT NULL, "
+                 "v INT64) PRIMARY KEY (e)"},
+            .proto_descriptor_bytes = TestProtoDescriptors()},
+        &completed_statements, &commit_ts, &backfill_status));
+    GOOGLESQL_ASSERT_OK(backfill_status);
+  }
   const Table* table = base->GetLatestSchema()->FindTable("T");
   const googlesql::EnumType* enum_type =
       table->FindColumn("e")->GetType()->AsEnum();
@@ -674,9 +687,6 @@ TEST_F(EphemeralCopyTest, ProtoAndEnumValuesTakeTheCopysTypes) {
 
   // The base drops the tables and the bundle; a later schema change frees
   // the schemas that held it once they are past the retention period.
-  GOOGLESQL_ASSERT_OK(UpdateSchema(base.get(),
-                                   "ALTER DATABASE `test-db` SET OPTIONS "
-                                   "(version_retention_period = '1s')"));
   GOOGLESQL_ASSERT_OK(UpdateSchema(base.get(), "DROP TABLE T"));
   GOOGLESQL_ASSERT_OK(UpdateSchema(base.get(), "DROP TABLE K"));
   GOOGLESQL_ASSERT_OK(UpdateSchema(base.get(), "DROP PROTO BUNDLE"));
