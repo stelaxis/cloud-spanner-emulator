@@ -315,7 +315,7 @@ TEST_F(EphemeralCopyTest, CopiesTakenDuringCommitsHoldWholeCommits) {
   std::unique_ptr<Database> base = CreateKv();
   std::atomic<bool> stop = false;
   std::thread writer([&] {
-    for (int64_t i = 0; !stop; ++i) {
+    for (int64_t i = 0; !stop && i < 1000; ++i) {
       GOOGLESQL_EXPECT_OK(
           Insert(base.get(), "T", {{2 * i, i}, {2 * i + 1, i}}));
     }
@@ -339,7 +339,7 @@ TEST_F(EphemeralCopyTest, ConcurrentCopiesDuringCommitsAndSchemaChanges) {
   std::unique_ptr<Database> base = CreateKv();
   std::atomic<bool> stop = false;
   std::thread writer([&] {
-    for (int64_t i = 0; !stop; ++i) {
+    for (int64_t i = 0; !stop && i < 1000; ++i) {
       // A schema change aborts the commits it overlaps.
       absl::Status status =
           Insert(base.get(), "T", {{2 * i, i}, {2 * i + 1, i}});

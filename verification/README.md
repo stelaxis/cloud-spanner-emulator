@@ -340,6 +340,53 @@ SPANNER_EMULATOR_HOST=localhost:19310 mise exec go@1.25 -- go run . \
 `cpu_ms/crt` is the emulator's CPU time per create. Unlike latency and
 throughput, it does not depend on what else the machine runs.
 
+With `-ephemeral` it creates one database from the DDL, fills every table with
+`-rows` rows, and times `CreateSession` with the label
+`emulator-ephemeral=true` (see [ephemeral sessions](../docs/ephemeral-sessions.md)),
+each session deleted right after, untimed. It then holds `-hold` ephemeral
+sessions at once, twice, and reports the resident memory they add.
+
+```sh
+SPANNER_EMULATOR_HOST=localhost:19440 mise exec go@1.25 -- go run . \
+  -ddl structure.sql -ephemeral -rows 5 -levels 1,16 -hold 64 -pid $!
+```
+
+Stelaxis's `structure.sql` (138 statements: 51 tables, 82 indexes, 2
+sequences), 5 rows per table (239 rows; three tables stay empty because their
+generated foreign keys find no row), `emulator_main -c opt` on macOS arm64:
+
+| Concurrency | Sessions | p50 ms | p99 ms | Sessions/s | CPU ms per copy |
+|---|---|---|---|---|---|
+| 1 | 32 | 3.3 | 3.8 | 256 | 3.8 |
+| 16 | 128 | 13.8 | 17.9 | 1,020 | 6.6 |
+
+Holding 64 copies adds 1.81 MiB of resident memory per copy. Deleting them
+leaves the resident size where it is (the allocator keeps the pages), and
+holding 64 more adds nothing: their memory is reused. For comparison, a
+`CreateDatabase` of the same DDL from the schema cache takes 2.8 ms at
+concurrency 1.
+
+### Ephemeral sessions against their design
+
+`verification/conformance -ephemeral` runs `-seeds` random runs of ephemeral
+sessions on one goroutine: commits to the base database, creating ephemeral
+sessions, commits to their copies (mutations, or `UPDATE`/`DELETE` DML in a
+read-write transaction), full reads of the base or a copy, and deleting
+ephemeral sessions. The model is the design: a copy is the base's state when
+its session was created, changed afterwards only by its own writes. Every read
+must equal the model, and a deleted session must be `NOT_FOUND`.
+
+```sh
+SPANNER_EMULATOR_HOST=localhost:19423 mise exec go@1.25 -- go run . -ephemeral -seeds 3000
+```
+
+Seeds 1–3000: 58,975 steps, 10,513 copies, 8,889 copy writes, 25,577 reads,
+3,915 deletions, **0** mismatches. Transactions of one ephemeral session run
+one at a time (a session has one active transaction), so the Target-model
+schedules above, which give each transaction its own session, cannot run on a
+copy; the copy's transactions are the same code, checked by
+`backend/database/ephemeral_copy_test.cc`.
+
 ## Running
 
 ### Proofs and the model executable
