@@ -78,6 +78,13 @@ absl::Time LockManager::PickSnapshotTimestamp() {
   return snapshot_timestamp;
 }
 
+void LockManager::SeedLastCommitTimestamp(absl::Time timestamp) {
+  absl::MutexLock lock(mu_);
+  if (last_commit_timestamp_ < timestamp) {
+    last_commit_timestamp_ = timestamp;
+  }
+}
+
 absl::Time LockManager::LastCommitTimestamp() {
   absl::ReaderMutexLock lock(mu_);
   return last_commit_timestamp_;

@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -168,7 +169,8 @@ T* Mutable(const SchemaNode* node) {
 absl::Status CopyNode(const SchemaNode* node,
                       googlesql::TypeFactory* type_factory,
                       const ProtoBundle& proto_bundle,
-                      std::string_view sequence_id_prefix, absl::Time now) {
+                      std::string_view sequence_id_prefix,
+                      std::optional<absl::Time> now) {
   if (auto* column = Mutable<Column>(node); column != nullptr) {
     GOOGLESQL_ASSIGN_OR_RETURN(const googlesql::Type* type,
                      CopyType(column->GetType(), type_factory, proto_bundle));
@@ -206,8 +208,8 @@ absl::Status CopyNode(const SchemaNode* node,
     Sequence::Editor(sequence).set_id(absl::StrCat(
         sequence_id_prefix, googlesql::functions::GenerateUuid(bitgen)));
   } else if (auto* change_stream = Mutable<ChangeStream>(node);
-             change_stream != nullptr) {
-    ChangeStream::Editor(change_stream).set_creation_time(now);
+             change_stream != nullptr && now.has_value()) {
+    ChangeStream::Editor(change_stream).set_creation_time(*now);
   }
   return absl::OkStatus();
 }
@@ -224,7 +226,7 @@ static_assert(std::has_unique_object_representations_v<
 absl::StatusOr<std::unique_ptr<const Schema>> CopySchema(
     const Schema& schema, googlesql::TypeFactory* type_factory,
     std::string_view database_id, std::string_view sequence_id_prefix,
-    absl::Time now) {
+    std::optional<absl::Time> now) {
   GOOGLESQL_ASSIGN_OR_RETURN(std::shared_ptr<const ProtoBundle> proto_bundle,
                    CopyProtoBundle(*schema.proto_bundle()));
   SchemaValidationContext context;
@@ -237,6 +239,36 @@ absl::StatusOr<std::unique_ptr<const Schema>> CopySchema(
   return std::make_unique<const OwningSchema>(
       std::move(graph), std::move(proto_bundle), schema.dialect(),
       database_id);
+}
+
+absl::StatusOr<googlesql::Value> CopyValue(const googlesql::Value& value,
+                                           googlesql::TypeFactory* type_factory,
+                                           const ProtoBundle& proto_bundle) {
+  if (!value.is_valid() || IsStaticType(value.type())) {
+    return value;
+  }
+  GOOGLESQL_ASSIGN_OR_RETURN(
+      const googlesql::Type* type,
+      CopyType(value.type(), type_factory, proto_bundle));
+  if (value.is_null()) {
+    return googlesql::Value::Null(type);
+  }
+  if (type->IsEnum()) {
+    return googlesql::Value::Enum(type->AsEnum(), value.enum_value());
+  }
+  if (type->IsProto()) {
+    return googlesql::Value::Proto(type->AsProto(), value.ToCord());
+  }
+  std::vector<googlesql::Value> parts;
+  for (const googlesql::Value& part :
+       type->IsArray() ? value.elements() : value.fields()) {
+    GOOGLESQL_ASSIGN_OR_RETURN(parts.emplace_back(),
+                               CopyValue(part, type_factory, proto_bundle));
+  }
+  if (type->IsArray()) {
+    return googlesql::Value::MakeArray(type->AsArray(), std::move(parts));
+  }
+  return googlesql::Value::MakeStruct(type->AsStruct(), std::move(parts));
 }
 
 SchemaCreateCache* SchemaCreateCache::Global() {
@@ -260,16 +292,18 @@ SchemaCreateCache* SchemaCreateCache::SetGlobalForTesting(
 
 namespace {
 
-// Flags that the emulator writes at runtime and DDL processing never reads:
-// every database's change stream churner sets its intervals when
-// --override_change_stream_partition_token_alive_seconds is set, and this
-// cache's size is read once.
+// Flags that DDL processing never reads and that change at runtime: every
+// database's change stream churner sets its intervals when
+// --override_change_stream_partition_token_alive_seconds is set, and tests set
+// the ephemeral session limits. This cache's size is read once.
 bool IsExcludedFromSettings(absl::string_view flag_name) {
   static const auto* excluded = new absl::flat_hash_set<absl::string_view>{
       "change_stream_churning_interval",
       "change_stream_churn_thread_sleep_interval",
       "change_stream_churn_thread_retry_sleep_interval",
       "schema_create_cache_size",
+      "ephemeral_session_idle_timeout_seconds",
+      "max_ephemeral_sessions",
   };
   return excluded->contains(flag_name);
 }

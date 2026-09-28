@@ -20,6 +20,7 @@
 #include <functional>
 #include <memory>
 #include <set>
+#include <utility>
 
 #include "absl/base/thread_annotations.h"
 #include "absl/status/status.h"
@@ -66,6 +67,10 @@ class LockManager {
   // Returns the timestamp at which last schema update or commit completed.
   absl::Time LastCommitTimestamp() ABSL_LOCKS_EXCLUDED(mu_);
 
+  // Makes `timestamp` the last commit timestamp of a database that has had no
+  // commit yet: that of the data it was copied with.
+  void SeedLastCommitTimestamp(absl::Time timestamp) ABSL_LOCKS_EXCLUDED(mu_);
+
   // Enters the commit critical section exclusively, waiting for an in-flight
   // commit to finish. Schema changes use this: they must not interleave with
   // commits, but they do not fail because read-write transactions are open.
@@ -83,6 +88,13 @@ class LockManager {
   // Waits until `read_time` has passed and no commit with a timestamp at or
   // before `read_time` is still pending.
   void WaitForSafeRead(absl::Time read_time) ABSL_LOCKS_EXCLUDED(mu_);
+
+  // Runs `hook` with the commit timestamp in every read-write commit after it
+  // reserves the timestamp and before it flushes. For tests; set before
+  // concurrent use.
+  void set_before_flush_hook_for_testing(std::function<void(absl::Time)> hook) {
+    before_flush_hook_ = std::move(hook);
+  }
 
  private:
   friend class LockHandle;
@@ -113,6 +125,9 @@ class LockManager {
 
   // Signals completion of a pending commit.
   absl::CondVar pending_commit_cvar_;
+
+  // See set_before_flush_hook_for_testing.
+  std::function<void(absl::Time)> before_flush_hook_;
 };
 
 }  // namespace backend

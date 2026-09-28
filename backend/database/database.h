@@ -40,6 +40,7 @@
 #include "backend/schema/catalog/schema.h"
 #include "backend/schema/catalog/versioned_catalog.h"
 #include "backend/schema/updater/schema_updater.h"
+#include "backend/storage/in_memory_storage.h"
 #include "backend/storage/storage.h"
 #include "backend/transaction/options.h"
 #include "backend/transaction/read_only_transaction.h"
@@ -81,6 +82,20 @@ class Database {
   absl::StatusOr<std::unique_ptr<ReadWriteTransaction>>
   CreateReadWriteTransaction(const ReadWriteOptions& options,
                              const RetryState& retry_state);
+
+  // Returns a new database, not registered anywhere, with a copy of this
+  // database as of one timestamp T taken during the call: its schema at T and
+  // the rows committed at or before T, as one version at T. Its sequences'
+  // counters are read after T, not at T: they are unversioned and drawn before
+  // commit, so they are at least what the rows at T drew, and may be ahead.
+  // The copy's IDs continue from this database's, and its commit timestamps
+  // are greater than T. Reads of the copy before T see no rows.
+  // Schema changes of this database wait while the copy is taken, and never
+  // reach the copy; copies of one database are taken concurrently.
+  //
+  // Fails, and copies nothing, with UNIMPLEMENTED if the schema cannot be
+  // copied (CopySchema).
+  absl::StatusOr<std::unique_ptr<Database>> CreateEphemeralCopy();
 
   // Updates the schema for this database.
   //
@@ -141,6 +156,19 @@ class Database {
     before_churner_update_hook_ = std::move(hook);
   }
 
+  // Runs `hook` with T in every CreateEphemeralCopy once it has picked T and
+  // before it waits for commits at or before T. For tests.
+  void set_ephemeral_copy_hook_for_testing(
+      std::function<void(absl::Time)> hook) {
+    ephemeral_copy_hook_ = std::move(hook);
+  }
+
+  // See LockManager::set_before_flush_hook_for_testing.
+  void set_before_commit_flush_hook_for_testing(
+      std::function<void(absl::Time)> hook) {
+    lock_manager_->set_before_flush_hook_for_testing(std::move(hook));
+  }
+
  private:
   Database();
   // Delete copy and assignment operators since database shouldn't be copyable.
@@ -180,6 +208,9 @@ class Database {
   // See set_before_churner_update_hook_for_testing. Set before concurrent use.
   std::function<void()> before_churner_update_hook_;
 
+  // See set_ephemeral_copy_hook_for_testing. Set before concurrent use.
+  std::function<void(absl::Time)> ephemeral_copy_hook_;
+
   // Clock to provide commit timestamps.
   Clock* clock_;
 
@@ -202,7 +233,7 @@ class Database {
   ColumnIDGenerator column_id_generator_;
 
   // Underlying storage for the database.
-  std::unique_ptr<Storage> storage_;
+  std::unique_ptr<InMemoryStorage> storage_;
 
   // Lock management.
   std::unique_ptr<LockManager> lock_manager_;

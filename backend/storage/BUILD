@@ -65,9 +65,12 @@ cc_library(
         "//backend/datamodel:key",
         "//backend/datamodel:key_range",
         "//common:errors",
+        "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",
+        "@com_google_googlesql//googlesql/base:status",
         "@com_google_googlesql//googlesql/public:value",
     ],
 )

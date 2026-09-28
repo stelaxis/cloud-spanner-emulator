@@ -44,6 +44,10 @@ class VersionedCatalog {
   // absl::InfinitePast() is assigned as its creation timestamp.
   explicit VersionedCatalog(std::unique_ptr<const Schema> initial_schema);
 
+  // As above, with the given version retention period.
+  VersionedCatalog(std::unique_ptr<const Schema> initial_schema,
+                   absl::Duration version_retention_period);
+
   // Finds the newest schema that is created at or before a given timestamp and
   // returns a pointer to that schema object. There is always a first schema in
   // each VersionedCatalog, which has a creation timestamp of

@@ -826,6 +826,55 @@ TEST_F(InMemoryStorageTest, RemoveExpiredVersionsFromCellOnDelete) {
   EXPECT_THAT(values, testing::ElementsAre(googlesql::Value()));
 }
 
+// CopyAt copies what is visible at its timestamp, as one version there: later
+// writes, deleted rows, and tables or columns it was not given are left out.
+TEST_F(InMemoryStorageTest, CopyAtCopiesTheRowsVisibleAtItsTimestamp) {
+  const ColumnID kOtherColumnID = "test_column:1";
+  absl::Time t0 = absl::Now();
+  absl::Time t1 = t0 + absl::Seconds(1);
+  absl::Time t2 = t0 + absl::Seconds(2);
+  absl::Time t3 = t0 + absl::Seconds(3);
+  GOOGLESQL_EXPECT_OK(storage_.Write(t0, kTableId0, Key({Int64(1)}),
+                                     {kColumnID, kOtherColumnID},
+                                     {String("old"), String("other")}));
+  GOOGLESQL_EXPECT_OK(storage_.Write(t1, kTableId0, Key({Int64(1)}),
+                                     {kColumnID}, {String("at-copy")}));
+  GOOGLESQL_EXPECT_OK(storage_.Write(t0, kTableId0, Key({Int64(2)}),
+                                     {kColumnID}, {String("deleted")}));
+  GOOGLESQL_EXPECT_OK(
+      storage_.Delete(t1, kTableId0, KeyRange::Point(Key({Int64(2)}))));
+  GOOGLESQL_EXPECT_OK(storage_.Write(t3, kTableId0, Key({Int64(3)}),
+                                     {kColumnID}, {String("after-copy")}));
+  GOOGLESQL_EXPECT_OK(storage_.Write(t3, kTableId0, Key({Int64(1)}),
+                                     {kColumnID}, {String("after-copy")}));
+  GOOGLESQL_EXPECT_OK(storage_.Write(t0, kTableId1, Key({Int64(1)}),
+                                     {kColumnID}, {String("not-copied")}));
+
+  InMemoryStorage copy;
+  GOOGLESQL_ASSERT_OK(storage_.CopyAt(
+      t2, {{kTableId0, {kColumnID}}},
+      [](const googlesql::Value& value) { return value; }, &copy));
+
+  std::vector<googlesql::Value> values;
+  GOOGLESQL_EXPECT_OK(copy.Lookup(t2, kTableId0, Key({Int64(1)}),
+                                  {kColumnID, kOtherColumnID}, &values));
+  EXPECT_THAT(values,
+              testing::ElementsAre(String("at-copy"), googlesql::Value()));
+  // One version, at the copy's timestamp.
+  EXPECT_THAT(copy.Lookup(t1, kTableId0, Key({Int64(1)}), {}, nullptr),
+              googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_FALSE(copy.HasVersionsAfter(t2, kTableId0, kKeyRange0To5));
+  EXPECT_TRUE(copy.HasVersionsAfter(t1, kTableId0, kKeyRange0To5));
+  GOOGLESQL_EXPECT_OK(
+      copy.Read(t3, kTableId0, kKeyRange0To5, {kColumnID}, &itr_));
+  ASSERT_TRUE(itr_->Next());
+  EXPECT_EQ(itr_->Key(), Key({Int64(1)}));
+  EXPECT_FALSE(itr_->Next());
+  GOOGLESQL_EXPECT_OK(
+      copy.Read(t3, kTableId1, kKeyRange0To5, {kColumnID}, &itr_));
+  EXPECT_FALSE(itr_->Next());
+}
+
 }  // namespace
 
 }  // namespace backend

@@ -70,6 +70,12 @@ VersionedCatalog::VersionedCatalog(
   schemas_[absl::InfinitePast()] = std::move(initial_schema);
 }
 
+VersionedCatalog::VersionedCatalog(std::unique_ptr<const Schema> initial_schema,
+                                   absl::Duration version_retention_period)
+    : VersionedCatalog(std::move(initial_schema)) {
+  version_retention_period_ = version_retention_period;
+}
+
 const Schema* VersionedCatalog::GetSchema(absl::Time timestamp) const {
   absl::MutexLock lock(mu_);
   auto itr = schemas_.upper_bound(timestamp);

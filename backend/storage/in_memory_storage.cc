@@ -26,6 +26,7 @@
 #include "absl/time/time.h"
 #include "backend/storage/in_memory_iterator.h"
 #include "common/errors.h"
+#include "googlesql/base/status_macros.h"
 
 namespace google {
 namespace spanner {
@@ -311,6 +312,51 @@ absl::Status InMemoryStorage::Delete(absl::Time timestamp,
         Cell& cell = itr->second[columns.first];
         cell[timestamp] = googlesql::Value();
         RemoveExpiredVersions(cell, timestamp);
+      }
+    }
+  }
+  return absl::OkStatus();
+}
+
+absl::Status InMemoryStorage::CopyAt(
+    absl::Time timestamp,
+    const absl::flat_hash_map<TableID, std::vector<ColumnID>>& columns,
+    const std::function<
+        absl::StatusOr<googlesql::Value>(const googlesql::Value&)>& copy_value,
+    InMemoryStorage* destination) const {
+  absl::MutexLock lock(mu_);
+  absl::MutexLock destination_lock(destination->mu_);
+  for (const auto& [table_id, column_ids] : columns) {
+    auto table_itr = tables_.find(table_id);
+    if (table_itr == tables_.end()) {
+      continue;
+    }
+    Table* copy = nullptr;
+    for (const auto& [key, row] : table_itr->second) {
+      if (!Exists(row, timestamp)) {
+        continue;
+      }
+      if (copy == nullptr) {
+        copy = &destination->tables_[table_id];
+        destination->NoteVersion(table_id, timestamp);
+      }
+      Key key_copy = key;
+      for (int i = 0; i < key.NumColumns(); ++i) {
+        GOOGLESQL_ASSIGN_OR_RETURN(googlesql::Value column,
+                                   copy_value(key.ColumnValue(i)));
+        key_copy.SetColumnValue(i, std::move(column));
+      }
+      // Copied values order as the originals, so keys stay sorted.
+      Row& row_copy =
+          copy->emplace_hint(copy->end(), std::move(key_copy), Row())->second;
+      row_copy[kExistsColumn][timestamp] = googlesql::values::Bool(true);
+      for (const ColumnID& column_id : column_ids) {
+        googlesql::Value value =
+            GetCellValueAtTimestamp(row, column_id, timestamp);
+        if (value.is_valid()) {
+          GOOGLESQL_ASSIGN_OR_RETURN(row_copy[column_id][timestamp],
+                                     copy_value(value));
+        }
       }
     }
   }

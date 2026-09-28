@@ -350,6 +350,33 @@ absl::Status InvalidOperationBatchCreateSessions() {
                       "Multiplexed sessions may not be created in batch.");
 }
 
+absl::Status EphemeralMultiplexedSession() {
+  return absl::Status(
+      absl::StatusCode::kInvalidArgument,
+      "The emulator does not support multiplexed sessions with the label "
+      "emulator-ephemeral=true. Create a regular session instead.");
+}
+
+absl::Status TooManyEphemeralSessions(int max_sessions) {
+  return absl::Status(
+      absl::StatusCode::kResourceExhausted,
+      absl::Substitute(
+          "Too many ephemeral sessions: at most $0 may be open at once "
+          "(--max_ephemeral_sessions). Delete the sessions you no longer use; "
+          "idle ones are deleted after "
+          "--ephemeral_session_idle_timeout_seconds.",
+          max_sessions));
+}
+
+absl::Status EphemeralSessionCopyFailed(absl::string_view database_uri,
+                                        const absl::Status& status) {
+  return absl::Status(
+      status.code(),
+      absl::StrCat("Cannot create an ephemeral session: the emulator cannot "
+                   "copy database ",
+                   database_uri, ": ", status.message()));
+}
+
 absl::Status TooFewSessions(int session_count) {
   return absl::Status(
       absl::StatusCode::kInvalidArgument,

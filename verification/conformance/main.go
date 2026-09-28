@@ -42,6 +42,7 @@ func run() int {
 		dumpFailed = flag.String("dump", "", "write the first (shrunk) mismatching schedule as JSON lines to this file")
 		replay     = flag.String("schedule", "", "run this schedule (JSON lines) once, print the step-by-step diff, and exit")
 		printOnly  = flag.Bool("print", false, "print the schedule of -first-seed as JSON lines (txnmodel input) and exit")
+		ephemeral  = flag.Bool("ephemeral", false, "instead of transaction schedules, run -seeds random runs of ephemeral sessions against their design (ephemeral.go)")
 	)
 	flag.Parse()
 	log.SetFlags(0)
@@ -96,6 +97,16 @@ func run() int {
 	if err := emu.setup(ctx); err != nil {
 		log.Print(err)
 		return 2
+	}
+	if *ephemeral {
+		st, err := runEphemeral(ctx, emu, *seeds, *firstSeed, *numKeys)
+		fmt.Printf("ephemeral runs=%d steps=%d copies=%d copy_writes=%d reads=%d deletes=%d mismatched=%d\n",
+			st.runs, st.steps, st.copies, st.copyWrites, st.reads, st.deletes, min(1, *seeds-st.runs))
+		if err != nil {
+			log.Print(err)
+			return 1
+		}
+		return 0
 	}
 	mdl, err := startModel(*modelPath, *modelName, *pushdown)
 	if err != nil {

@@ -20,6 +20,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "google/spanner/v1/spanner.pb.h"
 #include "absl/base/thread_annotations.h"
@@ -67,15 +68,22 @@ class Session {
     kInitializeAndActivate,
   };
 
+  // An ephemeral session has `database`, a copy of `base_database` that no
+  // other session uses, and holds `reservation` until after the copy is
+  // destroyed; other sessions have neither.
   Session(const std::string& session_uri, const Labels& labels,
           const bool multiplexed, const absl::Time create_time,
           std::shared_ptr<Database> database,
-          MultiplexedSessionTransactionManager* mux_txn_manager)
+          MultiplexedSessionTransactionManager* mux_txn_manager,
+          std::shared_ptr<Database> base_database = nullptr,
+          std::shared_ptr<void> reservation = nullptr)
       : session_uri_(session_uri),
         labels_(labels),
         create_time_(create_time),
         multiplexed_(multiplexed),
+        reservation_(std::move(reservation)),
         database_(database),
+        base_database_(std::move(base_database)),
         mux_txn_manager_(mux_txn_manager) {}
 
   // Returns the URI for this session.
@@ -91,6 +99,19 @@ class Session {
 
   // Returns the database this session is attached to.
   const std::shared_ptr<Database>& database() const { return database_; }
+
+  // The database an ephemeral session's database is a copy of, or null.
+  const std::shared_ptr<Database>& base_database() const {
+    return base_database_;
+  }
+  bool ephemeral() const { return base_database_ != nullptr; }
+
+  // True if the database this session serves has been dropped: its own or,
+  // for an ephemeral session, the one it copied.
+  bool database_dropped() const {
+    return database_->dropped() ||
+           (base_database_ != nullptr && base_database_->dropped());
+  }
 
   // Return the time this session was last used.
   absl::Time approximate_last_use_time() const ABSL_LOCKS_EXCLUDED(mu_) {
@@ -160,8 +181,14 @@ class Session {
   // Whether this session is multiplexed.
   const bool multiplexed_;
 
+  // See the constructor. Declared before database_, so released after it.
+  const std::shared_ptr<void> reservation_;
+
   // The database to which this session is attached.
   std::shared_ptr<Database> database_;
+
+  // See base_database().
+  const std::shared_ptr<Database> base_database_;
 
   // Mutex to guard the state below.
   mutable absl::Mutex mu_;

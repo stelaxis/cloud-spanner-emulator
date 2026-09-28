@@ -2,7 +2,8 @@
 // running emulator: latency percentiles and throughput at several levels of
 // concurrency, and the emulator's resident memory while it runs. With
 // -migration it instead times one UpdateDatabaseDdl that adds indexes to a
-// populated database.
+// populated database; with -ephemeral, CreateSession of ephemeral sessions,
+// each a copy of a populated database.
 //
 // Each worker creates a database, then drops it (the drop is not timed), so
 // at most one database per worker exists at a time.
@@ -56,6 +57,8 @@ func main() {
 		migration = flag.Int("migration", 0, "if > 0: time one UpdateDatabaseDdl adding this many of the DDL's CREATE INDEX statements to a populated database")
 		rows      = flag.Int("rows", 200, "rows per table for -migration")
 		repeats   = flag.Int("repeats", 3, "migrations to time with -migration")
+		ephemeral = flag.Bool("ephemeral", false, "time CreateSession with emulator-ephemeral=true (a copy of a database created from the DDL and filled with -rows rows per table) instead of CreateDatabase")
+		hold      = flag.Int("hold", 16, "with -ephemeral: ephemeral sessions to hold at once to measure memory per copy")
 	)
 	flag.Parse()
 	log.SetFlags(log.Ltime)
@@ -84,6 +87,18 @@ func main() {
 
 	if *migration > 0 {
 		runMigration(ctx, da, addr, stmts, *migration, *rows, *repeats, *pid)
+		return
+	}
+	if *ephemeral {
+		var ls []int
+		for _, l := range strings.Split(*levels, ",") {
+			level, err := strconv.Atoi(strings.TrimSpace(l))
+			if err != nil || level < 1 {
+				log.Fatalf("bad level %q", l)
+			}
+			ls = append(ls, level)
+		}
+		runEphemeral(ctx, da, opts, addr, stmts, *rows, ls, *creates, *hold, *pid)
 		return
 	}
 

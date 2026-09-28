@@ -143,6 +143,17 @@ void Sequence::RemoveSequenceCountersWithIdPrefix(absl::string_view prefix) {
   });
 }
 
+void Sequence::CopySequenceCounters(
+    const std::vector<std::pair<SequenceID, SequenceID>>& from_to) {
+  absl::MutexLock lock(SequenceMutex);
+  for (const auto& [from, to] : from_to) {
+    auto it = Sequence::SequenceLastValues.find(from);
+    if (it != Sequence::SequenceLastValues.end()) {
+      Sequence::SequenceLastValues[to] = it->second;
+    }
+  }
+}
+
 void Sequence::RemoveSequenceFromLastValuesMap() const {
   absl::MutexLock lock(SequenceMutex);
   absl::flat_hash_map<std::string, int64_t>::iterator it =
