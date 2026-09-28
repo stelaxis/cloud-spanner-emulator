@@ -78,6 +78,15 @@ Database::~Database() {
   Sequence::RemoveSequenceCountersWithIdPrefix(sequence_id_prefix_);
 }
 
+namespace {
+
+// The prefix of a cache entry's sequence ids. No database's prefix
+// ("seq_db<N>_") is a prefix of it, or it of theirs. Nothing draws from an
+// entry's sequences, so they never have counters.
+constexpr char kCacheEntrySequenceIdPrefix[] = "seq_cache_";
+
+}  // namespace
+
 std::unique_ptr<Database> Database::New(
     Clock* clock, std::string_view database_id,
     database_api::DatabaseDialect dialect) {
@@ -170,7 +179,8 @@ absl::StatusOr<std::unique_ptr<Database>> Database::CreateFromCache(
   std::unique_ptr<Database> database = New(clock, database_id, dialect);
   GOOGLESQL_ASSIGN_OR_RETURN(std::unique_ptr<const Schema> schema,
                    CopySchema(*entry.schema, database->type_factory_.get(),
-                              database_id, absl::Now()));
+                              database_id, database->sequence_id_prefix_,
+                              absl::Now()));
   // Continue the counters from where creating the schema from DDL left them.
   database->table_id_generator_.set_next_seq(entry.next_table_id);
   database->column_id_generator_.set_next_seq(entry.next_column_id);
@@ -198,7 +208,8 @@ Database::MakeSchemaCreateCacheEntry() const {
   entry->type_factory = std::make_unique<googlesql::TypeFactory>();
   absl::StatusOr<std::unique_ptr<const Schema>> schema =
       CopySchema(*versioned_catalog_->GetLatestSchema(),
-                 entry->type_factory.get(), /*database_id=*/"", absl::Now());
+                 entry->type_factory.get(), /*database_id=*/"",
+                 kCacheEntrySequenceIdPrefix, absl::Now());
   if (schema.ok()) {
     entry->schema = *std::move(schema);
   } else {

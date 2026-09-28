@@ -43,15 +43,17 @@ namespace backend {
 // Returns a deep copy of `schema` that shares no object with it: every schema
 // node is cloned, types that a type factory owns are rebuilt in
 // `type_factory`, and the proto bundle is rebuilt from its descriptors.
-// Sequences get new IDs, so the copy's sequences start where a new sequence
-// starts, and change streams are created at `now`. Table and column IDs are
-// kept.
+// Sequences get new IDs starting with `sequence_id_prefix`, so the copy's
+// sequences start where a new sequence starts, and their counters are released
+// with the prefix (Sequence::RemoveSequenceCountersWithIdPrefix). Change
+// streams are created at `now`. Table and column IDs are kept.
 //
 // Fails with UNIMPLEMENTED for schemas it cannot copy: a function whose
 // signature has a type that a type factory owns, or default arguments.
 absl::StatusOr<std::unique_ptr<const Schema>> CopySchema(
     const Schema& schema, googlesql::TypeFactory* type_factory,
-    std::string_view database_id, absl::Time now);
+    std::string_view database_id, std::string_view sequence_id_prefix,
+    absl::Time now);
 
 // Remembers the schemas that CreateDatabase built from DDL, so that a later
 // CreateDatabase with the same request copies the schema (CopySchema) instead

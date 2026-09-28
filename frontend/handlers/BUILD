@@ -54,9 +54,11 @@ cc_test(
     name = "databases_test",
     srcs = ["databases_test.cc"],
     deps = [
+        "@com_google_absl//absl/container:flat_hash_set",
         ":databases",
         "//backend/common:ids",
         "//backend/database",
+        "//backend/database:schema_create_cache",
         "//backend/schema/catalog:schema",
         "//backend/schema/printer:print_ddl",
         "//common:constants",

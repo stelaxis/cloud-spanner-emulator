@@ -167,7 +167,8 @@ T* Mutable(const SchemaNode* node) {
 
 absl::Status CopyNode(const SchemaNode* node,
                       googlesql::TypeFactory* type_factory,
-                      const ProtoBundle& proto_bundle, absl::Time now) {
+                      const ProtoBundle& proto_bundle,
+                      std::string_view sequence_id_prefix, absl::Time now) {
   if (auto* column = Mutable<Column>(node); column != nullptr) {
     GOOGLESQL_ASSIGN_OR_RETURN(const googlesql::Type* type,
                      CopyType(column->GetType(), type_factory, proto_bundle));
@@ -202,8 +203,8 @@ absl::Status CopyNode(const SchemaNode* node,
     // As CREATE SEQUENCE assigns them. A sequence's state is kept by ID across
     // databases, and a new ID has none.
     absl::BitGen bitgen;
-    Sequence::Editor(sequence).set_id(
-        absl::StrCat("seq_", googlesql::functions::GenerateUuid(bitgen)));
+    Sequence::Editor(sequence).set_id(absl::StrCat(
+        sequence_id_prefix, googlesql::functions::GenerateUuid(bitgen)));
   } else if (auto* change_stream = Mutable<ChangeStream>(node);
              change_stream != nullptr) {
     ChangeStream::Editor(change_stream).set_creation_time(now);
@@ -222,14 +223,16 @@ static_assert(std::has_unique_object_representations_v<
 
 absl::StatusOr<std::unique_ptr<const Schema>> CopySchema(
     const Schema& schema, googlesql::TypeFactory* type_factory,
-    std::string_view database_id, absl::Time now) {
+    std::string_view database_id, std::string_view sequence_id_prefix,
+    absl::Time now) {
   GOOGLESQL_ASSIGN_OR_RETURN(std::shared_ptr<const ProtoBundle> proto_bundle,
                    CopyProtoBundle(*schema.proto_bundle()));
   SchemaValidationContext context;
   SchemaGraphEditor editor(schema.GetSchemaGraph(), &context);
   GOOGLESQL_ASSIGN_OR_RETURN(std::unique_ptr<SchemaGraph> graph, editor.CloneGraph());
   for (const SchemaNode* node : graph->GetSchemaNodes()) {
-    GOOGLESQL_RETURN_IF_ERROR(CopyNode(node, type_factory, *proto_bundle, now));
+    GOOGLESQL_RETURN_IF_ERROR(
+        CopyNode(node, type_factory, *proto_bundle, sequence_id_prefix, now));
   }
   return std::make_unique<const OwningSchema>(
       std::move(graph), std::move(proto_bundle), schema.dialect(),

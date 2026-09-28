@@ -36,6 +36,7 @@
 #include "absl/flags/commandlineflag.h"
 #include "absl/flags/flag.h"
 #include "absl/flags/reflection.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/notification.h"
@@ -414,13 +415,14 @@ TEST(CopySchemaTest, CopyOwnsItsTypes) {
   googlesql::TypeFactory copy_factory;
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(
       std::unique_ptr<const Schema> copy,
-      CopySchema(*source, &copy_factory, "copy", absl::Now()));
+      CopySchema(*source, &copy_factory, "copy", "seq_copy_", absl::Now()));
   source.reset();
   source_factory.reset();
 
   EXPECT_EQ(copy->database_id(), "copy");
   EXPECT_THAT(PrintDDLStatements(copy.get()), IsOkAndHolds(expected));
   EXPECT_NE(copy->FindSequence("seq")->id(), source_sequence_id);
+  EXPECT_TRUE(absl::StartsWith(copy->FindSequence("seq")->id(), "seq_copy_"));
   std::vector<std::string> copied_types;
   for (const Column* column : copy->FindTable("t")->columns()) {
     copied_types.push_back(column->GetType()->DebugString());
@@ -488,8 +490,9 @@ TEST(SchemaCreateCacheKeyTest, KeyCoversTheWholeRequest) {
 }
 
 // A create publishes its schema only if the settings it was keyed by held
-// throughout: a change during the create, even one undone before it ends,
-// means the DDL may have read other settings than the key's.
+// throughout: any write to the feature flags during the create, even one undone
+// before it ends, and a command-line flag still changed at its end, mean the
+// DDL may have read other settings than the key's.
 class SchemaCreateCacheInterleavingTest : public ::testing::Test {
  protected:
   void SetUp() override {
