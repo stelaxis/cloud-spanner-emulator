@@ -84,10 +84,12 @@ class Database {
                              const RetryState& retry_state);
 
   // Returns a new database, not registered anywhere, with a copy of this
-  // database as of one timestamp T taken during the call: its schema at T, the
-  // rows committed at or before T, as one version at T, and its sequences'
-  // counters. The copy's IDs continue from this database's, and its commit
-  // timestamps are greater than T. Reads of the copy before T see no rows.
+  // database as of one timestamp T taken during the call: its schema at T and
+  // the rows committed at or before T, as one version at T. Its sequences'
+  // counters are read after T, not at T: they are unversioned and drawn before
+  // commit, so they are at least what the rows at T drew, and may be ahead.
+  // The copy's IDs continue from this database's, and its commit timestamps
+  // are greater than T. Reads of the copy before T see no rows.
   // Schema changes of this database wait while the copy is taken, and never
   // reach the copy; copies of one database are taken concurrently.
   //

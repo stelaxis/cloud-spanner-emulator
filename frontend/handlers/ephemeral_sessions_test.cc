@@ -262,6 +262,22 @@ class EphemeralSessionTest : public test::ServerTest {
     });
     return CopyWatch{copy, destroyed};
   }
+
+  // Waits, sending no request, until the watched copy's teardown has finished
+  // on the sweeping thread: its destroy hook has recorded its result, and its
+  // session has released its place, leaving `ephemeral_count` places taken.
+  // The weak pointer expires before either, so it is not enough to wait for.
+  bool AwaitTeardown(const CopyWatch& watch, int ephemeral_count,
+                     absl::Duration timeout) {
+    const absl::Time deadline = absl::Now() + timeout;
+    while (absl::Now() < deadline) {
+      if (*watch.destroyed != 0 && EphemeralCount() == ephemeral_count) {
+        return watch.copy.expired();
+      }
+      absl::SleepFor(absl::Milliseconds(5));
+    }
+    return false;
+  }
 };
 
 // (a), (b): a copy has the rows committed before its session was created, and
@@ -443,16 +459,6 @@ TEST_F(EphemeralSessionTest, DeleteSessionFreesTheCopy) {
   EXPECT_THAT(GetSession(copy), StatusIs(absl::StatusCode::kNotFound));
 }
 
-// Waits, sending no request, until `copy` has been destroyed.
-bool AwaitDestroyed(const std::weak_ptr<Database>& copy,
-                    absl::Duration timeout) {
-  const absl::Time deadline = absl::Now() + timeout;
-  while (!copy.expired() && absl::Now() < deadline) {
-    absl::SleepFor(absl::Milliseconds(10));
-  }
-  return copy.expired();
-}
-
 // (g): an idle ephemeral session is deleted, and its copy freed outside the
 // lock, with no request at all: a test process that dies leaves nothing
 // behind.
@@ -462,9 +468,8 @@ TEST_F(EphemeralSessionTest, IdleCopiesAreFreedWithoutRequests) {
   test_env()->AdvanceClock(absl::Seconds(121));
 
   // The sweeping thread runs every SessionManager::kSweepInterval.
-  EXPECT_TRUE(AwaitDestroyed(watch.copy, absl::Seconds(20)));
+  ASSERT_TRUE(AwaitTeardown(watch, /*ephemeral_count=*/0, absl::Seconds(20)));
   EXPECT_EQ(*watch.destroyed, 1);
-  EXPECT_EQ(EphemeralCount(), 0);
 }
 
 // (g): any request on an ephemeral session restarts its idle time.
@@ -481,15 +486,16 @@ TEST_F(EphemeralSessionTest, RequestsKeepEphemeralSessionsAlive) {
   GOOGLESQL_ASSERT_OK(GetSession(active));
   test_env()->AdvanceClock(absl::Seconds(40));
 
-  EXPECT_TRUE(AwaitDestroyed(idle_watch.copy, absl::Seconds(10)));
+  ASSERT_TRUE(
+      AwaitTeardown(idle_watch, /*ephemeral_count=*/1, absl::Seconds(10)));
   EXPECT_EQ(*idle_watch.destroyed, 1);
   EXPECT_FALSE(active_watch.copy.expired());
   EXPECT_THAT(GetSession(idle), StatusIs(absl::StatusCode::kNotFound));
 
   test_env()->AdvanceClock(absl::Seconds(121));
-  EXPECT_TRUE(AwaitDestroyed(active_watch.copy, absl::Seconds(10)));
+  ASSERT_TRUE(
+      AwaitTeardown(active_watch, /*ephemeral_count=*/0, absl::Seconds(10)));
   EXPECT_EQ(*active_watch.destroyed, 1);
-  EXPECT_EQ(EphemeralCount(), 0);
 }
 
 // (g): a lookup of an expired ephemeral session deletes it and frees its copy

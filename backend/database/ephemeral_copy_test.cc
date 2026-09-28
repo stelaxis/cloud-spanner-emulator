@@ -39,10 +39,12 @@
 #include "backend/access/read.h"
 #include "backend/access/write.h"
 #include "backend/database/database.h"
+#include "backend/database/schema_create_cache.h"
 #include "backend/datamodel/key.h"
 #include "backend/datamodel/key_set.h"
 #include "backend/query/query_context.h"
 #include "backend/query/query_engine.h"
+#include "backend/schema/catalog/proto_bundle.h"
 #include "backend/schema/catalog/sequence.h"
 #include "backend/schema/catalog/table.h"
 #include "backend/schema/updater/schema_updater.h"
@@ -644,8 +646,19 @@ TEST_F(EphemeralCopyTest, ProtoAndEnumValuesTakeTheCopysTypes) {
                      proto_type, absl::Cord(simple.SerializeAsString())),
                  googlesql::Value::Array(
                      array_type, {googlesql::Value::Enum(enum_type, 3)})}});
-  m.AddWriteOp(MutationOpType::kInsert, "K", {"e", "v"},
-               {{googlesql::Value::Enum(enum_type, 4), Int64(4)}});
+  // NULLs of the rebound types, in a column and in an array.
+  m.AddWriteOp(MutationOpType::kInsert, "T", {"k", "e", "p", "a"},
+               {{Int64(2), googlesql::Value::Null(enum_type),
+                 googlesql::Value::Null(proto_type),
+                 googlesql::Value::Array(
+                     array_type, {googlesql::Value::Null(enum_type)})}});
+  m.AddWriteOp(MutationOpType::kInsert, "T", {"k", "a"},
+               {{Int64(3), googlesql::Value::Null(array_type)}});
+  // Keys around the one looked up, so that the lookup compares keys.
+  for (int number : {1, 2, 4}) {
+    m.AddWriteOp(MutationOpType::kInsert, "K", {"e", "v"},
+                 {{googlesql::Value::Enum(enum_type, number), Int64(number)}});
+  }
   GOOGLESQL_ASSERT_OK(Apply(base.get(), m));
 
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Database> copy,
@@ -675,15 +688,28 @@ TEST_F(EphemeralCopyTest, ProtoAndEnumValuesTakeTheCopysTypes) {
     }
     return values;
   };
-  std::vector<googlesql::Value> row = read("T", {"e", "p", "a"});
-  ASSERT_EQ(row.size(), 3);
-  EXPECT_EQ(row[0].type()->AsEnum()->enum_descriptor(), copy_enum);
-  EXPECT_EQ(row[1].type()->AsProto()->descriptor(), copy_proto);
-  EXPECT_EQ(row[2].elements()[0].type()->AsEnum()->enum_descriptor(),
+  std::vector<googlesql::Value> rows = read("T", {"e", "p", "a"});
+  ASSERT_EQ(rows.size(), 9);
+  for (int row = 0; row < 3; ++row) {
+    EXPECT_EQ(rows[3 * row].type()->AsEnum()->enum_descriptor(), copy_enum);
+    EXPECT_EQ(rows[3 * row + 1].type()->AsProto()->descriptor(), copy_proto);
+    EXPECT_EQ(rows[3 * row + 2]
+                  .type()
+                  ->AsArray()
+                  ->element_type()
+                  ->AsEnum()
+                  ->enum_descriptor(),
+              copy_enum);
+  }
+  EXPECT_EQ(rows[2].elements()[0].type()->AsEnum()->enum_descriptor(),
             copy_enum);
-  std::vector<googlesql::Value> key = read("K", {"e"});
-  ASSERT_EQ(key.size(), 1);
-  EXPECT_EQ(key[0].type()->AsEnum()->enum_descriptor(), copy_enum);
+  EXPECT_TRUE(rows[3].is_null());
+  EXPECT_EQ(rows[5].elements()[0].type()->AsEnum()->enum_descriptor(),
+            copy_enum);
+  EXPECT_TRUE(rows[8].is_null());
+  for (const googlesql::Value& key : read("K", {"e"})) {
+    EXPECT_EQ(key.type()->AsEnum()->enum_descriptor(), copy_enum);
+  }
 
   // The base drops the tables and the bundle; a later schema change frees
   // the schemas that held it once they are past the retention period.
@@ -698,11 +724,132 @@ TEST_F(EphemeralCopyTest, ProtoAndEnumValuesTakeTheCopysTypes) {
 
   EXPECT_THAT(Sql(copy.get(),
                   "SELECT CAST(e AS STRING), p.field, CAST(a[OFFSET(0)] AS "
-                  "STRING) FROM T"),
+                  "STRING) FROM T WHERE k = 1"),
               IsOkAndHolds(ElementsAre(
                   "\"TEST_ENUM_TWO\",\"hello\",\"TEST_ENUM_THREE\"")));
-  EXPECT_THAT(Sql(copy.get(), "SELECT CAST(e AS STRING), v FROM K"),
-              IsOkAndHolds(ElementsAre("\"TEST_ENUM_FOUR\",4")));
+  EXPECT_THAT(
+      Sql(copy.get(),
+          "SELECT e IS NULL, p IS NULL, a[OFFSET(0)] IS NULL, "
+          "a IS NULL FROM T WHERE k > 1 ORDER BY k"),
+      IsOkAndHolds(ElementsAre("true,true,true,false", "true,true,true,true")));
+  EXPECT_THAT(
+      Sql(copy.get(), "SELECT CAST(e AS STRING), v FROM K ORDER BY v"),
+      IsOkAndHolds(ElementsAre("\"TEST_ENUM_ONE\",1", "\"TEST_ENUM_TWO\",2",
+                               "\"TEST_ENUM_FOUR\",4")));
+  // Point lookups by enum key compare the stored keys with the looked-up one.
+  const googlesql::EnumType* copy_key_type = copy->GetLatestSchema()
+                                                 ->FindTable("K")
+                                                 ->FindColumn("e")
+                                                 ->GetType()
+                                                 ->AsEnum();
+  auto lookup = [&](int number) {
+    std::unique_ptr<ReadOnlyTransaction> txn =
+        copy->CreateReadOnlyTransaction(ReadOnlyOptions()).value();
+    std::unique_ptr<RowCursor> cursor;
+    GOOGLESQL_EXPECT_OK(txn->Read(
+        ReadArg{.table = "K",
+                .key_set = KeySet(
+                    Key({googlesql::Value::Enum(copy_key_type, number)})),
+                .columns = {"v"}},
+        &cursor));
+    std::vector<int64_t> values;
+    while (cursor->Next()) {
+      values.push_back(cursor->ColumnValue(0).int64_value());
+    }
+    return values;
+  };
+  EXPECT_THAT(lookup(4), ElementsAre(4));
+  EXPECT_THAT(lookup(3), IsEmpty());
+  EXPECT_THAT(Sql(copy.get(), "SELECT v FROM K WHERE e = 'TEST_ENUM_TWO'"),
+              IsOkAndHolds(ElementsAre("2")));
+}
+
+// CopyValue within structs, including nested ones, and for NULLs of every
+// kind, which a table's columns cannot hold directly.
+TEST_F(EphemeralCopyTest, CopyValueRebindsNestedStructsAndNulls) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<Database> base,
+      Database::Create(
+          &clock_, kDatabaseId,
+          SchemaChangeOperation{
+              .statements =
+                  {"CREATE PROTO BUNDLE (emulator.tests.common.Simple, "
+                   "emulator.tests.common.TestEnum)",
+                   "CREATE TABLE T (k INT64 NOT NULL, "
+                   "e emulator.tests.common.TestEnum, "
+                   "p emulator.tests.common.Simple) PRIMARY KEY (k)"},
+              .proto_descriptor_bytes = TestProtoDescriptors()}));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Database> copy,
+                                 Copy(base.get()));
+  const Table* table = base->GetLatestSchema()->FindTable("T");
+  const googlesql::Type* enum_type = table->FindColumn("e")->GetType();
+  const googlesql::Type* proto_type = table->FindColumn("p")->GetType();
+  const ProtoBundle& copy_bundle = *copy->GetLatestSchema()->proto_bundle();
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      const google::protobuf::EnumDescriptor* copy_enum,
+      copy_bundle.GetEnumTypeDescriptor("emulator.tests.common.TestEnum"));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      const google::protobuf::Descriptor* copy_proto,
+      copy_bundle.GetTypeDescriptor("emulator.tests.common.Simple"));
+
+  // STRUCT<e, inner STRUCT<a ARRAY<e>, p>>, in the base's type factory.
+  googlesql::TypeFactory base_types;
+  const googlesql::ArrayType* array_type;
+  GOOGLESQL_ASSERT_OK(base_types.MakeArrayType(enum_type, &array_type));
+  const googlesql::StructType* inner_type;
+  GOOGLESQL_ASSERT_OK(base_types.MakeStructType(
+      {{"a", array_type}, {"p", proto_type}}, &inner_type));
+  const googlesql::StructType* outer_type;
+  GOOGLESQL_ASSERT_OK(base_types.MakeStructType(
+      {{"e", enum_type}, {"inner", inner_type}}, &outer_type));
+  ::emulator::tests::common::Simple simple;
+  simple.set_field("nested");
+  const googlesql::Value value = googlesql::Value::Struct(
+      outer_type,
+      {googlesql::Value::Enum(enum_type->AsEnum(), 1),
+       googlesql::Value::Struct(
+           inner_type,
+           {googlesql::Value::Array(
+                array_type, {googlesql::Value::Enum(enum_type->AsEnum(), 2),
+                             googlesql::Value::Null(enum_type)}),
+            googlesql::Value::Proto(proto_type->AsProto(),
+                                    absl::Cord(simple.SerializeAsString()))})});
+
+  googlesql::TypeFactory copy_types;
+  auto copy_value = [&](const googlesql::Value& v) {
+    return CopyValue(v, &copy_types, copy_bundle);
+  };
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(googlesql::Value copied, copy_value(value));
+  const googlesql::Value& inner = copied.field(1);
+  EXPECT_EQ(copied.field(0).type()->AsEnum()->enum_descriptor(), copy_enum);
+  EXPECT_EQ(copied.field(0).enum_value(), 1);
+  EXPECT_EQ(inner.field(0).element(0).type()->AsEnum()->enum_descriptor(),
+            copy_enum);
+  EXPECT_EQ(inner.field(0).element(0).enum_value(), 2);
+  EXPECT_TRUE(inner.field(0).element(1).is_null());
+  EXPECT_EQ(inner.field(0).element(1).type()->AsEnum()->enum_descriptor(),
+            copy_enum);
+  EXPECT_EQ(inner.field(1).type()->AsProto()->descriptor(), copy_proto);
+  EXPECT_EQ(inner.field(1).ToCord(), absl::Cord(simple.SerializeAsString()));
+  EXPECT_EQ(copied.type()->AsStruct()->field(1).type->AsStruct()->field(0).name,
+            "a");
+
+  // NULLs of each rebuilt kind keep their kind and take the copy's types.
+  for (const googlesql::Value& null :
+       {googlesql::Value::Null(enum_type), googlesql::Value::Null(proto_type),
+        googlesql::Value::Null(array_type), googlesql::Value::Null(inner_type),
+        googlesql::Value::Null(outer_type)}) {
+    GOOGLESQL_ASSERT_OK_AND_ASSIGN(googlesql::Value copied_null,
+                                   copy_value(null));
+    EXPECT_TRUE(copied_null.is_null());
+    EXPECT_TRUE(copied_null.type()->Equivalent(null.type()));
+    EXPECT_NE(copied_null.type(), null.type());
+  }
+  // Values of static types are returned as they are.
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(googlesql::Value copied_int,
+                                 copy_value(googlesql::values::NullInt64()));
+  EXPECT_TRUE(copied_int.is_null());
+  EXPECT_EQ(copied_int.type(), googlesql::types::Int64Type());
 }
 
 // Sequence counters are not versioned, and a transaction draws from one when
