@@ -89,6 +89,9 @@ class Session {
 
   const bool multiplexed() const { return multiplexed_; }
 
+  // Returns the database this session is attached to.
+  const std::shared_ptr<Database>& database() const { return database_; }
+
   // Return the time this session was last used.
   absl::Time approximate_last_use_time() const ABSL_LOCKS_EXCLUDED(mu_) {
     absl::MutexLock lock(&mu_);

@@ -145,8 +145,8 @@ absl::StatusOr<std::shared_ptr<Transaction>> Session::CreateMultiUseTransaction(
       return error::Internal(
           "Transaction manager is null on a multiplexed session");
     }
-    GOOGLESQL_RETURN_IF_ERROR(mux_txn_manager_->AddToCurrentTransactions(
-        txn, database_->database_uri(), txn->id()));
+    GOOGLESQL_RETURN_IF_ERROR(
+        mux_txn_manager_->AddToCurrentTransactions(txn, database_, txn->id()));
     // If the last clear time is older than staleness duration, clear the txn
     // map.
     mux_txn_manager_->MaybeClearOldTransactions();
@@ -247,7 +247,7 @@ absl::StatusOr<std::shared_ptr<Transaction>> Session::FindAndUseTransaction(
   absl::MutexLock lock(mu_);
   if (multiplexed_) {
     return mux_txn_manager_->GetCurrentTransactionOnMultiplexedSession(
-        database_->database_uri(), id);
+        *database_, id);
   }
   if (id == backend::kInvalidTransactionID) {
     return error::InvalidTransactionID(backend::kInvalidTransactionID);

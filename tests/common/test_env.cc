@@ -27,6 +27,8 @@
 #include "google/spanner/v1/spanner.grpc.pb.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "frontend/server/server.h"
 #include "googlesql/base/status_macros.h"
 #include "grpcpp/channel.h"
@@ -80,6 +82,9 @@ TestEnv::~TestEnv() {
 void TestEnv::SetupServer() {
   frontend::Server::Options options;
   options.server_address = "localhost:0";
+  options.system_now = [this] {
+    return absl::Now() + absl::Microseconds(clock_offset_micros_.load());
+  };
   server_ = frontend::Server::Create(options);
   GOOGLESQL_VLOG(server_ != nullptr);  // Crash ok
   ASSERT_EQ(server_->host(), "localhost");

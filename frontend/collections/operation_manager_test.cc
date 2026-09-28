@@ -16,6 +16,7 @@
 
 #include "frontend/collections/operation_manager.h"
 
+#include <memory>
 #include <string>
 
 #include "gmock/gmock.h"
@@ -23,6 +24,8 @@
 #include "googlesql/base/testing/status_matchers.h"
 #include "tests/common/proto_matchers.h"
 #include "absl/strings/match.h"
+#include "absl/time/clock.h"
+#include "frontend/entities/database.h"
 #include "frontend/entities/operation.h"
 
 namespace google {
@@ -136,6 +139,37 @@ TEST_F(OperationManagerTest, ListsOperationsWithSimilarInstanceURI) {
   operations[0]->ToProto(&operation_pb);
   EXPECT_EQ("projects/test-project/instances/test-instance-a/operations/1",
             operation_pb.name());
+}
+
+TEST_F(OperationManagerTest, DeleteDatabaseOperationsKeepsOtherDatabases) {
+  const std::string uri = "projects/1/instances/2/databases/db";
+  auto database = std::make_shared<Database>(uri, nullptr, absl::Now());
+  // Another database with a similar URI, and one re-created under the same.
+  auto similar = std::make_shared<Database>(uri + "2", nullptr, absl::Now());
+  auto recreated = std::make_shared<Database>(uri, nullptr, absl::Now());
+  GOOGLESQL_ASSERT_OK(manager()->CreateDatabaseOperation(database, "a"));
+  GOOGLESQL_ASSERT_OK(manager()->CreateDatabaseOperation(database, ""));
+  GOOGLESQL_ASSERT_OK(manager()->CreateDatabaseOperation(similar, "a"));
+
+  manager()->DeleteDatabaseOperations(recreated);
+  EXPECT_THAT(manager()->ListOperations(uri + "/operations/"),
+              googlesql_base::testing::IsOkAndHolds(testing::SizeIs(2)));
+  manager()->DeleteDatabaseOperations(database);
+
+  EXPECT_THAT(manager()->ListOperations(uri + "/operations/"),
+              googlesql_base::testing::IsOkAndHolds(testing::IsEmpty()));
+  GOOGLESQL_EXPECT_OK(manager()->GetOperation(uri + "2/operations/a"));
+}
+
+TEST_F(OperationManagerTest, RefusesOperationsOfDroppedDatabase) {
+  const std::string uri = "projects/1/instances/2/databases/db";
+  auto database = std::make_shared<Database>(uri, nullptr, absl::Now());
+  database->MarkDropped();
+
+  EXPECT_THAT(manager()->CreateDatabaseOperation(database, "a"),
+              googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(manager()->GetOperation(uri + "/operations/a"),
+              googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
 }
 
 }  // namespace frontend

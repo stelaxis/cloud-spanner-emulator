@@ -26,7 +26,9 @@
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/strings/substitute.h"
 #include "absl/synchronization/mutex.h"
 #include "backend/schema/graph/schema_graph_editor.h"
@@ -132,6 +134,13 @@ void Sequence::ResetSequenceLastValue() const {
   } else {
     Sequence::SequenceLastValues[id_] = kSequenceDefaultStartWith;
   }
+}
+
+void Sequence::RemoveSequenceCountersWithIdPrefix(absl::string_view prefix) {
+  absl::MutexLock lock(SequenceMutex);
+  absl::erase_if(Sequence::SequenceLastValues, [prefix](const auto& entry) {
+    return absl::StartsWith(entry.first, prefix);
+  });
 }
 
 void Sequence::RemoveSequenceFromLastValuesMap() const {

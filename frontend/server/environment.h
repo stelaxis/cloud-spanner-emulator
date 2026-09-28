@@ -17,7 +17,9 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_FRONTEND_SERVER_ENV_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_FRONTEND_SERVER_ENV_H_
 
+#include <functional>
 #include <memory>
+#include <utility>
 
 #include "common/clock.h"
 #include "frontend/collections/database_manager.h"
@@ -35,8 +37,10 @@ namespace frontend {
 // ServerEnv encapsulates global objects for Cloud Spanner Emulator.
 class ServerEnv {
  public:
-  ServerEnv()
-      : clock_(new Clock()),
+  ServerEnv() : ServerEnv(std::make_unique<Clock>()) {}
+
+  explicit ServerEnv(std::unique_ptr<Clock> clock)
+      : clock_(std::move(clock)),
         database_manager_(new DatabaseManager(clock_.get())),
         instance_manager_(new InstanceManager()),
         instance_partition_manager_(new InstancePartitionManager()),
@@ -56,6 +60,15 @@ class ServerEnv {
     return mux_txn_manager_.get();
   }
 
+  // Runs in every DeleteDatabase once it has picked the database to drop,
+  // before it releases anything. For tests; set before concurrent use.
+  void set_drop_database_hook_for_testing(std::function<void()> hook) {
+    drop_database_hook_ = std::move(hook);
+  }
+  const std::function<void()>& drop_database_hook() const {
+    return drop_database_hook_;
+  }
+
  private:
   std::unique_ptr<Clock> clock_;
   std::unique_ptr<DatabaseManager> database_manager_;
@@ -64,6 +77,7 @@ class ServerEnv {
   std::unique_ptr<OperationManager> operation_manager_;
   std::unique_ptr<SessionManager> session_manager_;
   std::unique_ptr<MultiplexedSessionTransactionManager> mux_txn_manager_;
+  std::function<void()> drop_database_hook_;
 };
 
 }  // namespace frontend

@@ -221,10 +221,12 @@ class SchemaUpdaterImpl {
       TableIDGenerator* table_id_generator,
       ColumnIDGenerator* column_id_generator, Storage* storage,
       absl::Time schema_change_ts, PgOidAssigner* pg_oid_assigner,
-      const Schema* existing_schema, std::string_view database_id) {
+      const Schema* existing_schema, std::string_view database_id,
+      std::string_view sequence_id_prefix) {
     SchemaUpdaterImpl impl(type_factory, table_id_generator,
                            column_id_generator, storage, schema_change_ts,
-                           pg_oid_assigner, existing_schema, database_id);
+                           pg_oid_assigner, existing_schema, database_id,
+                           sequence_id_prefix);
     GOOGLESQL_RETURN_IF_ERROR(impl.Init());
     return impl;
   }
@@ -245,7 +247,8 @@ class SchemaUpdaterImpl {
                     TableIDGenerator* table_id_generator,
                     ColumnIDGenerator* column_id_generator, Storage* storage,
                     absl::Time schema_change_ts, PgOidAssigner* pg_oid_assigner,
-                    const Schema* existing_schema, std::string_view database_id)
+                    const Schema* existing_schema, std::string_view database_id,
+                    std::string_view sequence_id_prefix)
       : type_factory_(type_factory),
         table_id_generator_(table_id_generator),
         column_id_generator_(column_id_generator),
@@ -254,7 +257,8 @@ class SchemaUpdaterImpl {
         latest_schema_(existing_schema),
         editor_(nullptr),
         pg_oid_assigner_(pg_oid_assigner),
-        database_id_(database_id) {}
+        database_id_(database_id),
+        sequence_id_prefix_(sequence_id_prefix) {}
 
   // Initializes potentially failing components after construction.
   absl::Status Init();
@@ -758,6 +762,9 @@ class SchemaUpdaterImpl {
 
   // Holds the database id for this schema updater.
   std::string database_id_;
+
+  // See SchemaChangeContext::sequence_id_prefix.
+  std::string sequence_id_prefix_;
 
   std::vector<TableID> dropped_tables_;
   std::vector<std::pair<TableID, ColumnID>> dropped_columns_;
@@ -4967,10 +4974,8 @@ absl::StatusOr<const Sequence*> SchemaUpdaterImpl::CreateSequence(
   }
   builder.set_name(create_sequence.sequence_name());
   absl::BitGen bitgen;
-  builder.set_id(absl::StrCat(
-      "seq_",
-      googlesql::functions::GenerateUuid(bitgen)
-      ));
+  builder.set_id(absl::StrCat(sequence_id_prefix_,
+                              googlesql::functions::GenerateUuid(bitgen)));
   ::google::protobuf::RepeatedPtrField<ddl::SetOption> clause_options;
   if (dialect == database_api::DatabaseDialect::GOOGLE_STANDARD_SQL) {
     bool created_from_syntax = create_sequence.has_type() ||
@@ -6946,7 +6951,8 @@ SchemaUpdater::ValidateSchemaFromDDL(
                        context.type_factory, context.table_id_generator,
                        context.column_id_generator, context.storage,
                        context.schema_change_timestamp, context.pg_oid_assigner,
-                       existing_schema, context.database_id));
+                       existing_schema, context.database_id,
+                       context.sequence_id_prefix));
   context.pg_oid_assigner->BeginAssignment();
   GOOGLESQL_ASSIGN_OR_RETURN(pending_work_,
                    updater.ApplyDDLStatements(schema_change_operation));
@@ -6981,7 +6987,8 @@ absl::StatusOr<SchemaChangeResult> SchemaUpdater::UpdateSchemaFromDDL(
                        context.type_factory, context.table_id_generator,
                        context.column_id_generator, context.storage,
                        context.schema_change_timestamp, context.pg_oid_assigner,
-                       existing_schema, context.database_id));
+                       existing_schema, context.database_id,
+                       context.sequence_id_prefix));
   context.pg_oid_assigner->BeginAssignment();
   GOOGLESQL_ASSIGN_OR_RETURN(pending_work_,
                    updater.ApplyDDLStatements(schema_change_operation));

@@ -16,6 +16,8 @@
 
 #include "backend/database/database.h"
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <thread>  // NOLINT
 #include <utility>
@@ -56,6 +58,8 @@
 #include "googlesql/base/logging.h"
 #include "googlesql/base/status_macros.h"
 #include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
+#include "backend/schema/catalog/sequence.h"
 
 namespace google {
 namespace spanner {
@@ -65,7 +69,14 @@ namespace backend {
 // TransactionIDGenerator is initialized to 1 because 0 is used as a sentinel
 // value for an invalid transaction.
 Database::Database()
-    : transaction_id_generator_(absl::ToUnixMicros(absl::Now())) {}
+    : transaction_id_generator_(absl::ToUnixMicros(absl::Now())) {
+  static std::atomic<int64_t> next_database = 0;
+  sequence_id_prefix_ = absl::StrCat("seq_db", next_database++, "_");
+}
+
+Database::~Database() {
+  Sequence::RemoveSequenceCountersWithIdPrefix(sequence_id_prefix_);
+}
 
 std::unique_ptr<Database> Database::New(
     Clock* clock, std::string_view database_id,
@@ -249,6 +260,7 @@ SchemaChangeContext Database::GetSchemaChangeContext() {
       .storage = storage_.get(),
       .pg_oid_assigner = pg_oid_assigner_.get(),
       .database_id = database_id_,
+      .sequence_id_prefix = sequence_id_prefix_,
   };
 }
 

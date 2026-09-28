@@ -34,6 +34,7 @@
 #include "google/spanner/v1/spanner.pb.h"
 #include "google/spanner/v1/transaction.pb.h"
 #include "absl/memory/memory.h"
+#include "common/clock.h"
 #include "common/constants.h"
 #include "common/errors.h"
 #include "common/limits.h"
@@ -315,7 +316,10 @@ Server::Server(std::unique_ptr<ServerEnv> env)
 
 // Server lifecycle methods.
 std::unique_ptr<Server> Server::Create(const Server::Options& options) {
-  auto env = std::make_unique<ServerEnv>();
+  auto env = options.system_now
+                 ? std::make_unique<ServerEnv>(
+                       std::make_unique<Clock>(options.system_now))
+                 : std::make_unique<ServerEnv>();
   std::unique_ptr<Server> server = absl::WrapUnique(new Server(std::move(env)));
   ::grpc::ServerBuilder builder;
 
