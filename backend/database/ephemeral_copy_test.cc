@@ -28,6 +28,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/cord.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
@@ -43,6 +44,7 @@
 #include "backend/query/query_context.h"
 #include "backend/query/query_engine.h"
 #include "backend/schema/catalog/sequence.h"
+#include "backend/schema/catalog/table.h"
 #include "backend/schema/updater/schema_updater.h"
 #include "backend/transaction/options.h"
 #include "backend/transaction/read_only_transaction.h"
@@ -50,11 +52,14 @@
 #include "common/clock.h"
 #include "common/feature_flags.h"
 #include "gmock/gmock.h"
+#include "google/protobuf/descriptor.h"
+#include "google/protobuf/descriptor.pb.h"
 #include "googlesql/base/testing/status_matchers.h"
 #include "googlesql/public/value.h"
 #include "gtest/gtest.h"
 #include "tests/common/proto_matchers.h"
 #include "tests/common/scoped_feature_flags_setter.h"
+#include "tests/common/test.pb.h"
 
 namespace google {
 namespace spanner {
@@ -582,6 +587,155 @@ TEST_F(EphemeralCopyTest, CopiesPostgresqlDatabases) {
       UpdateSchema(copy.get(), "CREATE TABLE u (k bigint primary key)"));
   EXPECT_NE(copy->get_pg_oid_assigner()->next_postgresql_oid(),
             base->get_pg_oid_assigner()->next_postgresql_oid());
+}
+
+std::string TestProtoDescriptors() {
+  google::protobuf::FileDescriptorSet files;
+  ::emulator::tests::common::Simple::descriptor()->file()->CopyTo(
+      files.add_file());
+  return files.SerializeAsString();
+}
+
+// Proto and enum values, in cells, arrays and keys, take the copy's types:
+// they must not depend on the base's proto bundle, which the base frees once
+// a schema change removes it and its schema versions expire.
+TEST_F(EphemeralCopyTest, ProtoAndEnumValuesTakeTheCopysTypes) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<Database> base,
+      Database::Create(
+          &clock_, kDatabaseId,
+          SchemaChangeOperation{
+              .statements =
+                  {"CREATE PROTO BUNDLE (emulator.tests.common.Simple, "
+                   "emulator.tests.common.TestEnum)",
+                   "CREATE TABLE T (k INT64 NOT NULL, "
+                   "e emulator.tests.common.TestEnum, "
+                   "p emulator.tests.common.Simple, "
+                   "a ARRAY<emulator.tests.common.TestEnum>) PRIMARY KEY (k)",
+                   "CREATE TABLE K (e emulator.tests.common.TestEnum NOT NULL, "
+                   "v INT64) PRIMARY KEY (e)"},
+              .proto_descriptor_bytes = TestProtoDescriptors()}));
+  const Table* table = base->GetLatestSchema()->FindTable("T");
+  const googlesql::EnumType* enum_type =
+      table->FindColumn("e")->GetType()->AsEnum();
+  const googlesql::ProtoType* proto_type =
+      table->FindColumn("p")->GetType()->AsProto();
+  const googlesql::ArrayType* array_type =
+      table->FindColumn("a")->GetType()->AsArray();
+  ::emulator::tests::common::Simple simple;
+  simple.set_field("hello");
+  Mutation m;
+  m.AddWriteOp(MutationOpType::kInsert, "T", {"k", "e", "p", "a"},
+               {{Int64(1), googlesql::Value::Enum(enum_type, 2),
+                 googlesql::Value::Proto(
+                     proto_type, absl::Cord(simple.SerializeAsString())),
+                 googlesql::Value::Array(
+                     array_type, {googlesql::Value::Enum(enum_type, 3)})}});
+  m.AddWriteOp(MutationOpType::kInsert, "K", {"e", "v"},
+               {{googlesql::Value::Enum(enum_type, 4), Int64(4)}});
+  GOOGLESQL_ASSERT_OK(Apply(base.get(), m));
+
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Database> copy,
+                                 Copy(base.get()));
+
+  // Every value read from the copy has the copy's descriptors.
+  const Table* copy_table = copy->GetLatestSchema()->FindTable("T");
+  const google::protobuf::EnumDescriptor* copy_enum =
+      copy_table->FindColumn("e")->GetType()->AsEnum()->enum_descriptor();
+  const google::protobuf::Descriptor* copy_proto =
+      copy_table->FindColumn("p")->GetType()->AsProto()->descriptor();
+  ASSERT_NE(copy_enum, enum_type->enum_descriptor());
+  auto read = [&](const std::string& table_name,
+                  std::vector<std::string> columns) {
+    std::unique_ptr<ReadOnlyTransaction> txn =
+        copy->CreateReadOnlyTransaction(ReadOnlyOptions()).value();
+    std::unique_ptr<RowCursor> cursor;
+    GOOGLESQL_EXPECT_OK(txn->Read(
+        ReadArg{
+            .table = table_name, .key_set = KeySet::All(), .columns = columns},
+        &cursor));
+    std::vector<googlesql::Value> values;
+    while (cursor->Next()) {
+      for (int i = 0; i < cursor->NumColumns(); ++i) {
+        values.push_back(cursor->ColumnValue(i));
+      }
+    }
+    return values;
+  };
+  std::vector<googlesql::Value> row = read("T", {"e", "p", "a"});
+  ASSERT_EQ(row.size(), 3);
+  EXPECT_EQ(row[0].type()->AsEnum()->enum_descriptor(), copy_enum);
+  EXPECT_EQ(row[1].type()->AsProto()->descriptor(), copy_proto);
+  EXPECT_EQ(row[2].elements()[0].type()->AsEnum()->enum_descriptor(),
+            copy_enum);
+  std::vector<googlesql::Value> key = read("K", {"e"});
+  ASSERT_EQ(key.size(), 1);
+  EXPECT_EQ(key[0].type()->AsEnum()->enum_descriptor(), copy_enum);
+
+  // The base drops the tables and the bundle; a later schema change frees
+  // the schemas that held it once they are past the retention period.
+  GOOGLESQL_ASSERT_OK(UpdateSchema(base.get(),
+                                   "ALTER DATABASE `test-db` SET OPTIONS "
+                                   "(version_retention_period = '1s')"));
+  GOOGLESQL_ASSERT_OK(UpdateSchema(base.get(), "DROP TABLE T"));
+  GOOGLESQL_ASSERT_OK(UpdateSchema(base.get(), "DROP TABLE K"));
+  GOOGLESQL_ASSERT_OK(UpdateSchema(base.get(), "DROP PROTO BUNDLE"));
+  absl::SleepFor(absl::Milliseconds(2100));
+  GOOGLESQL_ASSERT_OK(
+      UpdateSchema(base.get(), "CREATE TABLE X (k INT64) PRIMARY KEY (k)"));
+  GOOGLESQL_ASSERT_OK(
+      UpdateSchema(base.get(), "CREATE TABLE Y (k INT64) PRIMARY KEY (k)"));
+
+  EXPECT_THAT(Sql(copy.get(),
+                  "SELECT CAST(e AS STRING), p.field, CAST(a[OFFSET(0)] AS "
+                  "STRING) FROM T"),
+              IsOkAndHolds(ElementsAre(
+                  "\"TEST_ENUM_TWO\",\"hello\",\"TEST_ENUM_THREE\"")));
+  EXPECT_THAT(Sql(copy.get(), "SELECT CAST(e AS STRING), v FROM K"),
+              IsOkAndHolds(ElementsAre("\"TEST_ENUM_FOUR\",4")));
+}
+
+// Sequence counters are not versioned, and a transaction draws from one when
+// it evaluates a default, before it commits (Sequence::GetNextSequenceValue),
+// so no timestamp's rows match a counter exactly: an open transaction, or one
+// rolled back, leaves the counter ahead of the committed rows on any database.
+// The copy reads the counters after T, so they are at least what the rows at T
+// drew, and the copy never draws a value one of its rows holds. Here a base
+// commit after T draws one value: the copy lacks its row and skips its value.
+TEST_F(EphemeralCopyTest, SequenceCountersAreAtLeastTheRowsAtTheCopy) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Database> base,
+                                 Create({R"(CREATE SEQUENCE seq OPTIONS (
+                   sequence_kind = 'bit_reversed_positive'))",
+                                         R"(CREATE TABLE S (
+                   id INT64 DEFAULT (GET_NEXT_SEQUENCE_VALUE(SEQUENCE seq)),
+                   c INT64,
+                 ) PRIMARY KEY (id))"}));
+  auto draw = [&](Database* db, int64_t c) {
+    Mutation m;
+    m.AddWriteOp(MutationOpType::kInsert, "S", {"c"}, {{Int64(c)}});
+    return Apply(db, m);
+  };
+  GOOGLESQL_ASSERT_OK(draw(base.get(), 1));
+  base->set_ephemeral_copy_hook_for_testing(
+      [&](absl::Time) { GOOGLESQL_EXPECT_OK(draw(base.get(), 2)); });
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Database> copy,
+                                 base->CreateEphemeralCopy());
+  base->set_ephemeral_copy_hook_for_testing(nullptr);
+
+  EXPECT_THAT(Sql(copy.get(), "SELECT c FROM S"),
+              IsOkAndHolds(ElementsAre("1")));
+  GOOGLESQL_ASSERT_OK(draw(copy.get(), 3));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::vector<std::string> base_ids,
+      Sql(base.get(), "SELECT id FROM S ORDER BY c"));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::vector<std::string> copy_ids,
+      Sql(copy.get(), "SELECT id FROM S ORDER BY c"));
+  ASSERT_EQ(base_ids.size(), 2);
+  ASSERT_EQ(copy_ids.size(), 2);
+  EXPECT_EQ(copy_ids[0], base_ids[0]);
+  EXPECT_NE(copy_ids[1], base_ids[0]);
+  EXPECT_NE(copy_ids[1], base_ids[1]);
 }
 
 // A schema CopySchema cannot copy fails the copy; nothing of it remains.

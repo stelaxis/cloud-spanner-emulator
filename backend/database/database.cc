@@ -247,7 +247,16 @@ absl::StatusOr<std::unique_ptr<Database>> Database::CreateEphemeralCopy() {
       }
     }
   }
-  storage_->CopyAt(timestamp, columns, copy->storage_.get());
+  // Values take the copy's types, so they reference only the copy's
+  // descriptors: the base may free its proto bundle while the copy lives.
+  const ProtoBundle& proto_bundle = *schema_copy->proto_bundle();
+  googlesql::TypeFactory* type_factory = copy->type_factory_.get();
+  GOOGLESQL_RETURN_IF_ERROR(storage_->CopyAt(
+      timestamp, columns,
+      [&](const googlesql::Value& value) {
+        return CopyValue(value, type_factory, proto_bundle);
+      },
+      copy->storage_.get()));
 
   // Counters are not versioned. Read after T, each is at least what the rows
   // at T drew from it.

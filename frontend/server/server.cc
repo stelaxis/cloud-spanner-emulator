@@ -87,7 +87,6 @@ absl::Status Invoke(const std::string& service_name,
     return error::Internal(absl::StrCat("Could not find handler for ",
                                         service_name, ".", method_name));
   }
-  env->session_manager()->MaybeSweepEphemeralSessions();
   RequestContext ctx(env, grpc_ctx);
   absl::Status status =
       dynamic_cast<UnaryGRPCHandler<RequestT, ResponseT>*>(handler)->Run(
@@ -110,7 +109,6 @@ absl::Status Invoke(const std::string& service_name,
     return error::Internal(absl::StrCat("Could not find handler for ",
                                         service_name, ".", method_name));
   }
-  env->session_manager()->MaybeSweepEphemeralSessions();
   RequestContext ctx(env, grpc_ctx);
   absl::Status status =
       dynamic_cast<ServerStreamingGRPCHandler<RequestT, ResponseT>*>(handler)

@@ -69,16 +69,19 @@ class Session {
   };
 
   // An ephemeral session has `database`, a copy of `base_database` that no
-  // other session uses; other sessions have no base database.
+  // other session uses, and holds `reservation` until after the copy is
+  // destroyed; other sessions have neither.
   Session(const std::string& session_uri, const Labels& labels,
           const bool multiplexed, const absl::Time create_time,
           std::shared_ptr<Database> database,
           MultiplexedSessionTransactionManager* mux_txn_manager,
-          std::shared_ptr<Database> base_database = nullptr)
+          std::shared_ptr<Database> base_database = nullptr,
+          std::shared_ptr<void> reservation = nullptr)
       : session_uri_(session_uri),
         labels_(labels),
         create_time_(create_time),
         multiplexed_(multiplexed),
+        reservation_(std::move(reservation)),
         database_(database),
         base_database_(std::move(base_database)),
         mux_txn_manager_(mux_txn_manager) {}
@@ -177,6 +180,9 @@ class Session {
 
   // Whether this session is multiplexed.
   const bool multiplexed_;
+
+  // See the constructor. Declared before database_, so released after it.
+  const std::shared_ptr<void> reservation_;
 
   // The database to which this session is attached.
   std::shared_ptr<Database> database_;

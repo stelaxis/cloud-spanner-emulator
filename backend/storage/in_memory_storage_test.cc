@@ -851,7 +851,9 @@ TEST_F(InMemoryStorageTest, CopyAtCopiesTheRowsVisibleAtItsTimestamp) {
                                      {kColumnID}, {String("not-copied")}));
 
   InMemoryStorage copy;
-  storage_.CopyAt(t2, {{kTableId0, {kColumnID}}}, &copy);
+  GOOGLESQL_ASSERT_OK(storage_.CopyAt(
+      t2, {{kTableId0, {kColumnID}}},
+      [](const googlesql::Value& value) { return value; }, &copy));
 
   std::vector<googlesql::Value> values;
   GOOGLESQL_EXPECT_OK(copy.Lookup(t2, kTableId0, Key({Int64(1)}),

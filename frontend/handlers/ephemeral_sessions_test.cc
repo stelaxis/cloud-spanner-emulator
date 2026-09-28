@@ -443,11 +443,34 @@ TEST_F(EphemeralSessionTest, DeleteSessionFreesTheCopy) {
   EXPECT_THAT(GetSession(copy), StatusIs(absl::StatusCode::kNotFound));
 }
 
-// (g): an idle ephemeral session is deleted by the sweep of the next request,
-// whatever it asks for, and its copy freed outside the lock. Any request on
-// the session restarts its idle time.
-TEST_F(EphemeralSessionTest, IdleEphemeralSessionsAreSwept) {
-  GOOGLESQL_ASSERT_OK_AND_ASSIGN(std::string ordinary, CreateSession({}));
+// Waits, sending no request, until `copy` has been destroyed.
+bool AwaitDestroyed(const std::weak_ptr<Database>& copy,
+                    absl::Duration timeout) {
+  const absl::Time deadline = absl::Now() + timeout;
+  while (!copy.expired() && absl::Now() < deadline) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  return copy.expired();
+}
+
+// (g): an idle ephemeral session is deleted, and its copy freed outside the
+// lock, with no request at all: a test process that dies leaves nothing
+// behind.
+TEST_F(EphemeralSessionTest, IdleCopiesAreFreedWithoutRequests) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(std::string copy, CreateSession(kEphemeral));
+  CopyWatch watch = WatchCopy(copy);
+  test_env()->AdvanceClock(absl::Seconds(121));
+
+  // The sweeping thread runs every SessionManager::kSweepInterval.
+  EXPECT_TRUE(AwaitDestroyed(watch.copy, absl::Seconds(20)));
+  EXPECT_EQ(*watch.destroyed, 1);
+  EXPECT_EQ(EphemeralCount(), 0);
+}
+
+// (g): any request on an ephemeral session restarts its idle time.
+TEST_F(EphemeralSessionTest, RequestsKeepEphemeralSessionsAlive) {
+  test_env()->env()->session_manager()->set_sweep_interval_for_testing(
+      absl::Milliseconds(5));
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(std::string active, CreateSession(kEphemeral));
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(std::string idle, CreateSession(kEphemeral));
   CopyWatch active_watch = WatchCopy(active);
@@ -456,32 +479,26 @@ TEST_F(EphemeralSessionTest, IdleEphemeralSessionsAreSwept) {
   // Nothing reads from here on: reads would wait for the advanced clock.
   test_env()->AdvanceClock(absl::Seconds(90));
   GOOGLESQL_ASSERT_OK(GetSession(active));
-  EXPECT_FALSE(idle_watch.copy.expired());
   test_env()->AdvanceClock(absl::Seconds(40));
-  GOOGLESQL_ASSERT_OK(GetSession(ordinary));
 
-  EXPECT_TRUE(idle_watch.copy.expired());
+  EXPECT_TRUE(AwaitDestroyed(idle_watch.copy, absl::Seconds(10)));
   EXPECT_EQ(*idle_watch.destroyed, 1);
   EXPECT_FALSE(active_watch.copy.expired());
-  EXPECT_EQ(EphemeralCount(), 1);
   EXPECT_THAT(GetSession(idle), StatusIs(absl::StatusCode::kNotFound));
 
   test_env()->AdvanceClock(absl::Seconds(121));
-  GOOGLESQL_ASSERT_OK(GetSession(ordinary));
-  EXPECT_TRUE(active_watch.copy.expired());
+  EXPECT_TRUE(AwaitDestroyed(active_watch.copy, absl::Seconds(10)));
   EXPECT_EQ(*active_watch.destroyed, 1);
   EXPECT_EQ(EphemeralCount(), 0);
 }
 
 // (g): a lookup of an expired ephemeral session deletes it and frees its copy
-// outside the lock, before a sweep is due.
+// outside the lock, as for ordinary sessions, without waiting for a sweep.
 TEST_F(EphemeralSessionTest, LookupOfAnExpiredEphemeralSessionFreesTheCopy) {
+  test_env()->env()->session_manager()->set_sweep_interval_for_testing(
+      absl::Hours(1));
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(std::string copy, CreateSession(kEphemeral));
   CopyWatch watch = WatchCopy(copy);
-  // A sweep is due, and finds nothing expired; the next is 10 s later.
-  test_env()->AdvanceClock(SessionManager::kSweepInterval + absl::Seconds(1));
-  GOOGLESQL_ASSERT_OK(ListSessions().status());
-  ASSERT_FALSE(watch.copy.expired());
 
   config::set_ephemeral_session_idle_timeout(absl::Seconds(5));
   test_env()->AdvanceClock(absl::Seconds(6));
@@ -567,6 +584,25 @@ TEST_F(EphemeralSessionTest, OpenCopiesAreCapped) {
   EXPECT_EQ(batch.size(), 2);
   EXPECT_EQ(EphemeralCount(), 4);
   EXPECT_THAT(ListSessions(), IsOkAndHolds(testing::SizeIs(5)));
+}
+
+// (k): a copy counts until it is destroyed. A request in flight keeps a
+// deleted session, and its copy, alive; its place is not free before then.
+TEST_F(EphemeralSessionTest, CopiesCountUntilTheyAreDestroyed) {
+  config::set_max_ephemeral_sessions(1);
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(std::string first, CreateSession(kEphemeral));
+  // What a streaming query on the session holds while it runs.
+  std::shared_ptr<Session> in_flight = GetSessionObject(first);
+  std::weak_ptr<Database> copy = in_flight->database();
+
+  GOOGLESQL_ASSERT_OK(DeleteSession(first));
+  EXPECT_FALSE(copy.expired());
+  EXPECT_THAT(CreateSession(kEphemeral),
+              StatusIs(absl::StatusCode::kResourceExhausted));
+
+  in_flight.reset();
+  EXPECT_TRUE(copy.expired());
+  GOOGLESQL_EXPECT_OK(CreateSession(kEphemeral).status());
 }
 
 // (l): only the value "true" makes a session ephemeral.

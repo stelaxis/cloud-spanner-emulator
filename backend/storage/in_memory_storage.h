@@ -17,6 +17,7 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_IN_MEMORY_STORAGE_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_STORAGE_IN_MEMORY_STORAGE_H_
 
+#include <functional>
 #include <vector>
 
 #include "googlesql/public/value.h"
@@ -28,6 +29,7 @@
 #include "backend/storage/iterator.h"
 #include "backend/storage/storage.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 
 namespace google {
 namespace spanner {
@@ -90,10 +92,13 @@ class InMemoryStorage : public Storage {
 
   // Writes into the empty `destination`, as one version at `timestamp`, every
   // row of `columns`' tables that exists at `timestamp`, with the values its
-  // `columns` have then. Other tables and columns are not copied.
-  void CopyAt(
+  // `columns` have then. Other tables and columns are not copied. Every key
+  // column and cell value is written as `copy_value` returns it.
+  absl::Status CopyAt(
       absl::Time timestamp,
       const absl::flat_hash_map<TableID, std::vector<ColumnID>>& columns,
+      const std::function<absl::StatusOr<googlesql::Value>(
+          const googlesql::Value&)>& copy_value,
       InMemoryStorage* destination) const ABSL_LOCKS_EXCLUDED(mu_);
 
  private:

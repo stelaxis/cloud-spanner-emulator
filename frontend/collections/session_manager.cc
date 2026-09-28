@@ -19,6 +19,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>  // NOLINT
 #include <utility>
 #include <vector>
 
@@ -50,6 +51,44 @@ bool IsEphemeral(const Labels& labels) {
 
 }  // namespace
 
+SessionManager::SessionManager(Clock* clock)
+    : clock_(clock), sweeper_([this] { SweepLoop(); }) {}
+
+SessionManager::~SessionManager() {
+  {
+    absl::MutexLock lock(sweep_mu_);
+    stopping_ = true;
+  }
+  sweeper_.join();
+}
+
+void SessionManager::SweepLoop() {
+  while (true) {
+    {
+      absl::MutexLock lock(sweep_mu_);
+      const int64_t generation = sweep_generation_;
+      auto woken = [this, generation]() ABSL_NO_THREAD_SAFETY_ANALYSIS {
+        return stopping_ || sweep_generation_ != generation;
+      };
+      // Woken early only to stop or to take a new interval.
+      if (sweep_mu_.AwaitWithTimeout(absl::Condition(&woken),
+                                     sweep_interval_)) {
+        if (stopping_) {
+          return;
+        }
+        continue;
+      }
+    }
+    SweepEphemeralSessions();
+  }
+}
+
+void SessionManager::set_sweep_interval_for_testing(absl::Duration interval) {
+  absl::MutexLock lock(sweep_mu_);
+  sweep_interval_ = interval;
+  ++sweep_generation_;
+}
+
 bool SessionManager::Expired(const Session& session, absl::Time now) {
   const absl::Duration idle = now - session.approximate_last_use_time();
   if (session.ephemeral()) {
@@ -63,9 +102,6 @@ std::map<std::string, std::shared_ptr<Session>>::iterator
 SessionManager::EraseLocked(
     std::map<std::string, std::shared_ptr<Session>>::iterator itr,
     std::vector<std::shared_ptr<Session>>* released) {
-  if (itr->second->ephemeral()) {
-    --ephemeral_sessions_;
-  }
   released->push_back(std::move(itr->second));
   return session_map_.erase(itr);
 }
@@ -104,17 +140,24 @@ absl::StatusOr<std::shared_ptr<Session>> SessionManager::CreateSession(
 
 absl::StatusOr<std::shared_ptr<Session>> SessionManager::CreateEphemeralSession(
     const Labels& labels, std::shared_ptr<Database> database) {
+  if (database->dropped()) {
+    return error::DatabaseNotFound(database->database_uri());
+  }
+  // The copy's place, from before it is made until it is destroyed: the
+  // session owns the reservation and releases it after its database.
+  std::shared_ptr<void> reservation;
   {
-    absl::MutexLock lock(mu_);
-    if (database->dropped()) {
-      return error::DatabaseNotFound(database->database_uri());
-    }
+    absl::MutexLock lock(ephemeral_capacity_->mu);
     const int max_sessions = config::max_ephemeral_sessions();
-    if (ephemeral_sessions_ >= max_sessions) {
+    if (ephemeral_capacity_->used >= max_sessions) {
       return error::TooManyEphemeralSessions(max_sessions);
     }
-    // Reserves the copy's place while it is made without the lock.
-    ++ephemeral_sessions_;
+    ++ephemeral_capacity_->used;
+    reservation =
+        std::shared_ptr<void>(nullptr, [capacity = ephemeral_capacity_](void*) {
+          absl::MutexLock lock(capacity->mu);
+          --capacity->used;
+        });
   }
   // Released after mu_, like everything below.
   std::shared_ptr<Database> copy;
@@ -128,14 +171,12 @@ absl::StatusOr<std::shared_ptr<Session>> SessionManager::CreateEphemeralSession(
 
   absl::MutexLock lock(mu_);
   if (!backend_copy.ok()) {
-    --ephemeral_sessions_;
     return error::EphemeralSessionCopyFailed(database->database_uri(),
                                              backend_copy.status());
   }
   // As in CreateSession: a drop that swept the sessions meanwhile did not see
   // this one.
   if (database->dropped()) {
-    --ephemeral_sessions_;
     return error::DatabaseNotFound(database->database_uri());
   }
   const std::string session_uri = MakeSessionUri(
@@ -143,7 +184,7 @@ absl::StatusOr<std::shared_ptr<Session>> SessionManager::CreateEphemeralSession(
   auto session = std::make_shared<Session>(
       session_uri, labels, /*multiplexed=*/false,
       /*create_time=*/clock_->Now(), std::move(copy),
-      /*mux_txn_manager=*/nullptr, std::move(database));
+      /*mux_txn_manager=*/nullptr, std::move(database), std::move(reservation));
   session->set_approximate_last_use_time(clock_->Now());
   session_map_[session_uri] = session;
   return session;
@@ -241,22 +282,14 @@ absl::Status SessionManager::DeleteSession(const std::string& session_uri,
   return absl::OkStatus();
 }
 
-void SessionManager::MaybeSweepEphemeralSessions() {
-  const absl::Time now = clock_->Now();
-  const int64_t now_micros = absl::ToUnixMicros(now);
-  int64_t next_sweep_micros = next_sweep_micros_.load();
-  if (now_micros < next_sweep_micros ||
-      !next_sweep_micros_.compare_exchange_strong(
-          next_sweep_micros,
-          now_micros + absl::ToInt64Microseconds(kSweepInterval))) {
+void SessionManager::SweepEphemeralSessions() {
+  if (ephemeral_session_count() == 0) {
     return;
   }
+  const absl::Time now = clock_->Now();
   // Released after mu_.
   std::vector<std::shared_ptr<Session>> released;
   absl::MutexLock lock(mu_);
-  if (ephemeral_sessions_ == 0) {
-    return;
-  }
   for (auto itr = session_map_.begin(); itr != session_map_.end();) {
     if (itr->second->ephemeral() && Expired(*itr->second, now)) {
       itr = EraseLocked(itr, &released);
@@ -267,8 +300,8 @@ void SessionManager::MaybeSweepEphemeralSessions() {
 }
 
 int SessionManager::ephemeral_session_count() const {
-  absl::MutexLock lock(mu_);
-  return ephemeral_sessions_;
+  absl::MutexLock lock(ephemeral_capacity_->mu);
+  return ephemeral_capacity_->used;
 }
 
 }  // namespace frontend

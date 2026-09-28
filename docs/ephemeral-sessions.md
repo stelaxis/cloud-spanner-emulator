@@ -27,9 +27,17 @@ commit with a timestamp at or before T to finish, and copies, as of T:
   error messages read as they do on the base;
 * every row committed at or before T, in tables, index data and change stream
   tables. A commit is in the copy whole or not at all;
-* the counters of sequences and identity columns, so the copy draws the values
-  the base would draw next, and never one that a copied row holds. The copy's
-  and the base's counters are independent from then on.
+* the counters of sequences and identity columns, so the copy never draws a
+  value that a copied row holds. The copy's and the base's counters are
+  independent from then on. Counters are not versioned, and a transaction
+  draws from one before it commits, so no timestamp's rows match a counter
+  exactly: the emulator reads them after T, so they are at least what the
+  rows at T drew. A value drawn by a transaction that commits after T is
+  skipped by the copy, as a value drawn by a transaction that rolls back is
+  skipped by the base.
+
+Proto and enum values take the copy's own types, so the copy stays readable
+when the base drops its proto bundle.
 
 The copy's table, column and PostgreSQL OID counters continue from the base's,
 so a schema change applied to both assigns the same IDs.
@@ -53,10 +61,10 @@ while a copy of it is being made.
 * An ephemeral session idle for `--ephemeral_session_idle_timeout_seconds`
   (default 120) expires; any call on the session restarts the idle time.
   Upstream expires sessions only when they are looked up, so the copies of a
-  test run that was killed would stay. The emulator therefore also sweeps: at
-  most every 10 seconds of emulator time, the first request of any kind deletes
-  every expired ephemeral session. Ordinary sessions keep upstream's lazy
-  expiry after an hour idle (28 days for multiplexed ones).
+  test run that was killed would stay. A background thread therefore deletes
+  every expired ephemeral session every 10 seconds, whether or not requests
+  arrive. Ordinary sessions keep upstream's lazy expiry after an hour idle (28
+  days for multiplexed ones).
 * `DropDatabase` of the base deletes its ephemeral sessions and their copies.
   A database created again under the same name does not bring them back: they
   are tied to the dropped database object, not to its name.
@@ -66,9 +74,11 @@ emulator keeps serving sessions while it is freed.
 
 ## Limits
 
-* At most `--max_ephemeral_sessions` (default 256) ephemeral sessions, and so
-  copies, exist at once, including those being created. One more fails with
-  `RESOURCE_EXHAUSTED`; a `BatchCreateSessions` that does not fit fails whole.
+* At most `--max_ephemeral_sessions` (default 256) copies exist at once,
+  including those being created. A copy counts until it is destroyed: a
+  request in flight on a deleted or expired session keeps it, and its place,
+  until the request ends. One more fails with `RESOURCE_EXHAUSTED`; a
+  `BatchCreateSessions` that does not fit fails whole.
   Copies do not count towards `--override_max_databases_per_instance`, and
   ordinary sessions are not limited.
 * Multiplexed ephemeral sessions are refused with `INVALID_ARGUMENT`: the

@@ -241,6 +241,36 @@ absl::StatusOr<std::unique_ptr<const Schema>> CopySchema(
       database_id);
 }
 
+absl::StatusOr<googlesql::Value> CopyValue(const googlesql::Value& value,
+                                           googlesql::TypeFactory* type_factory,
+                                           const ProtoBundle& proto_bundle) {
+  if (!value.is_valid() || IsStaticType(value.type())) {
+    return value;
+  }
+  GOOGLESQL_ASSIGN_OR_RETURN(
+      const googlesql::Type* type,
+      CopyType(value.type(), type_factory, proto_bundle));
+  if (value.is_null()) {
+    return googlesql::Value::Null(type);
+  }
+  if (type->IsEnum()) {
+    return googlesql::Value::Enum(type->AsEnum(), value.enum_value());
+  }
+  if (type->IsProto()) {
+    return googlesql::Value::Proto(type->AsProto(), value.ToCord());
+  }
+  std::vector<googlesql::Value> parts;
+  for (const googlesql::Value& part :
+       type->IsArray() ? value.elements() : value.fields()) {
+    GOOGLESQL_ASSIGN_OR_RETURN(parts.emplace_back(),
+                               CopyValue(part, type_factory, proto_bundle));
+  }
+  if (type->IsArray()) {
+    return googlesql::Value::MakeArray(type->AsArray(), std::move(parts));
+  }
+  return googlesql::Value::MakeStruct(type->AsStruct(), std::move(parts));
+}
+
 SchemaCreateCache* SchemaCreateCache::Global() {
   if (global_overridden.load()) {
     return global_for_testing.load();

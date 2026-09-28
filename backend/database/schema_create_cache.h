@@ -34,6 +34,7 @@
 #include "absl/time/time.h"
 #include "backend/schema/catalog/schema.h"
 #include "backend/schema/updater/schema_updater.h"
+#include "googlesql/public/value.h"
 
 namespace google {
 namespace spanner {
@@ -55,6 +56,16 @@ absl::StatusOr<std::unique_ptr<const Schema>> CopySchema(
     const Schema& schema, googlesql::TypeFactory* type_factory,
     std::string_view database_id, std::string_view sequence_id_prefix,
     std::optional<absl::Time> now);
+
+// Returns `value` with its type as `CopySchema` copies it: a type that a type
+// factory owns is rebuilt in `type_factory`, with the proto and enum
+// descriptors of `proto_bundle`, within arrays and structs too. The copy's
+// values then depend only on the copy's schema, not on the schema, proto
+// bundle or type factory `value` came from. Values of other types are
+// returned as they are.
+absl::StatusOr<googlesql::Value> CopyValue(const googlesql::Value& value,
+                                           googlesql::TypeFactory* type_factory,
+                                           const ProtoBundle& proto_bundle);
 
 // Remembers the schemas that CreateDatabase built from DDL, so that a later
 // CreateDatabase with the same request copies the schema (CopySchema) instead
