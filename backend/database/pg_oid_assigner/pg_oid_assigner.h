@@ -94,6 +94,20 @@ class PgOidAssigner {
     return absl::OkStatus();
   }
 
+  // The next OID to assign, or nullopt if OIDs are not assigned.
+  std::optional<uint32_t> next_postgresql_oid() const {
+    return enabled_ ? std::optional<uint32_t>(next_postgresql_oid_)
+                    : std::nullopt;
+  }
+
+  // Continues from `next_postgresql_oid`, for a database whose schema is a
+  // copy of one that was assigned OIDs below it.
+  void SetNextPostgresqlOid(uint32_t next_postgresql_oid) {
+    if (!enabled_) return;
+    next_postgresql_oid_ = next_postgresql_oid;
+    tentative_next_postgresql_oid_ = next_postgresql_oid;
+  }
+
   uint32_t TEST_next_postgresql_oid() { return next_postgresql_oid_; }
 
   uint32_t TEST_tentative_next_postgresql_oid() {

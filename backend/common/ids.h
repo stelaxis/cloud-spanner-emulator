@@ -50,8 +50,19 @@ class UniqueIdGenerator {
     return IdType{next_seq_++};
   }
 
+  // The sequence number the next ID gets.
+  int64_t next_seq() const ABSL_LOCKS_EXCLUDED(mu_) {
+    absl::MutexLock lock(&mu_);
+    return next_seq_;
+  }
+
+  void set_next_seq(int64_t next_seq) ABSL_LOCKS_EXCLUDED(mu_) {
+    absl::MutexLock lock(&mu_);
+    next_seq_ = next_seq;
+  }
+
  private:
-  absl::Mutex mu_;
+  mutable absl::Mutex mu_;
   int64_t next_seq_ ABSL_GUARDED_BY(mu_);
 };
 

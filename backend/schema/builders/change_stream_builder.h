@@ -219,6 +219,11 @@ class ChangeStream::Editor {
     return *this;
   }
 
+  Editor& set_creation_time(absl::Time creation_time) {
+    instance_->creation_time_ = creation_time;
+    return *this;
+  }
+
  private:
   // Not owned.
   ChangeStream* instance_;

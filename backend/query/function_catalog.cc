@@ -16,10 +16,12 @@
 
 #include "backend/query/function_catalog.h"
 
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -46,6 +48,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/strings/strip.h"
 #include "absl/strings/substitute.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "backend/common/case.h"
 #include "backend/query/analyzer_options.h"
@@ -609,11 +612,75 @@ FunctionCatalog::LoadLatestSchemaForEvaluation() const {
   return schema;
 }
 
+// Functions that depend only on the SharedFunctions key.
+struct FunctionCatalog::SharedFunctions {
+  // Owns the types of the functions below. Never destroyed (see
+  // GetSharedFunctions), so types that analysis copies into a schema, such as
+  // a view column's type, stay valid.
+  googlesql::TypeFactory type_factory;
+  CaseInsensitiveStringMap<std::unique_ptr<googlesql::Function>> functions;
+  CaseInsensitiveStringMap<std::unique_ptr<googlesql::TableValuedFunction>>
+      table_valued_functions;
+};
+
+namespace {
+
+std::atomic<bool> sharing_enabled{true};
+
+// At most this many distinct keys share functions; catalogs of further keys
+// build their own. Each set takes a few MB. Outside tests the flags are set
+// once, so there are at most a few keys.
+constexpr int kMaxSharedFunctionSets = 8;
+
+static_assert(std::has_unique_object_representations_v<
+                  EmulatorFeatureFlags::Flags>,
+              "SharedFunctionsKey compares the flags' bytes");
+
+// Everything the functions of a SharedFunctions depend on.
+std::string SharedFunctionsKey(const std::string& catalog_name,
+                               database_api::DatabaseDialect dialect,
+                               const EmulatorFeatureFlags::Flags& flags) {
+  return absl::StrCat(
+      catalog_name, "/", static_cast<int>(dialect), "/",
+      absl::string_view(reinterpret_cast<const char*>(&flags), sizeof(flags)));
+}
+
+}  // namespace
+
+void FunctionCatalog::SetSharingEnabledForTesting(bool enabled) {
+  sharing_enabled = enabled;
+}
+
 FunctionCatalog::FunctionCatalog(googlesql::TypeFactory* type_factory,
                                  const std::string& catalog_name,
                                  const backend::Schema* schema)
     : catalog_name_(catalog_name) {
   SetLatestSchema(schema);
+  database_api::DatabaseDialect dialect =
+      schema != nullptr ? schema->dialect()
+                        : database_api::DatabaseDialect::GOOGLE_STANDARD_SQL;
+  shared_ = GetSharedFunctions(catalog_name, dialect);
+  if (shared_ == nullptr) {
+    BuildAllFunctions(type_factory, dialect);
+    schema_bound_functions_.clear();
+    return;
+  }
+  // The shared functions lack exactly these; see BuildSharedFunctions.
+  AddSequenceFunctions();
+  AddPGLambdaFunctions();
+  schema_bound_functions_.clear();
+}
+
+FunctionCatalog::FunctionCatalog(BuildAllTag,
+                                 googlesql::TypeFactory* type_factory,
+                                 const std::string& catalog_name,
+                                 database_api::DatabaseDialect dialect)
+    : catalog_name_(catalog_name) {
+  BuildAllFunctions(type_factory, dialect);
+}
+
+void FunctionCatalog::BuildAllFunctions(googlesql::TypeFactory* type_factory,
+                                        database_api::DatabaseDialect dialect) {
   // Add the subset of GoogleSQL built-in functions supported by Cloud Spanner.
   AddGoogleSQLBuiltInFunctions(type_factory);
   // Add Cloud Spanner specific functions.
@@ -624,8 +691,82 @@ FunctionCatalog::FunctionCatalog(googlesql::TypeFactory* type_factory,
   AddMlFunctions(type_factory);
   AddSpannerPGFunctions();
   AddPGLambdaFunctions();
-  AddSearchFunctions(type_factory);
+  AddSearchFunctions(type_factory, dialect);
   AddMockGraphAlgoFunctions(table_valued_functions_);
+}
+
+const FunctionCatalog::SharedFunctions* FunctionCatalog::GetSharedFunctions(
+    const std::string& catalog_name, database_api::DatabaseDialect dialect) {
+  if (!sharing_enabled) {
+    return nullptr;
+  }
+  // Entries are never removed: see SharedFunctions::type_factory.
+  static absl::Mutex mu(absl::kConstInit);
+  static auto* cache =
+      new absl::flat_hash_map<std::string,
+                              std::unique_ptr<const SharedFunctions>>();
+  const EmulatorFeatureFlags::Snapshot flags =
+      EmulatorFeatureFlags::instance().snapshot();
+  std::string key = SharedFunctionsKey(catalog_name, dialect, flags.flags);
+  absl::MutexLock lock(mu);
+  if (auto it = cache->find(key); it != cache->end()) {
+    return it->second.get();
+  }
+  if (cache->size() >= kMaxSharedFunctionSets) {
+    return nullptr;
+  }
+  if (before_shared_build_hook_ != nullptr) before_shared_build_hook_();
+  std::unique_ptr<const SharedFunctions> shared =
+      BuildSharedFunctions(catalog_name, dialect);
+  if (after_shared_build_hook_ != nullptr) after_shared_build_hook_();
+  // Flags written while building, even if changed back: the functions may not
+  // match the key.
+  if (EmulatorFeatureFlags::instance().snapshot().generation !=
+      flags.generation) {
+    return nullptr;
+  }
+  // A null entry records that this key cannot share.
+  const SharedFunctions* result = shared.get();
+  (*cache)[key] = std::move(shared);
+  return result;
+}
+
+std::unique_ptr<const FunctionCatalog::SharedFunctions>
+FunctionCatalog::BuildSharedFunctions(const std::string& catalog_name,
+                                      database_api::DatabaseDialect dialect) {
+  auto shared = std::make_unique<SharedFunctions>();
+  FunctionCatalog all(BuildAllTag{}, &shared->type_factory, catalog_name,
+                      dialect);
+  // The schema-bound functions evaluate against `all`'s schema. Each catalog
+  // adds its own instead, so they must be exactly the functions under their
+  // names once everything is built, and nothing else may be derived from
+  // them.
+  if (all.derived_from_schema_bound_) {
+    return nullptr;
+  }
+  for (const googlesql::Function* function : all.schema_bound_functions_) {
+    auto it = all.functions_.find(function->Name());
+    if (it == all.functions_.end() || it->second.get() != function) {
+      return nullptr;
+    }
+    all.functions_.erase(it);
+  }
+  shared->functions = std::move(all.functions_);
+  shared->table_valued_functions = std::move(all.table_valued_functions_);
+  return shared;
+}
+
+void FunctionCatalog::AddSchemaBoundFunction(
+    std::unique_ptr<googlesql::Function> function) {
+  schema_bound_functions_.insert(function.get());
+  std::string name = function->Name();
+  functions_[name] = std::move(function);
+}
+
+void FunctionCatalog::NoteDerivedFrom(const googlesql::Function* source) {
+  if (schema_bound_functions_.contains(source)) {
+    derived_from_schema_bound_ = true;
+  }
 }
 
 void FunctionCatalog::AddGoogleSQLBuiltInFunctions(
@@ -660,25 +801,19 @@ void FunctionCatalog::AddSpannerFunctions() {
   auto bit_reverse_func = BitReverseFunction(catalog_name_);
   functions_[bit_reverse_func->Name()] = std::move(bit_reverse_func);
 
-  auto get_internal_sequence_state_func =
-      GetInternalSequenceStateFunction(catalog_name_);
-  functions_[get_internal_sequence_state_func->Name()] =
-      std::move(get_internal_sequence_state_func);
+  AddSequenceFunctions();
+}
 
-  auto get_table_column_identity_state_func =
-      GetTableColumnIdentityStateFunction(catalog_name_);
-  functions_[get_table_column_identity_state_func->Name()] =
-      std::move(get_table_column_identity_state_func);
-
-  auto get_next_sequence_value_func =
-      GetNextSequenceValueFunction(catalog_name_);
-  functions_[get_next_sequence_value_func->Name()] =
-      std::move(get_next_sequence_value_func);
+void FunctionCatalog::AddSequenceFunctions() {
+  AddSchemaBoundFunction(GetInternalSequenceStateFunction(catalog_name_));
+  AddSchemaBoundFunction(GetTableColumnIdentityStateFunction(catalog_name_));
+  AddSchemaBoundFunction(GetNextSequenceValueFunction(catalog_name_));
 }
 
 void FunctionCatalog::AddGraphSafeToJsonSignatures() {
   auto it = functions_.find("safe_to_json");
   if (it != functions_.end()) {
+    NoteDerivedFrom(it->second.get());
     it->second->AddSignature(googlesql::FunctionSignature(
         googlesql::types::JsonType(),
         {googlesql::FunctionArgumentType(googlesql::ARG_KIND_EXPR_GRAPH_NODE)},
@@ -726,13 +861,8 @@ void FunctionCatalog::AddMlFunctions(googlesql::TypeFactory* type_factory) {
   }
 }
 
-void FunctionCatalog::AddSearchFunctions(googlesql::TypeFactory* type_factory) {
-  auto dialect = database_api::DatabaseDialect::GOOGLE_STANDARD_SQL;
-  std::shared_ptr<const backend::Schema> latest_schema = GetLatestSchema();
-  if (latest_schema != nullptr) {
-    dialect = latest_schema->dialect();
-  }
-
+void FunctionCatalog::AddSearchFunctions(googlesql::TypeFactory* type_factory,
+                                         database_api::DatabaseDialect dialect) {
   auto search_functions =
       query::search::GetSearchFunctions(type_factory, catalog_name_, dialect);
 
@@ -750,6 +880,7 @@ void FunctionCatalog::AddSpannerPGFunctions() {
     // If function exists, add extra signatures instead of overwriting.
     // Needed for JSONB.
     if (auto f = functions_.find(function->Name()); f != functions_.end()) {
+      NoteDerivedFrom(f->second.get());
       // Copy the existing options and add any evaluators if they exist.
       googlesql::FunctionOptions function_options =
           f->second->function_options().Copy();
@@ -782,9 +913,18 @@ void FunctionCatalog::AddSpannerPGFunctions() {
 
 void FunctionCatalog::GetFunction(const std::string& name,
                                   const googlesql::Function** output) const {
-  auto function_iter = functions_.find(name);
-  *output =
-      function_iter == functions_.end() ? nullptr : function_iter->second.get();
+  if (auto it = functions_.find(name); it != functions_.end()) {
+    *output = it->second.get();
+    return;
+  }
+  if (shared_ != nullptr) {
+    if (auto it = shared_->functions.find(name);
+        it != shared_->functions.end()) {
+      *output = it->second.get();
+      return;
+    }
+  }
+  *output = nullptr;
 }
 
 void FunctionCatalog::GetFunctions(
@@ -792,13 +932,29 @@ void FunctionCatalog::GetFunctions(
   for (const auto& [name, function] : functions_) {
     output->insert(function.get());
   }
+  if (shared_ != nullptr) {
+    for (const auto& [name, function] : shared_->functions) {
+      output->insert(function.get());
+    }
+  }
 }
 
 void FunctionCatalog::GetTableValuedFunction(
     const std::string& name,
     const googlesql::TableValuedFunction** output) const {
-  auto i = table_valued_functions_.find(name);
-  *output = i == table_valued_functions_.end() ? nullptr : i->second.get();
+  if (auto it = table_valued_functions_.find(name);
+      it != table_valued_functions_.end()) {
+    *output = it->second.get();
+    return;
+  }
+  if (shared_ != nullptr) {
+    if (auto it = shared_->table_valued_functions.find(name);
+        it != shared_->table_valued_functions.end()) {
+      *output = it->second.get();
+      return;
+    }
+  }
+  *output = nullptr;
 }
 
 void FunctionCatalog::AddFunctionAliases() {
@@ -807,6 +963,7 @@ void FunctionCatalog::AddFunctionAliases() {
   for (auto it = functions_.begin(); it != functions_.end(); ++it) {
     const googlesql::Function* original_function = it->second.get();
     if (!original_function->alias_name().empty()) {
+      NoteDerivedFrom(original_function);
       googlesql::FunctionOptions function_options =
           original_function->function_options();
       std::string alias_name = function_options.alias_name;
@@ -828,18 +985,11 @@ void FunctionCatalog::AddFunctionAliases() {
 void FunctionCatalog::AddPGLambdaFunctions() {
   // These date/timestamp PG functions need to use a lambda to access the
   // default time zone in the latest schema, so they need to be defined here.
-  auto to_char_function = GetPGToCharFunction(catalog_name_);
-  functions_[to_char_function->Name()] = std::move(to_char_function);
-  auto extract_function = GetPGExtractFunction(catalog_name_);
-  functions_[extract_function->Name()] = std::move(extract_function);
-  auto cast_to_timestamp_function = GetPGCastToTimestampFunction(catalog_name_);
-  functions_[cast_to_timestamp_function->Name()] =
-      std::move(cast_to_timestamp_function);
-  auto cast_to_string_function = GetPGCastToStringFunction(catalog_name_);
-  functions_[cast_to_string_function->Name()] =
-      std::move(cast_to_string_function);
-  auto date_trunc_function = GetPGDateTruncFunction(catalog_name_);
-  functions_[date_trunc_function->Name()] = std::move(date_trunc_function);
+  AddSchemaBoundFunction(GetPGToCharFunction(catalog_name_));
+  AddSchemaBoundFunction(GetPGExtractFunction(catalog_name_));
+  AddSchemaBoundFunction(GetPGCastToTimestampFunction(catalog_name_));
+  AddSchemaBoundFunction(GetPGCastToStringFunction(catalog_name_));
+  AddSchemaBoundFunction(GetPGDateTruncFunction(catalog_name_));
 }
 
 std::unique_ptr<googlesql::Function> FunctionCatalog::GetPGToCharFunction(
