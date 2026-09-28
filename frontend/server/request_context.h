@@ -55,6 +55,12 @@ absl::StatusOr<std::shared_ptr<Instance>> GetInstance(
 absl::StatusOr<std::shared_ptr<Database>> GetDatabase(
     RequestContext* ctx, const std::string& database_uri);
 
+// Deletes the database registered under `database_uri` and everything that
+// refers to it: all its sessions, idle or not, its multiplexed-session
+// transactions and its operations. Returns OK if no database is registered.
+absl::Status DeleteDatabase(RequestContext* ctx,
+                            const std::string& database_uri);
+
 // Checks if a session exists. Returns the Session entity or an error:
 //   InstanceNotFound if the instance is not found.
 //   DatabaseNotFound if the database is not found.

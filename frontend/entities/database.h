@@ -17,6 +17,7 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_FRONTEND_DATABASE_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_FRONTEND_DATABASE_H_
 
+#include <atomic>
 #include <string>
 
 #include "google/spanner/admin/database/v1/spanner_database_admin.pb.h"
@@ -50,6 +51,13 @@ class Database {
   // Returns the handle to the backend database.
   backend::Database* backend() const { return backend_.get(); }
 
+  // Set when the database is unregistered. Everything published for the
+  // database (sessions, multiplexed-session transactions, operations) checks
+  // it under the lock its drop-time sweep takes, so nothing is published
+  // after the sweep.
+  void MarkDropped() { dropped_.store(true); }
+  bool dropped() const { return dropped_.load(); }
+
   // Converts this database object to its proto representation.
   absl::Status ToProto(admin::database::v1::Database* database);
 
@@ -62,6 +70,8 @@ class Database {
 
   // The time at which this database was created.
   const absl::Time create_time_;
+
+  std::atomic<bool> dropped_ = false;
 };
 
 }  // namespace frontend

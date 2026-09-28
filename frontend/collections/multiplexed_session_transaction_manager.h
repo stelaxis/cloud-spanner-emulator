@@ -17,6 +17,7 @@
 #ifndef STORAGE_CLOUD_SPANNER_EMULATOR_FRONTEND_MULTIPLEXED_SESSION_TRANSACTION_MANAGER_H_
 #define STORAGE_CLOUD_SPANNER_EMULATOR_FRONTEND_MULTIPLEXED_SESSION_TRANSACTION_MANAGER_H_
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -26,6 +27,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "backend/common/ids.h"
+#include "frontend/entities/database.h"
 #include "frontend/entities/transaction.h"
 
 namespace google {
@@ -47,15 +49,29 @@ class MultiplexedSessionTransactionManager {
   MultiplexedSessionTransactionManager& operator=(
       const MultiplexedSessionTransactionManager&) = delete;
 
-  // Adds new transactions to the current transactions map.
+  // Adds new transactions to the current transactions map. The entry owns
+  // `database`, which the transaction points into. Returns DatabaseNotFound
+  // if `database` has been dropped.
   absl::Status AddToCurrentTransactions(std::shared_ptr<Transaction> txn,
-                                        const std::string& database_uri,
+                                        std::shared_ptr<Database> database,
                                         backend::TransactionID txn_id);
 
-  // Retrieve a transaction from the current transactions map.
+  // Retrieve a transaction of `database` from the current transactions map.
   absl::StatusOr<std::shared_ptr<Transaction>>
-  GetCurrentTransactionOnMultiplexedSession(const std::string& database_uri,
+  GetCurrentTransactionOnMultiplexedSession(const Database& database,
                                             backend::TransactionID txn_id);
+
+  // Runs `hook` with the transaction id at the start of every
+  // AddToCurrentTransactions. For tests; set before concurrent use.
+  void set_before_add_hook_for_testing(
+      std::function<void(backend::TransactionID)> hook) {
+    before_add_hook_ = std::move(hook);
+  }
+
+  // Removes every transaction of the given database object. Transactions of
+  // another database with the same URI are kept.
+  void RemoveDatabaseTransactions(const Database& database)
+      ABSL_LOCKS_EXCLUDED(mu_);
 
   // Called occasionally to clear old transactions.
   void ClearOldTransactions();
@@ -81,14 +97,20 @@ class MultiplexedSessionTransactionManager {
   }
 
  private:
+  struct Entry {
+    // Declared first, so it outlives the transaction.
+    std::shared_ptr<Database> database;
+    std::shared_ptr<Transaction> txn;
+  };
+
   mutable absl::Mutex mu_;
   // First string is the database uri.
-  std::map<std::pair<std::string, backend::TransactionID>,
-           std::shared_ptr<Transaction>>
+  std::map<std::pair<std::string, backend::TransactionID>, Entry>
       current_transactions_ ABSL_GUARDED_BY(mu_);
   // The last time the transactions were checked for staleness.
   absl::Time last_clear_time_ ABSL_GUARDED_BY(mu_);
   absl::Duration old_transaction_staleness_duration_;
+  std::function<void(backend::TransactionID)> before_add_hook_;
   absl::Duration staleness_check_duration_;
 
   // Evict a transaction from the current transactions map.

@@ -80,6 +80,7 @@ cc_test(
         "//backend/transaction:foreign_key_restrictions",
         "//backend/transaction:read_write_transaction",
         "//common:clock",
+        "//frontend/entities:database",
         "//frontend/entities:transaction",
         "//tests/common:proto_matchers",
         "//tests/common:test_schema_constructor",
@@ -126,6 +127,7 @@ cc_library(
     deps = [
         "//backend/common:ids",
         "//common:errors",
+        "//frontend/entities:database",
         "//frontend/entities:transaction",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/status",
@@ -241,6 +243,7 @@ cc_library(
     deps = [
         "//common:errors",
         "//frontend/common:uris",
+        "//frontend/entities:database",
         "//frontend/entities:operation",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/status",
@@ -257,11 +260,13 @@ cc_test(
     ],
     deps = [
         ":operation_manager",
+        "//frontend/entities:database",
         "//frontend/entities:operation",
         "//tests/common:proto_matchers",
         "@com_github_google_benchmark//:benchmark",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
         "@com_google_googlesql//googlesql/base/testing:status_matchers",
         "@com_google_googletest//:gtest_main",
     ],

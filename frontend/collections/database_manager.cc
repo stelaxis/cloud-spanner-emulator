@@ -123,15 +123,25 @@ absl::StatusOr<std::shared_ptr<Database>> DatabaseManager::GetDatabase(
 }
 
 absl::Status DatabaseManager::DeleteDatabase(const std::string& database_uri) {
+  return ReleaseDatabase(database_uri).status();
+}
+
+absl::StatusOr<std::shared_ptr<Database>> DatabaseManager::ReleaseDatabase(
+    const std::string& database_uri) {
   absl::MutexLock lock(mu_);
-  if (database_map_.erase(database_uri) > 0) {
-    absl::string_view project_id, instance_id, database_id;
-    GOOGLESQL_RETURN_IF_ERROR(ParseDatabaseUri(database_uri, &project_id, &instance_id,
-                                     &database_id));
-    std::string instance_uri = MakeInstanceUri(project_id, instance_id);
-    num_databases_per_instance_[instance_uri] -= 1;
+  auto itr = database_map_.find(database_uri);
+  if (itr == database_map_.end()) {
+    return nullptr;
   }
-  return absl::OkStatus();
+  absl::string_view project_id, instance_id, database_id;
+  GOOGLESQL_RETURN_IF_ERROR(
+      ParseDatabaseUri(database_uri, &project_id, &instance_id, &database_id));
+  std::string instance_uri = MakeInstanceUri(project_id, instance_id);
+  num_databases_per_instance_[instance_uri] -= 1;
+  std::shared_ptr<Database> database = std::move(itr->second);
+  database_map_.erase(itr);
+  database->MarkDropped();
+  return database;
 }
 
 absl::StatusOr<std::vector<std::shared_ptr<Database>>>
