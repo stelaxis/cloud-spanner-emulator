@@ -211,8 +211,8 @@ absl::StatusOr<std::unique_ptr<Database>> Database::CreateFromCache(
 absl::StatusOr<std::unique_ptr<Database>> Database::CreateEphemeralCopy() {
   // No schema change runs until the copy is done: none can drop or restart a
   // sequence between T and the copy of its counter, and the ID generators are
-  // not moving.
-  absl::MutexLock schema_change_lock(schema_change_mu_);
+  // not moving. Copies only read, so they share the lock.
+  absl::ReaderMutexLock schema_change_lock(schema_change_mu_);
   std::unique_ptr<Database> copy = New(clock_, database_id_, dialect_);
   const absl::Time timestamp = clock_->Now();
   if (ephemeral_copy_hook_ != nullptr) {

@@ -119,27 +119,31 @@ func runEphemeral(ctx context.Context, da *database.DatabaseAdminClient, opts []
 	}
 
 	if hold > 0 && pid > 0 {
-		time.Sleep(time.Second)
-		before := rssKB(pid)
-		var sessions []string
-		for i := 0; i < hold; i++ {
-			s, _, err := create()
-			if err != nil {
-				log.Fatal(err)
+		// Two rounds: freed copies stay in the allocator's free lists, so the
+		// second round shows whether their memory is reused.
+		for round := 1; round <= 2; round++ {
+			time.Sleep(time.Second)
+			before := rssKB(pid)
+			var sessions []string
+			for i := 0; i < hold; i++ {
+				s, _, err := create()
+				if err != nil {
+					log.Fatal(err)
+				}
+				sessions = append(sessions, s)
 			}
-			sessions = append(sessions, s)
-		}
-		time.Sleep(time.Second)
-		held := rssKB(pid)
-		for _, s := range sessions {
-			if err := remove(s); err != nil {
-				log.Fatal(err)
+			time.Sleep(time.Second)
+			held := rssKB(pid)
+			for _, s := range sessions {
+				if err := remove(s); err != nil {
+					log.Fatal(err)
+				}
 			}
+			time.Sleep(time.Second)
+			after := rssKB(pid)
+			fmt.Printf("round=%d hold=%d rss_before=%s rss_held=%s rss_after_delete=%s growth_per_copy=%.2fMiB\n",
+				round, hold, mib(before), mib(held), mib(after), float64(held-before)/1024/float64(hold))
 		}
-		time.Sleep(time.Second)
-		after := rssKB(pid)
-		fmt.Printf("hold=%d rss_before=%s rss_held=%s rss_after_delete=%s per_copy=%.2fMiB\n",
-			hold, mib(before), mib(held), mib(after), float64(held-before)/1024/float64(hold))
 	}
 	if err := da.DropDatabase(ctx, &databasepb.DropDatabaseRequest{Database: name}); err != nil {
 		log.Fatalf("drop database: %v", err)

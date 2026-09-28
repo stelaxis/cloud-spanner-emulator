@@ -89,7 +89,7 @@ class Database {
   // counters. The copy's IDs continue from this database's, and its commit
   // timestamps are greater than T. Reads of the copy before T see no rows.
   // Schema changes of this database wait while the copy is taken, and never
-  // reach the copy.
+  // reach the copy; copies of one database are taken concurrently.
   //
   // Fails, and copies nothing, with UNIMPLEMENTED if the schema cannot be
   // copied (CopySchema).

@@ -333,6 +333,50 @@ TEST_F(EphemeralCopyTest, CopiesTakenDuringCommitsHoldWholeCommits) {
   writer.join();
 }
 
+// Copies of one database are taken on several threads at once, while pairs of
+// rows are committed and schema changes run.
+TEST_F(EphemeralCopyTest, ConcurrentCopiesDuringCommitsAndSchemaChanges) {
+  std::unique_ptr<Database> base = CreateKv();
+  std::atomic<bool> stop = false;
+  std::thread writer([&] {
+    for (int64_t i = 0; !stop; ++i) {
+      // A schema change aborts the commits it overlaps.
+      absl::Status status =
+          Insert(base.get(), "T", {{2 * i, i}, {2 * i + 1, i}});
+      if (status.code() != absl::StatusCode::kAborted) {
+        GOOGLESQL_EXPECT_OK(status);
+      }
+    }
+  });
+  // Paced, so that copies, which wait for schema changes, get their turn.
+  std::thread ddl([&] {
+    for (int i = 0; i < 20 && !stop; ++i) {
+      GOOGLESQL_EXPECT_OK(UpdateSchema(
+          base.get(),
+          absl::StrCat("CREATE TABLE X", i, " (k INT64) PRIMARY KEY (k)")));
+      absl::SleepFor(absl::Milliseconds(2));
+    }
+  });
+  std::vector<std::thread> copiers;
+  for (int c = 0; c < 8; ++c) {
+    copiers.emplace_back([&] {
+      for (int n = 0; n < 10; ++n) {
+        absl::StatusOr<std::unique_ptr<Database>> copy =
+            base->CreateEphemeralCopy();
+        GOOGLESQL_ASSERT_OK(copy);
+        EXPECT_THAT(
+            Sql(copy->get(), "SELECT v FROM T GROUP BY v HAVING COUNT(*) != 2"),
+            IsOkAndHolds(IsEmpty()));
+        GOOGLESQL_EXPECT_OK(Insert(copy->get(), "T", {{-1, -1}}));
+      }
+    });
+  }
+  for (std::thread& copier : copiers) copier.join();
+  stop = true;
+  writer.join();
+  ddl.join();
+}
+
 // Read-write transactions on a copy conflict and commit as they do on the
 // database it copies.
 TEST_F(EphemeralCopyTest, ReadWriteTransactionsOnACopyBehaveAsOnItsBase) {
