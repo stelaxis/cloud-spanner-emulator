@@ -126,7 +126,8 @@ absl::Status ValidateTokenInRetentionWindow(
     // Although token is not expired, the user provided tvf start time is too
     // old.
     return error::InvalidChangeStreamTvfArgumentStartTimestampTooOld(
-        absl::FormatTime(gc_time), absl::FormatTime(tvf_start));
+        absl::FormatTime(gc_time, absl::UTCTimeZone()),
+        absl::FormatTime(tvf_start, absl::UTCTimeZone()));
   }
   return absl::OkStatus();
 }
@@ -281,8 +282,10 @@ absl::StatusOr<absl::Time> ChangeStreamsHandler::TryGetPartitionTokenEndTime(
             metadata().start_timestamp > end) {
           return error::
               InvalidChangeStreamTvfArgumentStartTimestampForPartition(
-                  absl::FormatTime(start), absl::FormatTime(end),
-                  absl::FormatTime(metadata().start_timestamp));
+                  absl::FormatTime(start, absl::UTCTimeZone()),
+                  absl::FormatTime(end, absl::UTCTimeZone()),
+                  absl::FormatTime(metadata().start_timestamp,
+                                   absl::UTCTimeZone()));
         }
         return absl::OkStatus();
       }));

@@ -103,9 +103,10 @@ absl::Status VersionedCatalog::AddSchema(absl::Time creation_time,
                                          std::unique_ptr<const Schema> schema) {
   absl::MutexLock lock(mu_);
   GOOGLESQL_RET_CHECK(creation_time > schemas_.rbegin()->first)
-      << "Failed to insert schema at " << absl::FormatTime(creation_time)
+      << "Failed to insert schema at "
+      << absl::FormatTime(creation_time, absl::UTCTimeZone())
       << ": the latest schema creation timestamp is "
-      << absl::FormatTime(schemas_.rbegin()->first);
+      << absl::FormatTime(schemas_.rbegin()->first, absl::UTCTimeZone());
   auto version_retention_period =
       ParseVersionRetentionPeriod(schema->version_retention_period());
   if (!version_retention_period.ok()) {

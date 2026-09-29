@@ -85,12 +85,14 @@ absl::Status ChangeStreamQueryValidator::ValidateTimeStamps(
 
   if (start_time < min_time) {
     return error::InvalidChangeStreamTvfArgumentStartTimestampTooOld(
-        absl::FormatTime(min_time), absl::FormatTime(start_time));
+        absl::FormatTime(min_time, absl::UTCTimeZone()),
+        absl::FormatTime(start_time, absl::UTCTimeZone()));
   }
   if (start_time > max_time) {
     return error::InvalidChangeStreamTvfArgumentStartTimestampTooFarInFuture(
-        absl::FormatTime(min_time), absl::FormatTime(max_time),
-        absl::FormatTime(start_time));
+        absl::FormatTime(min_time, absl::UTCTimeZone()),
+        absl::FormatTime(max_time, absl::UTCTimeZone()),
+        absl::FormatTime(start_time, absl::UTCTimeZone()));
   }
 
   if (change_stream->partition_mode() ==
@@ -103,8 +105,9 @@ absl::Status ChangeStreamQueryValidator::ValidateTimeStamps(
         start_time + absl::Minutes(limits::kChangeStreamsMaxEndTimestampDelay);
     if (end_time > max_end_time) {
       return error::InvalidChangeStreamTvfArgumentEndTimestampTooFarInFuture(
-          absl::FormatTime(start_time), absl::FormatTime(max_end_time),
-          absl::FormatTime(end_time));
+          absl::FormatTime(start_time, absl::UTCTimeZone()),
+          absl::FormatTime(max_end_time, absl::UTCTimeZone()),
+          absl::FormatTime(end_time, absl::UTCTimeZone()));
     }
   }
 
@@ -113,7 +116,8 @@ absl::Status ChangeStreamQueryValidator::ValidateTimeStamps(
     if (start_time > end_time) {
       return error::
           InvalidChangeStreamTvfArgumentStartTimestampGreaterThanEndTimestamp(
-              absl::FormatTime(start_time), absl::FormatTime(end_time));
+              absl::FormatTime(start_time, absl::UTCTimeZone()),
+              absl::FormatTime(end_time, absl::UTCTimeZone()));
     }
   }
   return absl::OkStatus();
