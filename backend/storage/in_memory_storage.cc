@@ -17,6 +17,7 @@
 #include "backend/storage/in_memory_storage.h"
 
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -36,6 +37,13 @@ namespace backend {
 namespace {
 
 static constexpr char kExistsColumn[] = "_exists";
+
+// A miss is the usual outcome of an existence check, so its message must not
+// read the local time zone: on macOS, each read can leak the zone's name on a
+// thread that never drains its autorelease pool, such as a gRPC worker.
+std::string FormatLookupTime(absl::Time timestamp) {
+  return absl::FormatTime(timestamp, absl::UTCTimeZone());
+}
 
 }  // namespace
 
@@ -101,7 +109,7 @@ absl::Status InMemoryStorage::Lookup(
     return absl::Status(
         absl::StatusCode::kNotFound,
         absl::StrCat("Key: ", key.DebugString(), " not found for table: ",
-                     table_id, " at timestamp: ", absl::FormatTime(timestamp)));
+                     table_id, " at timestamp: ", FormatLookupTime(timestamp)));
   }
   const Table& table = table_itr->second;
 
@@ -111,7 +119,7 @@ absl::Status InMemoryStorage::Lookup(
     return absl::Status(
         absl::StatusCode::kNotFound,
         absl::StrCat("Key: ", key.DebugString(), " not found for table: ",
-                     table_id, " at timestamp: ", absl::FormatTime(timestamp)));
+                     table_id, " at timestamp: ", FormatLookupTime(timestamp)));
   }
   const Row& row = row_itr->second;
 
@@ -121,7 +129,7 @@ absl::Status InMemoryStorage::Lookup(
         absl::StatusCode::kNotFound,
         absl::StrCat(
             "Key: ", key.DebugString(), " does not exist for table: ", table_id,
-            " at the given timestamp: " + absl::FormatTime(timestamp)));
+            " at the given timestamp: " + FormatLookupTime(timestamp)));
   }
 
   // For request without columns, return ok since the key exist.
