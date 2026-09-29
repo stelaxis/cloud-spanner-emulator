@@ -21,7 +21,13 @@
 #if defined(ABSL_HAVE_ADDRESS_SANITIZER) || \
     defined(ABSL_HAVE_THREAD_SANITIZER) || defined(ABSL_HAVE_MEMORY_SANITIZER)
 #define EMULATOR_SANITIZER_ALLOCATOR 1
+#if __has_include(<sanitizer/allocator_interface.h>)
 #include <sanitizer/allocator_interface.h>
+#else
+#include <cstddef>
+// GCC's sanitizer runtimes define it but do not install this header.
+extern "C" std::size_t __sanitizer_get_current_allocated_bytes(void);
+#endif
 #endif
 
 #if defined(__APPLE__)
@@ -216,9 +222,11 @@ TEST_F(InMemoryStorageTest, LookupMissFormatsTimeInUtc) {
           testing::HasSubstr("2026-01-02T03:04:05+00:00")));
 }
 
-// The leak FormatLookupTime avoids. On macOS, only the system's own zone
-// leaks, and only if its name is too long to be stored without an allocation;
-// "UTC", which `bazel test` sets, is not.
+// The leak FormatLookupTime avoids. This check reproduces it only on macOS
+// whose system zone is not UTC: only the system's own zone leaks, and only if
+// its name is too long to be stored without an allocation ("UTC", which
+// `bazel test` sets, is not). A pass on a UTC host or on Linux says nothing
+// about the leak.
 TEST_F(InMemoryStorageTest, LookupMissesKeepNoMemory) {
   ScopedTz tz(nullptr);
   absl::Time write_ts = absl::Now();
