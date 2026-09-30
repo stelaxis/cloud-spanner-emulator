@@ -530,6 +530,7 @@ cc_test(
     srcs = ["memory_release_test.cc"],
     deps = [
         "//backend/database",
+        "//common:config",
         "//common:heap_release",
         "//frontend/collections:database_manager",
         "//frontend/collections:session_manager",
@@ -542,6 +543,7 @@ cc_test(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_googleapis//google/spanner/admin/database/v1:database_cc_proto",
         "@com_google_googleapis//google/spanner/admin/instance/v1:instance_cc_proto",

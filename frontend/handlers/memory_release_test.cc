@@ -27,9 +27,11 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "backend/database/database.h"
+#include "common/config.h"
 #include "common/heap_release.h"
 #include "frontend/collections/database_manager.h"
 #include "frontend/collections/session_manager.h"
@@ -52,9 +54,11 @@ namespace emulator {
 namespace frontend {
 namespace {
 
+using ::googlesql_base::testing::IsOkAndHolds;
 using ::googlesql_base::testing::StatusIs;
 using ::testing::ElementsAre;
 using ::testing::ElementsAreArray;
+using ::testing::StartsWith;
 
 namespace spanner_api = ::google::spanner::v1;
 namespace database_api = ::google::spanner::admin::database::v1;
@@ -158,12 +162,72 @@ class MemoryReleaseTest : public test::ServerTest {
 
   absl::Status QueryTable(std::optional<absl::Time> timestamp,
                           const std::string& table) {
+    return Query(timestamp, absl::StrCat("SELECT k FROM ", table)).status();
+  }
+
+  // The first column of every row.
+  absl::StatusOr<std::vector<std::string>> Query(
+      std::optional<absl::Time> timestamp, const std::string& sql) {
     spanner_api::ExecuteSqlRequest request;
     request.set_session(session_);
     *request.mutable_transaction() = ReadOnly(timestamp);
-    request.set_sql(absl::StrCat("SELECT k FROM ", table));
+    request.set_sql(sql);
     spanner_api::ResultSet response;
-    return ExecuteSql(request, &response);
+    GOOGLESQL_RETURN_IF_ERROR(ExecuteSql(request, &response));
+    std::vector<std::string> values;
+    for (const auto& row : response.rows()) {
+      values.push_back(row.values(0).string_value());
+    }
+    return values;
+  }
+
+  // Query, streaming; for single-column results.
+  absl::StatusOr<std::vector<std::string>> StreamingQuery(
+      std::optional<absl::Time> timestamp, const std::string& sql) {
+    spanner_api::ExecuteSqlRequest request;
+    request.set_session(session_);
+    *request.mutable_transaction() = ReadOnly(timestamp);
+    request.set_sql(sql);
+    std::vector<spanner_api::PartialResultSet> response;
+    GOOGLESQL_RETURN_IF_ERROR(ExecuteStreamingSql(request, &response));
+    std::vector<std::string> values;
+    for (const auto& partial : response) {
+      for (const auto& value : partial.values()) {
+        values.push_back(value.string_value());
+      }
+    }
+    return values;
+  }
+
+  // Three schema changes: t1, then t2 a minute later, then t3 an hour on,
+  // which removes t1's schema. Returns the time t1 was created.
+  absl::StatusOr<absl::Time> RemoveASchemaByASchemaChange() {
+    GOOGLESQL_ASSIGN_OR_RETURN(absl::Time t1, ChangeSchema(CreateTable(1)));
+    test_env()->AdvanceClock(absl::Minutes(1));
+    GOOGLESQL_ASSIGN_OR_RETURN(absl::Time t2, ChangeSchema(CreateTable(2)));
+    MoveClockTo(t2 + absl::Hours(1) + absl::Seconds(10));
+    GOOGLESQL_ASSIGN_OR_RETURN(absl::Time t3, ChangeSchema(CreateTable(3)));
+    if (Backend()->SchemaTimestampsForTesting() !=
+        std::vector<absl::Time>{absl::InfinitePast(), t2, t3}) {
+      return absl::InternalError("t1's schema was not removed");
+    }
+    return t1;
+  }
+
+  // Reads at a time whose schema a schema change removed are resolved against
+  // the schema left before it, as upstream does, however old they are.
+  void ExpectReadsAsUpstreamWhereASchemaChangeRemovedTheSchema() {
+    GOOGLESQL_ASSERT_OK_AND_ASSIGN(absl::Time t1,
+                                   RemoveASchemaByASchemaChange());
+    const absl::Time too_old = t1 + absl::Seconds(30);
+    EXPECT_THAT(Query(too_old, "SELECT 1"), IsOkAndHolds(ElementsAre("1")));
+    EXPECT_THAT(StreamingQuery(too_old, "SELECT 1"),
+                IsOkAndHolds(ElementsAre("1")));
+    EXPECT_THAT(ReadTable(too_old, "t1"),
+                StatusIs(absl::StatusCode::kNotFound, "Table not found: t1"));
+    EXPECT_THAT(QueryTable(too_old, "t1"),
+                StatusIs(absl::StatusCode::kInvalidArgument,
+                         StartsWith("Table not found: t1 [at 1:15]")));
   }
 
   // The error a read at `timestamp` past the version retention period gets.
@@ -337,6 +401,65 @@ TEST_F(MemoryReleaseTest, ReclaimerThreadSweepsEveryInterval) {
     return Backend()->SchemaTimestampsForTesting() ==
            std::vector<absl::Time>{absl::InfinitePast(), second};
   }));
+}
+
+// A sweep removed t1's schema; the retention period is then lengthened to
+// cover it again. As in Spanner, lengthening it does not bring back what was
+// collected: reads at those times fail as too old, rather than being resolved
+// against the schema before it.
+TEST_F(MemoryReleaseTest, LengtheningRetentionDoesNotBringSweptSchemasBack) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(absl::Time t1, ChangeSchema(CreateTable(1)));
+  test_env()->AdvanceClock(absl::Minutes(1));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(absl::Time t2, ChangeSchema(CreateTable(2)));
+  MoveClockTo(t2 + absl::Hours(2));
+  reclaimer()->RemoveExpiredSchemas();
+  ASSERT_THAT(Backend()->SchemaTimestampsForTesting(),
+              ElementsAre(absl::InfinitePast(), t2));
+  GOOGLESQL_ASSERT_OK(ChangeSchema(
+      absl::StrCat("ALTER DATABASE `", test_database_name_,
+                   "` SET OPTIONS (version_retention_period = '1d')")));
+
+  const absl::Time swept = t1 + absl::Seconds(30);
+  EXPECT_THAT(ReadTable(swept, "t1"),
+              StatusIs(absl::StatusCode::kFailedPrecondition, TooOld(swept)));
+  EXPECT_THAT(QueryTable(swept, "t1"),
+              StatusIs(absl::StatusCode::kFailedPrecondition, TooOld(swept)));
+  EXPECT_THAT(Query(swept,
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = ''"),
+              StatusIs(absl::StatusCode::kFailedPrecondition, TooOld(swept)));
+  EXPECT_THAT(StreamingQuery(swept, "SELECT 1"),
+              StatusIs(absl::StatusCode::kFailedPrecondition, TooOld(swept)));
+
+  // Times whose schema is still there read as before: t2's, and those before
+  // t1, when the database's first schema was in effect.
+  GOOGLESQL_EXPECT_OK(ReadTable(t2 + absl::Seconds(30), "t1"));
+  EXPECT_THAT(ReadTable(t1 - absl::Seconds(1), "t1"),
+              StatusIs(absl::StatusCode::kNotFound, "Table not found: t1"));
+  EXPECT_THAT(Query(t1 - absl::Seconds(1), "SELECT COUNT(*) FROM test_table"),
+              IsOkAndHolds(ElementsAre("0")));
+}
+
+TEST_F(MemoryReleaseTest, SchemaChangesRemoveSchemasAsUpstreamDoes) {
+  ExpectReadsAsUpstreamWhereASchemaChangeRemovedTheSchema();
+}
+
+// With both flags 0 the emulator neither sweeps nor releases, and reads are
+// exactly upstream's.
+class MemoryReleaseDisabledTest : public MemoryReleaseTest {
+ protected:
+  static void SetUpTestSuite() {
+    config::set_heap_release_interval(absl::ZeroDuration());
+    config::set_schema_version_gc_interval(absl::ZeroDuration());
+  }
+  static void TearDownTestSuite() {
+    config::set_heap_release_interval(absl::Seconds(10));
+    config::set_schema_version_gc_interval(absl::Seconds(60));
+  }
+};
+
+TEST_F(MemoryReleaseDisabledTest, ReadsAreUpstreams) {
+  ExpectReadsAsUpstreamWhereASchemaChangeRemovedTheSchema();
 }
 
 }  // namespace

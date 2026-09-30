@@ -67,7 +67,8 @@ absl::Status ReadOnlyTransaction::Read(const ReadArg& read_arg,
     return error::ReadTimestampPastVersionGCLimit(read_timestamp_);
   }
 
-  // Expired schemas can be removed after the check above.
+  // A sweep can remove the schema at the read timestamp after the check above,
+  // and even inside a retention period lengthened since.
   GOOGLESQL_RETURN_IF_ERROR(ValidateSchemaRetained());
   std::shared_ptr<const Schema> schema = SchemaShared();
   GOOGLESQL_ASSIGN_OR_RETURN(const ResolvedReadArg resolved_read_arg,
@@ -97,13 +98,8 @@ const Schema* ReadOnlyTransaction::schema() const {
 
 absl::Status ReadOnlyTransaction::ValidateSchemaRetained() const {
   SchemaShared();
-  bool schema_removed;
-  {
-    absl::MutexLock lock(schema_mu_);
-    schema_removed = schema_removed_;
-  }
-  if (schema_removed &&
-      clock_->Now() - read_timestamp_ >= version_retention_period_) {
+  absl::MutexLock lock(schema_mu_);
+  if (schema_swept_) {
     return error::ReadTimestampPastVersionGCLimit(read_timestamp_);
   }
   return absl::OkStatus();
@@ -116,7 +112,7 @@ std::shared_ptr<const Schema> ReadOnlyTransaction::SchemaShared() const {
   absl::MutexLock lock(schema_mu_);
   if (schema_holder_ == nullptr) {
     schema_holder_ =
-        versioned_catalog_->GetSchemaShared(read_timestamp_, &schema_removed_);
+        versioned_catalog_->GetSchemaShared(read_timestamp_, &schema_swept_);
   }
   return schema_holder_;
 }

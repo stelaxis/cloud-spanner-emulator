@@ -75,9 +75,13 @@ void set_max_ephemeral_sessions(int max_sessions);
 // asked for it (RequestHeapRelease). Zero: never.
 absl::Duration heap_release_interval();
 
+void set_heap_release_interval(absl::Duration interval);
+
 // How often the schema versions no read can need are removed from every
 // database. Zero: only when the database's schema next changes.
 absl::Duration schema_version_gc_interval();
+
+void set_schema_version_gc_interval(absl::Duration interval);
 
 }  // namespace config
 }  // namespace emulator

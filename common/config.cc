@@ -138,8 +138,18 @@ absl::Duration heap_release_interval() {
   return absl::Seconds(absl::GetFlag(FLAGS_heap_release_interval_seconds));
 }
 
+void set_heap_release_interval(absl::Duration interval) {
+  absl::SetFlag(&FLAGS_heap_release_interval_seconds,
+                absl::ToInt64Seconds(interval));
+}
+
 absl::Duration schema_version_gc_interval() {
   return absl::Seconds(absl::GetFlag(FLAGS_schema_version_gc_interval_seconds));
+}
+
+void set_schema_version_gc_interval(absl::Duration interval) {
+  absl::SetFlag(&FLAGS_schema_version_gc_interval_seconds,
+                absl::ToInt64Seconds(interval));
 }
 
 }  // namespace config

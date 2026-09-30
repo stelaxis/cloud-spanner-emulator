@@ -445,7 +445,8 @@ std::shared_ptr<const Schema> Database::GetLatestSchemaShared() const {
 }
 
 int Database::RemoveExpiredSchemas() {
-  return versioned_catalog_->RemoveExpiredSchemas(clock_->Now());
+  return versioned_catalog_->RemoveExpiredSchemas(clock_->Now(),
+                                                  /*swept=*/true);
 }
 
 }  // namespace backend

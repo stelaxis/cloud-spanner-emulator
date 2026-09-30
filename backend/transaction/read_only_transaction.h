@@ -62,10 +62,12 @@ class ReadOnlyTransaction : public RowReader {
   const Schema* schema() const ABSL_LOCKS_EXCLUDED(schema_mu_);
 
   // Fails as Read does for a read timestamp past the version retention period
-  // if the schema at the read timestamp had been garbage-collected when this
-  // transaction took its schema: schema() is then an older schema. Within the
-  // period (which a database can shorten and lengthen again), that older
-  // schema is used, as upstream does.
+  // if a sweep had removed the schema at the read timestamp when this
+  // transaction took its schema (Database::RemoveExpiredSchemas): schema() is
+  // then an older schema. It fails even if the retention period has been
+  // lengthened to cover the read timestamp again. A schema that a schema
+  // change removed does not count: reads resolve against the older schema, as
+  // upstream does.
   absl::Status ValidateSchemaRetained() const ABSL_LOCKS_EXCLUDED(schema_mu_);
 
   // Returns the ID of this transaction.
@@ -86,14 +88,14 @@ class ReadOnlyTransaction : public RowReader {
   std::shared_ptr<const Schema> SchemaShared() const
       ABSL_LOCKS_EXCLUDED(schema_mu_);
 
-  // Guards schema_holder_ and schema_removed_. Separate from mu_, which Read
+  // Guards schema_holder_ and schema_swept_. Separate from mu_, which Read
   // holds while it calls schema().
   mutable absl::Mutex schema_mu_;
   mutable std::shared_ptr<const Schema> schema_holder_
       ABSL_GUARDED_BY(schema_mu_);
-  // The schema at the read timestamp had been removed from the versioned
-  // catalog when schema_holder_ was taken.
-  mutable bool schema_removed_ ABSL_GUARDED_BY(schema_mu_) = false;
+  // A sweep had removed the schema at the read timestamp when schema_holder_
+  // was taken.
+  mutable bool schema_swept_ ABSL_GUARDED_BY(schema_mu_) = false;
 
   // Options with which the transaction was created.
   ReadOnlyOptions options_;

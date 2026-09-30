@@ -124,9 +124,10 @@ class Transaction {
   // Returns the schema from the backend transaction.
   const backend::Schema* schema() const;
 
-  // For a read-only transaction reading past the version retention period,
-  // fails as its reads do if schema() is not the schema at the read timestamp,
-  // because that was garbage-collected. Call it before using schema() to read.
+  // For a read-only transaction, fails as reads past the version retention
+  // period do if schema() is not the schema at the read timestamp, because a
+  // sweep removed that (ReadOnlyTransaction::ValidateSchemaRetained). Call it
+  // before using schema() to read.
   absl::Status ValidateSchemaRetained() const;
 
   // Returns the engine used to execute queries against the database.
