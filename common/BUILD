@@ -112,6 +112,26 @@ cc_library(
 )
 
 cc_library(
+    name = "heap_release",
+    srcs = ["heap_release.cc"],
+    hdrs = ["heap_release.h"],
+    deps = [
+        "@com_google_absl//absl/log:absl_log",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+cc_test(
+    name = "heap_release_test",
+    srcs = ["heap_release_test.cc"],
+    deps = [
+        ":heap_release",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "feature_flags",
     hdrs = ["feature_flags.h"],
     deps = [

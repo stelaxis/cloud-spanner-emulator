@@ -138,6 +138,17 @@ class Database {
   // garbage-collect this one while the caller still uses it.
   std::shared_ptr<const Schema> GetLatestSchemaShared() const;
 
+  // Removes the schema versions that no read can need any more, as a schema
+  // change does (VersionedCatalog::RemoveExpiredSchemas), as a sweep: reads at
+  // the times they were in effect then fail as too old, even if the retention
+  // period is lengthened later. Returns how many it removed.
+  int RemoveExpiredSchemas();
+
+  // The creation times of the schema versions this database keeps. For tests.
+  std::vector<absl::Time> SchemaTimestampsForTesting() const {
+    return versioned_catalog_->SchemaTimestampsForTesting();
+  }
+
   // Used to execute queries against the database.
   QueryEngine* query_engine() { return query_engine_.get(); }
 

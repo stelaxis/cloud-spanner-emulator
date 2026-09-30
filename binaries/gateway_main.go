@@ -83,6 +83,16 @@ var (
 		"The most ephemeral sessions, each with its own copy of its database, open at once. "+
 			"Creating another fails with RESOURCE_EXHAUSTED. Copies do not count towards "+
 			"--override_max_databases_per_instance.")
+	heapReleaseIntervalSeconds = flag.Int("heap_release_interval_seconds", 10,
+		"Seconds between returns of free heap memory to the operating system. Dropping a "+
+			"database or an instance, a schema change and removing old schema versions free "+
+			"memory that the allocator would otherwise keep; a background thread returns it at "+
+			"most once per interval. 0 disables it.")
+	schemaVersionGCIntervalSeconds = flag.Int("schema_version_gc_interval_seconds", 60,
+		"Seconds between sweeps that remove, from every database, the schema versions no read "+
+			"can need any more: those superseded longer than the database's "+
+			"version_retention_period ago. 0 disables the sweep: the next schema change of a "+
+			"database still removes them.")
 	printNotices = flag.Bool("notices", false,
 		"If true, the emulator will print all third-party notices to stdout.")
 	remoteFunctionsHostPort = flag.String("remote_functions_host_port", "",
@@ -191,6 +201,8 @@ func main() {
 		SchemaCreateCacheSize:                          *schemaCreateCacheSize,
 		EphemeralSessionIdleTimeoutSeconds:             *ephemeralSessionIdleTimeoutSeconds,
 		MaxEphemeralSessions:                           *maxEphemeralSessions,
+		HeapReleaseIntervalSeconds:                     *heapReleaseIntervalSeconds,
+		SchemaVersionGCIntervalSeconds:                 *schemaVersionGCIntervalSeconds,
 	}
 	gw := gateway.New(gwopts)
 	gw.Run()

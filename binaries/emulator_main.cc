@@ -39,6 +39,13 @@ int main(int argc, char** argv) {
                        "positive and --max_ephemeral_sessions not negative.";
     return EXIT_FAILURE;
   }
+  if (config::heap_release_interval() < absl::ZeroDuration() ||
+      config::schema_version_gc_interval() < absl::ZeroDuration()) {
+    ABSL_LOG(ERROR) << "--heap_release_interval_seconds and "
+                       "--schema_version_gc_interval_seconds must not be "
+                       "negative.";
+    return EXIT_FAILURE;
+  }
 
   Server::Options options;
   options.server_address = google::spanner::emulator::config::grpc_host_port();

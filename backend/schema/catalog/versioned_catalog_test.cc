@@ -17,6 +17,7 @@
 #include "backend/schema/catalog/versioned_catalog.h"
 
 #include <memory>
+#include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -126,6 +127,75 @@ TEST(VersionedCatalogTest, ExpiredSchemasThatCoverRetentionPeriodAreKept) {
   // Verify that the schema created at t0 is removed as it is no longer required
   // to cover the retention period.
   EXPECT_EQ(catalog.GetSchema(t0), catalog.GetSchema(absl::InfinitePast()));
+}
+
+TEST(VersionedCatalogTest, RemoveExpiredSchemasReturnsHowManyItRemoved) {
+  VersionedCatalog catalog;
+  absl::Time t0 = absl::Now();
+  absl::Time t1 = t0 + absl::Minutes(10);
+  absl::Time t2 = t0 + absl::Minutes(20);
+  absl::Time t3 = t0 + absl::Minutes(30);
+  for (absl::Time t : {t0, t1, t2, t3}) {
+    GOOGLESQL_EXPECT_OK(catalog.AddSchema(t, std::make_unique<const Schema>()));
+  }
+
+  // Reads from a second after t2 on need the schema created at t2 and later.
+  EXPECT_EQ(
+      catalog.RemoveExpiredSchemas(t2 + absl::Hours(1) + absl::Seconds(1)), 2);
+  EXPECT_THAT(catalog.SchemaTimestampsForTesting(),
+              testing::ElementsAre(absl::InfinitePast(), t2, t3));
+  EXPECT_EQ(
+      catalog.RemoveExpiredSchemas(t2 + absl::Hours(1) + absl::Seconds(1)), 0);
+}
+
+TEST(VersionedCatalogTest, LookupsTellWhetherASweepRemovedTheirSchema) {
+  VersionedCatalog catalog;
+  absl::Time t1 = absl::Now();
+  std::vector<absl::Time> t = {t1};
+  for (int i = 1; i < 6; ++i) t.push_back(t1 + absl::Minutes(10 * i));
+  for (absl::Time creation : t) {
+    GOOGLESQL_EXPECT_OK(
+        catalog.AddSchema(creation, std::make_unique<const Schema>()));
+  }
+  const Schema* first = catalog.GetSchema(absl::InfinitePast());
+  bool swept = true;
+  std::shared_ptr<const Schema> at_t0 = catalog.GetSchemaShared(t[0], &swept);
+  EXPECT_FALSE(swept);
+
+  // A schema change's removal is not reported.
+  EXPECT_EQ(catalog.RemoveExpiredSchemas(t[1] + absl::Hours(1)), 1);
+  EXPECT_EQ(catalog.GetSchemaShared(t[0], &swept).get(), first);
+  EXPECT_FALSE(swept);
+
+  // A sweep's is, from the oldest schema it removed to the one it kept.
+  EXPECT_EQ(catalog.RemoveExpiredSchemas(t[3] + absl::Hours(1),
+                                         /*swept=*/true),
+            2);
+  for (absl::Time time : {t[1], t[2], t[3] - absl::Microseconds(1)}) {
+    EXPECT_EQ(catalog.GetSchemaShared(time, &swept).get(), first);
+    EXPECT_TRUE(swept);
+  }
+  for (absl::Time time :
+       {t[0] - absl::Seconds(1), t[0], t[1] - absl::Seconds(1)}) {
+    EXPECT_EQ(catalog.GetSchemaShared(time, &swept).get(), first);
+    EXPECT_FALSE(swept);
+  }
+  EXPECT_NE(catalog.GetSchemaShared(t[3], &swept).get(), first);
+  EXPECT_FALSE(swept);
+
+  // A later sweep extends the range.
+  EXPECT_EQ(catalog.RemoveExpiredSchemas(t[5] + absl::Hours(1),
+                                         /*swept=*/true),
+            2);
+  for (absl::Time time : {t[1], t[3], t[5] - absl::Microseconds(1)}) {
+    catalog.GetSchemaShared(time, &swept);
+    EXPECT_TRUE(swept);
+  }
+  catalog.GetSchemaShared(t[5], &swept);
+  EXPECT_FALSE(swept);
+
+  // A schema held elsewhere outlives its removal.
+  EXPECT_EQ(at_t0.use_count(), 1);
 }
 
 }  // namespace

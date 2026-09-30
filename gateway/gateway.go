@@ -60,6 +60,8 @@ type Options struct {
 	SchemaCreateCacheSize                          int
 	EphemeralSessionIdleTimeoutSeconds             int
 	MaxEphemeralSessions                           int
+	HeapReleaseIntervalSeconds                     int
+	SchemaVersionGCIntervalSeconds                 int
 }
 
 // Gateway implements the emulator gateway server.
@@ -113,6 +115,11 @@ func (gw *Gateway) Run() {
 			gw.opts.EphemeralSessionIdleTimeoutSeconds))
 	emulatorArgs = append(emulatorArgs,
 		fmt.Sprintf("--max_ephemeral_sessions=%d", gw.opts.MaxEphemeralSessions))
+	emulatorArgs = append(emulatorArgs,
+		fmt.Sprintf("--heap_release_interval_seconds=%d", gw.opts.HeapReleaseIntervalSeconds))
+	emulatorArgs = append(emulatorArgs,
+		fmt.Sprintf("--schema_version_gc_interval_seconds=%d",
+			gw.opts.SchemaVersionGCIntervalSeconds))
 
 
 	cmd := exec.Command(gw.opts.FrontendBinary, emulatorArgs...)

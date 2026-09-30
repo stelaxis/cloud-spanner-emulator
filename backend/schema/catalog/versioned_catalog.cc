@@ -17,8 +17,10 @@
 #include "backend/schema/catalog/versioned_catalog.h"
 
 #include <cstdint>
+#include <iterator>
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -99,6 +101,17 @@ std::shared_ptr<const Schema> VersionedCatalog::GetLatestSchemaShared() const {
   return GetSchemaShared(absl::InfiniteFuture());
 }
 
+std::shared_ptr<const Schema> VersionedCatalog::GetSchemaShared(
+    absl::Time timestamp, bool* swept) const {
+  absl::MutexLock lock(mu_);
+  auto swept_itr = swept_.upper_bound(timestamp);
+  *swept =
+      swept_itr != swept_.begin() && timestamp < std::prev(swept_itr)->second;
+  auto itr = schemas_.upper_bound(timestamp);
+  itr--;
+  return itr->second;
+}
+
 absl::Status VersionedCatalog::AddSchema(absl::Time creation_time,
                                          std::unique_ptr<const Schema> schema) {
   absl::MutexLock lock(mu_);
@@ -117,19 +130,43 @@ absl::Status VersionedCatalog::AddSchema(absl::Time creation_time,
   return absl::OkStatus();
 }
 
-void VersionedCatalog::RemoveExpiredSchemas(absl::Time timestamp) {
+int VersionedCatalog::RemoveExpiredSchemas(absl::Time timestamp, bool swept) {
+  // Released after mu_: destroying a schema takes a while.
+  std::vector<std::shared_ptr<const Schema>> removed;
   absl::MutexLock lock(mu_);
   auto upper_bound =
       schemas_.upper_bound(timestamp - version_retention_period_);
   auto it = ++schemas_.begin();  // Skip the infinite past schema.
+  const absl::Time oldest_removed =
+      it == schemas_.end() ? absl::InfinitePast() : it->first;
   while (it != upper_bound) {
     auto next = it;
     if (++next == upper_bound) {
       // The current schema needs to be kept to cover the retention period.
       break;
     }
+    removed.push_back(std::move(it->second));
     it = schemas_.erase(it);
   }
+  if (swept && !removed.empty()) {
+    // `it` is the schema kept after the removed ones.
+    auto previous = swept_.empty() ? swept_.end() : std::prev(swept_.end());
+    if (previous != swept_.end() && previous->second == oldest_removed) {
+      previous->second = it->first;
+    } else {
+      swept_[oldest_removed] = it->first;
+    }
+  }
+  return removed.size();
+}
+
+std::vector<absl::Time> VersionedCatalog::SchemaTimestampsForTesting() const {
+  absl::MutexLock lock(mu_);
+  std::vector<absl::Time> timestamps;
+  for (const auto& [timestamp, schema] : schemas_) {
+    timestamps.push_back(timestamp);
+  }
+  return timestamps;
 }
 
 }  // namespace backend

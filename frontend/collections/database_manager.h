@@ -69,6 +69,11 @@ class DatabaseManager {
   absl::StatusOr<std::vector<std::shared_ptr<Database>>> ListDatabases(
       const std::string& instance_uri) const ABSL_LOCKS_EXCLUDED(mu_);
 
+  // Removes, from every database, the schema versions no read can need any
+  // more (backend::Database::RemoveExpiredSchemas). Returns how many it
+  // removed.
+  int RemoveExpiredSchemas() ABSL_LOCKS_EXCLUDED(mu_);
+
  private:
   // System-wide clock.
   Clock* clock_;

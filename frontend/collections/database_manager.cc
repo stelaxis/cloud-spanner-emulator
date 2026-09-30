@@ -150,6 +150,21 @@ DatabaseManager::ListDatabases(const std::string& instance_uri) const {
   return GetDatabasesByInstance(database_map_, instance_uri);
 }
 
+int DatabaseManager::RemoveExpiredSchemas() {
+  std::vector<std::shared_ptr<Database>> databases;
+  {
+    absl::ReaderMutexLock lock(mu_);
+    for (const auto& [uri, database] : database_map_) {
+      databases.push_back(database);
+    }
+  }
+  int removed = 0;
+  for (const std::shared_ptr<Database>& database : databases) {
+    removed += database->backend()->RemoveExpiredSchemas();
+  }
+  return removed;
+}
+
 }  // namespace frontend
 }  // namespace emulator
 }  // namespace spanner
