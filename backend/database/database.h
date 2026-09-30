@@ -141,7 +141,9 @@ class Database {
   // Removes the schema versions that no read can need any more, as a schema
   // change does (VersionedCatalog::RemoveExpiredSchemas), as a sweep: reads at
   // the times they were in effect then fail as too old, even if the retention
-  // period is lengthened later. Returns how many it removed.
+  // period is lengthened later, as do reads at the times of versions a schema
+  // change removed since an earlier sweep removed any. Returns how many it
+  // removed.
   int RemoveExpiredSchemas();
 
   // The creation times of the schema versions this database keeps. For tests.

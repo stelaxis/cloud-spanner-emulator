@@ -17,6 +17,7 @@
 #include "backend/schema/catalog/versioned_catalog.h"
 
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "gmock/gmock.h"
@@ -196,6 +197,103 @@ TEST(VersionedCatalogTest, LookupsTellWhetherASweepRemovedTheirSchema) {
 
   // A schema held elsewhere outlives its removal.
   EXPECT_EQ(at_t0.use_count(), 1);
+}
+
+// No schema is left in effect between two sweeps' removals, so lookups there
+// report a sweep also where a schema change removed the schema.
+TEST(VersionedCatalogTest, SchemaChangeRemovalsBetweenSweepsAreReported) {
+  VersionedCatalog catalog;
+  absl::Time t1 = absl::Now();
+  std::vector<absl::Time> t = {t1};
+  for (int i = 1; i < 8; ++i) t.push_back(t1 + absl::Minutes(10 * i));
+  std::vector<const Schema*> schemas;
+  for (absl::Time creation : t) {
+    auto schema = std::make_unique<const Schema>();
+    schemas.push_back(schema.get());
+    GOOGLESQL_EXPECT_OK(catalog.AddSchema(creation, std::move(schema)));
+  }
+  const Schema* first = catalog.GetSchema(absl::InfinitePast());
+  bool swept = true;
+
+  // A schema change before any sweep, a sweep, a schema change, a sweep.
+  EXPECT_EQ(catalog.RemoveExpiredSchemas(t[1] + absl::Hours(1)), 1);
+  EXPECT_EQ(catalog.RemoveExpiredSchemas(t[3] + absl::Hours(1),
+                                         /*swept=*/true),
+            2);
+  EXPECT_EQ(catalog.RemoveExpiredSchemas(t[5] + absl::Hours(1)), 2);
+  // What a schema change removed after the latest sweep is not reported yet.
+  for (absl::Time time : {t[3], t[5] - absl::Microseconds(1)}) {
+    EXPECT_EQ(catalog.GetSchemaShared(time, &swept).get(), first);
+    EXPECT_FALSE(swept);
+  }
+  EXPECT_EQ(catalog.RemoveExpiredSchemas(t[6] + absl::Hours(1),
+                                         /*swept=*/true),
+            1);
+  EXPECT_THAT(catalog.SchemaTimestampsForTesting(),
+              testing::ElementsAre(absl::InfinitePast(), t[6], t[7]));
+
+  // Before the first sweep's removals, as upstream: the first schema.
+  for (absl::Time time :
+       {t[0] - absl::Seconds(1), t[0], t[1] - absl::Microseconds(1)}) {
+    EXPECT_EQ(catalog.GetSchemaShared(time, &swept).get(), first);
+    EXPECT_FALSE(swept);
+  }
+  // Swept, removed by the schema change between the sweeps, swept.
+  for (absl::Time time :
+       {t[1], t[2], t[3], t[4], t[5], t[6] - absl::Microseconds(1)}) {
+    EXPECT_EQ(catalog.GetSchemaShared(time, &swept).get(), first);
+    EXPECT_TRUE(swept);
+  }
+  // Kept.
+  for (int i : {6, 7}) {
+    EXPECT_EQ(catalog.GetSchemaShared(t[i], &swept).get(), schemas[i]);
+    EXPECT_FALSE(swept);
+  }
+  EXPECT_EQ(catalog.GetSchemaShared(absl::InfiniteFuture(), &swept).get(),
+            schemas[7]);
+  EXPECT_FALSE(swept);
+  EXPECT_THAT(catalog.SweptRangesForTesting(),
+              testing::ElementsAre(testing::Pair(t[1], t[6])));
+}
+
+// However often sweeps and schema changes alternate, the catalog keeps one
+// swept range.
+TEST(VersionedCatalogTest, AlternatingSweepsAndSchemaChangesKeepOneSweptRange) {
+  VersionedCatalog catalog;
+  const Schema* first = catalog.GetSchema(absl::InfinitePast());
+  const absl::Time t0 = absl::Now();
+  auto t = [t0](int i) { return t0 + absl::Minutes(i); };
+  GOOGLESQL_EXPECT_OK(
+      catalog.AddSchema(t(0), std::make_unique<const Schema>()));
+
+  // Each round adds a schema and removes the one before it: a sweep in odd
+  // rounds, a schema change in even ones.
+  constexpr int kRounds = 1000;
+  for (int i = 1; i <= kRounds; ++i) {
+    GOOGLESQL_EXPECT_OK(
+        catalog.AddSchema(t(i), std::make_unique<const Schema>()));
+    const bool sweep = i % 2 == 1;
+    EXPECT_EQ(catalog.RemoveExpiredSchemas(t(i) + absl::Hours(1), sweep), 1);
+    const std::vector<std::pair<absl::Time, absl::Time>> ranges =
+        catalog.SweptRangesForTesting();
+    ASSERT_EQ(ranges.size(), 1) << "after round " << i;
+    EXPECT_EQ(ranges[0], std::make_pair(t(0), t(sweep ? i : i - 1)));
+  }
+  EXPECT_THAT(catalog.SchemaTimestampsForTesting(),
+              testing::ElementsAre(absl::InfinitePast(), t(kRounds)));
+
+  bool swept = true;
+  EXPECT_EQ(catalog.GetSchemaShared(t(0) - absl::Seconds(1), &swept).get(),
+            first);
+  EXPECT_FALSE(swept);
+  // Every schema before the last is removed; the last round was a schema
+  // change after the latest sweep.
+  for (int i = 0; i < kRounds; ++i) {
+    EXPECT_EQ(catalog.GetSchemaShared(t(i), &swept).get(), first);
+    EXPECT_EQ(swept, i < kRounds - 1) << "at t(" << i << ")";
+  }
+  EXPECT_NE(catalog.GetSchemaShared(t(kRounds), &swept).get(), first);
+  EXPECT_FALSE(swept);
 }
 
 }  // namespace

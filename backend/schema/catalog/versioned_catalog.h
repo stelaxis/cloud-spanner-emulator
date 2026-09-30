@@ -19,6 +19,7 @@
 
 #include <map>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "absl/base/thread_annotations.h"
@@ -68,8 +69,9 @@ class VersionedCatalog {
   std::shared_ptr<const Schema> GetLatestSchemaShared() const
       ABSL_LOCKS_EXCLUDED(mu_);
 
-  // GetSchemaShared, also setting `*swept` if a sweep removed the schema in
-  // effect at `timestamp` (RemoveExpiredSchemas with `swept`): the schema
+  // GetSchemaShared, also setting `*swept` if the schema in effect at
+  // `timestamp` was removed by a sweep (RemoveExpiredSchemas with `swept`), or
+  // by a schema change between two sweeps that removed schemas: the schema
   // returned is then an older one.
   std::shared_ptr<const Schema> GetSchemaShared(absl::Time timestamp,
                                                 bool* swept) const
@@ -87,12 +89,19 @@ class VersionedCatalog {
   // at or before that time and the ones after it. Returns how many it removed.
   // A removed schema is destroyed once nothing else holds it, never under the
   // catalog's lock. With `swept`, the removal is a sweep's, and lookups at the
-  // times the removed schemas were in effect report it from then on.
+  // times the removed schemas were in effect report it from then on, as do
+  // lookups at the times of the schemas a schema change removed since an
+  // earlier sweep removed any.
   int RemoveExpiredSchemas(absl::Time timestamp, bool swept = false)
       ABSL_LOCKS_EXCLUDED(mu_);
 
   // The creation times of the schemas in the catalog, oldest first. For tests.
   std::vector<absl::Time> SchemaTimestampsForTesting() const
+      ABSL_LOCKS_EXCLUDED(mu_);
+
+  // The ranges of time at which lookups report a sweep: none until a sweep
+  // removes a schema, then one. For tests.
+  std::vector<std::pair<absl::Time, absl::Time>> SweptRangesForTesting() const
       ABSL_LOCKS_EXCLUDED(mu_);
 
   absl::Duration version_retention_period() const {
@@ -119,10 +128,16 @@ class VersionedCatalog {
   absl::Duration version_retention_period_ ABSL_GUARDED_BY(mu_) =
       absl::Hours(1);
 
-  // The times at which the schemas sweeps removed were in effect: each
-  // [start, end) from the oldest removed schema's creation time to the kept
-  // one's. Adjacent ranges are merged.
-  std::map<absl::Time, absl::Time> swept_ ABSL_GUARDED_BY(mu_);
+  // Lookups at [swept_begin_, swept_end_) report a sweep. The range runs from
+  // the creation of the oldest schema that the first sweep to remove any
+  // removed, to the creation of the schema that the latest such sweep kept.
+  // Schemas are removed oldest first, so no schema in effect in it is left:
+  // it also covers those a schema change removed between two sweeps, where a
+  // lookup could only return an older schema. That keeps it one range however
+  // often sweeps and schema changes alternate. Empty until a sweep removes a
+  // schema.
+  absl::Time swept_begin_ ABSL_GUARDED_BY(mu_) = absl::InfinitePast();
+  absl::Time swept_end_ ABSL_GUARDED_BY(mu_) = absl::InfinitePast();
 };
 
 }  // namespace backend

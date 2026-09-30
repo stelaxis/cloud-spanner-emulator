@@ -81,7 +81,14 @@ from a schema that was not in effect then: a table not found, or
 
 Schema versions that a schema change removes keep upstream's behaviour: reads
 at their times are resolved against the older schema that is left, as
-upstream's conformance tests expect. With
+upstream's conformance tests expect. The exception is a version that a schema
+change removes after a sweep has removed versions of the same database: once
+a later sweep removes versions too, reads at its time get the staleness error
+as well. Each database records the swept time as one range, from the oldest
+version that the first of its sweeps to remove any removed, to the version
+that the latest such sweep kept, so the record stays the same size however
+often sweeps and schema changes alternate. No version in effect in that range
+is left, so the older schema would be the wrong one there too. With
 `--schema_version_gc_interval_seconds=0` nothing is swept, so every read
 behaves as upstream's.
 
