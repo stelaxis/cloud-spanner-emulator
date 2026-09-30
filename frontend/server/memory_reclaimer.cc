@@ -18,6 +18,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
+#include <utility>
 
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
@@ -56,6 +58,12 @@ MemoryReclaimer::~MemoryReclaimer() {
 }
 
 void MemoryReclaimer::RemoveExpiredSchemas() {
+  std::function<void()> hook;
+  {
+    absl::MutexLock lock(mu_);
+    hook = before_sweep_hook_;
+  }
+  if (hook != nullptr) hook();
   if (database_manager_->RemoveExpiredSchemas() > 0) {
     RequestHeapRelease();
   }
@@ -69,18 +77,27 @@ void MemoryReclaimer::set_intervals_for_testing(
   ++generation_;
 }
 
+void MemoryReclaimer::set_hooks_for_testing(
+    std::function<void()> before_sweep, std::function<void()> after_release) {
+  absl::MutexLock lock(mu_);
+  before_sweep_hook_ = std::move(before_sweep);
+  after_release_hook_ = std::move(after_release);
+}
+
 void MemoryReclaimer::Run() {
+  // The intervals' generation the deadlines were computed for.
+  int64_t generation = -1;
   absl::Time next_gc, next_release;
-  {
-    absl::MutexLock lock(mu_);
-    next_gc = NextDue(schema_version_gc_interval_);
-    next_release = NextDue(heap_release_interval_);
-  }
   while (true) {
     bool gc, release;
+    std::function<void()> after_release;
     {
       absl::MutexLock lock(mu_);
-      const int64_t generation = generation_;
+      if (generation != generation_) {
+        generation = generation_;
+        next_gc = NextDue(schema_version_gc_interval_);
+        next_release = NextDue(heap_release_interval_);
+      }
       auto woken = [this, generation]() ABSL_NO_THREAD_SAFETY_ANALYSIS {
         return stopping_ || generation_ != generation;
       };
@@ -90,18 +107,22 @@ void MemoryReclaimer::Run() {
         if (stopping_) {
           return;
         }
-        next_gc = NextDue(schema_version_gc_interval_);
-        next_release = NextDue(heap_release_interval_);
         continue;
       }
       const absl::Time now = absl::Now();
       gc = now >= next_gc;
       release = now >= next_release;
-      if (gc) next_gc = NextDue(schema_version_gc_interval_);
-      if (release) next_release = NextDue(heap_release_interval_);
+      after_release = after_release_hook_;
     }
     if (gc) RemoveExpiredSchemas();
-    if (release) ReleaseHeapIfRequested();
+    if (release && ReleaseHeapIfRequested() && after_release != nullptr) {
+      after_release();
+    }
+    // Each interval runs from the end of its work: a slow sweep must not bring
+    // the next release closer.
+    absl::MutexLock lock(mu_);
+    if (gc) next_gc = NextDue(schema_version_gc_interval_);
+    if (release) next_release = NextDue(heap_release_interval_);
   }
 }
 

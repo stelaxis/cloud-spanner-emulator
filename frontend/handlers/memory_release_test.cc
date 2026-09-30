@@ -444,6 +444,48 @@ TEST_F(MemoryReleaseTest, SchemaChangesRemoveSchemasAsUpstreamDoes) {
   ExpectReadsAsUpstreamWhereASchemaChangeRemovedTheSchema();
 }
 
+// A sweep lasting most of a release interval does not bring the next release
+// closer: releases stay at least an interval apart.
+TEST_F(MemoryReleaseTest, ReleasesStayAnIntervalApartAfterASlowSweep) {
+  struct State {
+    absl::Mutex mu;
+    int sweeps ABSL_GUARDED_BY(mu) = 0;
+    std::vector<absl::Time> releases ABSL_GUARDED_BY(mu);
+  };
+  auto state = std::make_shared<State>();
+  constexpr absl::Duration kInterval = absl::Milliseconds(300);
+  reclaimer()->set_hooks_for_testing(
+      /*before_sweep=*/
+      [state, kInterval] {
+        bool first;
+        {
+          absl::MutexLock lock(state->mu);
+          first = state->sweeps++ == 0;
+        }
+        if (first) absl::SleepFor(kInterval - absl::Milliseconds(50));
+        RequestHeapRelease();
+      },
+      /*after_release=*/
+      [state] {
+        absl::MutexLock lock(state->mu);
+        state->releases.push_back(absl::Now());
+      });
+  reclaimer()->set_intervals_for_testing(kInterval, kInterval);
+  ASSERT_TRUE(Await([&] {
+    absl::MutexLock lock(state->mu);
+    return state->releases.size() >= 3;
+  }));
+  reclaimer()->set_intervals_for_testing(absl::ZeroDuration(),
+                                         absl::ZeroDuration());
+  reclaimer()->set_hooks_for_testing(nullptr, nullptr);
+
+  absl::MutexLock lock(state->mu);
+  for (int i = 1; i < state->releases.size(); ++i) {
+    EXPECT_GE(state->releases[i] - state->releases[i - 1], kInterval)
+        << "release " << i;
+  }
+}
+
 // With both flags 0 the emulator neither sweeps nor releases, and reads are
 // exactly upstream's.
 class MemoryReleaseDisabledTest : public MemoryReleaseTest {
