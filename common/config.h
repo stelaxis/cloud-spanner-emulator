@@ -71,6 +71,14 @@ int max_ephemeral_sessions();
 
 void set_max_ephemeral_sessions(int max_sessions);
 
+// How often free heap memory is returned to the operating system, if anything
+// asked for it (RequestHeapRelease). Zero: never.
+absl::Duration heap_release_interval();
+
+// How often the schema versions no read can need are removed from every
+// database. Zero: only when the database's schema next changes.
+absl::Duration schema_version_gc_interval();
+
 }  // namespace config
 }  // namespace emulator
 }  // namespace spanner

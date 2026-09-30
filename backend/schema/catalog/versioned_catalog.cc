@@ -16,9 +16,11 @@
 
 #include "backend/schema/catalog/versioned_catalog.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -99,6 +101,15 @@ std::shared_ptr<const Schema> VersionedCatalog::GetLatestSchemaShared() const {
   return GetSchemaShared(absl::InfiniteFuture());
 }
 
+std::shared_ptr<const Schema> VersionedCatalog::GetSchemaShared(
+    absl::Time timestamp, bool* removed) const {
+  absl::MutexLock lock(mu_);
+  auto itr = schemas_.upper_bound(timestamp);
+  itr--;
+  *removed = itr == schemas_.begin() && timestamp >= removed_since_;
+  return itr->second;
+}
+
 absl::Status VersionedCatalog::AddSchema(absl::Time creation_time,
                                          std::unique_ptr<const Schema> schema) {
   absl::MutexLock lock(mu_);
@@ -117,7 +128,9 @@ absl::Status VersionedCatalog::AddSchema(absl::Time creation_time,
   return absl::OkStatus();
 }
 
-void VersionedCatalog::RemoveExpiredSchemas(absl::Time timestamp) {
+int VersionedCatalog::RemoveExpiredSchemas(absl::Time timestamp) {
+  // Released after mu_: destroying a schema takes a while.
+  std::vector<std::shared_ptr<const Schema>> removed;
   absl::MutexLock lock(mu_);
   auto upper_bound =
       schemas_.upper_bound(timestamp - version_retention_period_);
@@ -128,8 +141,20 @@ void VersionedCatalog::RemoveExpiredSchemas(absl::Time timestamp) {
       // The current schema needs to be kept to cover the retention period.
       break;
     }
+    removed_since_ = std::min(removed_since_, it->first);
+    removed.push_back(std::move(it->second));
     it = schemas_.erase(it);
   }
+  return removed.size();
+}
+
+std::vector<absl::Time> VersionedCatalog::SchemaTimestampsForTesting() const {
+  absl::MutexLock lock(mu_);
+  std::vector<absl::Time> timestamps;
+  for (const auto& [timestamp, schema] : schemas_) {
+    timestamps.push_back(timestamp);
+  }
+  return timestamps;
 }
 
 }  // namespace backend

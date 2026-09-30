@@ -94,6 +94,7 @@ absl::Status Read(RequestContext* ctx, const spanner_api::ReadRequest* request,
       GOOGLESQL_ASSIGN_OR_RETURN(absl::Time read_timestamp, txn->GetReadTimestamp());
       GOOGLESQL_RETURN_IF_ERROR(ValidateReadTimestampNotTooFarInFuture(
           read_timestamp, ctx->env()->clock()->Now()));
+      GOOGLESQL_RETURN_IF_ERROR(txn->ValidateSchemaRetained());
     }
 
     // Parse read request.
@@ -167,6 +168,7 @@ absl::Status StreamingRead(
       GOOGLESQL_ASSIGN_OR_RETURN(absl::Time read_timestamp, txn->GetReadTimestamp());
       GOOGLESQL_RETURN_IF_ERROR(ValidateReadTimestampNotTooFarInFuture(
           read_timestamp, ctx->env()->clock()->Now()));
+      GOOGLESQL_RETURN_IF_ERROR(txn->ValidateSchemaRetained());
     }
 
     // Parse read request.

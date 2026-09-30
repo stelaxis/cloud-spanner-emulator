@@ -28,6 +28,7 @@
 #include "frontend/collections/multiplexed_session_transaction_manager.h"
 #include "frontend/collections/operation_manager.h"
 #include "frontend/collections/session_manager.h"
+#include "frontend/server/memory_reclaimer.h"
 
 namespace google {
 namespace spanner {
@@ -46,7 +47,8 @@ class ServerEnv {
         instance_partition_manager_(new InstancePartitionManager()),
         operation_manager_(new OperationManager()),
         session_manager_(new SessionManager(clock_.get())),
-        mux_txn_manager_(new MultiplexedSessionTransactionManager()) {}
+        mux_txn_manager_(new MultiplexedSessionTransactionManager()),
+        memory_reclaimer_(new MemoryReclaimer(database_manager_.get())) {}
 
   Clock* clock() { return clock_.get(); }
   DatabaseManager* database_manager() { return database_manager_.get(); }
@@ -59,6 +61,7 @@ class ServerEnv {
   MultiplexedSessionTransactionManager* mux_txn_manager() {
     return mux_txn_manager_.get();
   }
+  MemoryReclaimer* memory_reclaimer() { return memory_reclaimer_.get(); }
 
   // Runs in every DeleteDatabase once it has picked the database to drop,
   // before it releases anything. For tests; set before concurrent use.
@@ -78,6 +81,8 @@ class ServerEnv {
   std::unique_ptr<SessionManager> session_manager_;
   std::unique_ptr<MultiplexedSessionTransactionManager> mux_txn_manager_;
   std::function<void()> drop_database_hook_;
+  // Declared last: it stops before the managers it uses are destroyed.
+  std::unique_ptr<MemoryReclaimer> memory_reclaimer_;
 };
 
 }  // namespace frontend

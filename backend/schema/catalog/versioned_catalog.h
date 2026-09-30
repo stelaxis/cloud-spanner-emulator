@@ -19,6 +19,7 @@
 
 #include <map>
 #include <memory>
+#include <vector>
 
 #include "absl/base/thread_annotations.h"
 #include "absl/status/status.h"
@@ -67,6 +68,13 @@ class VersionedCatalog {
   std::shared_ptr<const Schema> GetLatestSchemaShared() const
       ABSL_LOCKS_EXCLUDED(mu_);
 
+  // GetSchemaShared, also setting `*removed` if RemoveExpiredSchemas removed
+  // the schema in effect at `timestamp`: the schema returned is then an older
+  // one.
+  std::shared_ptr<const Schema> GetSchemaShared(absl::Time timestamp,
+                                                bool* removed) const
+      ABSL_LOCKS_EXCLUDED(mu_);
+
   // Adds a schema at a given timestamp. Returns an error if creation_time is
   // the same or prior to the largest timestamp in all of the schemas. In this
   // case, the new schema will not be added.
@@ -74,7 +82,16 @@ class VersionedCatalog {
                          std::unique_ptr<const Schema> schema)
       ABSL_LOCKS_EXCLUDED(mu_);
 
-  void RemoveExpiredSchemas(absl::Time timestamp) ABSL_LOCKS_EXCLUDED(mu_);
+  // Removes the schemas that no read at or after `timestamp` minus the
+  // retention period needs: all but the first schema, the newest one created
+  // at or before that time and the ones after it. Returns how many it removed.
+  // A removed schema is destroyed once nothing else holds it, never under the
+  // catalog's lock.
+  int RemoveExpiredSchemas(absl::Time timestamp) ABSL_LOCKS_EXCLUDED(mu_);
+
+  // The creation times of the schemas in the catalog, oldest first. For tests.
+  std::vector<absl::Time> SchemaTimestampsForTesting() const
+      ABSL_LOCKS_EXCLUDED(mu_);
 
   absl::Duration version_retention_period() const {
     absl::MutexLock lock(&mu_);
@@ -99,6 +116,11 @@ class VersionedCatalog {
   // The retention period for schema versions.
   absl::Duration version_retention_period_ ABSL_GUARDED_BY(mu_) =
       absl::Hours(1);
+
+  // The creation time of the oldest schema RemoveExpiredSchemas removed, or
+  // InfiniteFuture. It always removes the schemas right after the first one,
+  // so the removed ones were in effect from here until the second schema.
+  absl::Time removed_since_ ABSL_GUARDED_BY(mu_) = absl::InfiniteFuture();
 };
 
 }  // namespace backend

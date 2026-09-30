@@ -67,6 +67,8 @@ absl::Status ReadOnlyTransaction::Read(const ReadArg& read_arg,
     return error::ReadTimestampPastVersionGCLimit(read_timestamp_);
   }
 
+  // Expired schemas can be removed after the check above.
+  GOOGLESQL_RETURN_IF_ERROR(ValidateSchemaRetained());
   std::shared_ptr<const Schema> schema = SchemaShared();
   GOOGLESQL_ASSIGN_OR_RETURN(const ResolvedReadArg resolved_read_arg,
                    ResolveReadArg(read_arg, schema.get()));
@@ -93,13 +95,23 @@ const Schema* ReadOnlyTransaction::schema() const {
   return SchemaShared().get();
 }
 
+absl::Status ReadOnlyTransaction::ValidateSchemaRetained() const {
+  SchemaShared();
+  absl::MutexLock lock(schema_mu_);
+  if (schema_removed_) {
+    return error::ReadTimestampPastVersionGCLimit(read_timestamp_);
+  }
+  return absl::OkStatus();
+}
+
 std::shared_ptr<const Schema> ReadOnlyTransaction::SchemaShared() const {
   // Wait for any concurrent schema change or read-write transactions to commit
   // before accessing database state to read schemas in versioned_catalog.
   lock_handle_->WaitForSafeRead(read_timestamp_);
   absl::MutexLock lock(schema_mu_);
   if (schema_holder_ == nullptr) {
-    schema_holder_ = versioned_catalog_->GetSchemaShared(read_timestamp_);
+    schema_holder_ =
+        versioned_catalog_->GetSchemaShared(read_timestamp_, &schema_removed_);
   }
   return schema_holder_;
 }

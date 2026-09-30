@@ -21,6 +21,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "common/heap_release.h"
 #include "frontend/common/uris.h"
 #include "frontend/entities/database.h"
 #include "frontend/entities/instance.h"
@@ -67,6 +68,9 @@ absl::Status DeleteDatabase(RequestContext* ctx,
   env->session_manager()->DeleteDatabaseSessions(*database);
   env->mux_txn_manager()->RemoveDatabaseTransactions(*database);
   env->operation_manager()->DeleteDatabaseOperations(database);
+  // Unless a request in flight still holds it, the database is freed here.
+  database.reset();
+  RequestHeapRelease();
   return absl::OkStatus();
 }
 

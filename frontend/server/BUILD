@@ -29,6 +29,7 @@ cc_library(
     hdrs = ["request_context.h"],
     deps = [
         ":environment",
+        "//common:heap_release",
         "//frontend/common:uris",
         "//frontend/entities:database",
         "//frontend/entities:instance",
@@ -119,11 +120,26 @@ cc_library(
 )
 
 cc_library(
+    name = "memory_reclaimer",
+    srcs = ["memory_reclaimer.cc"],
+    hdrs = ["memory_reclaimer.h"],
+    deps = [
+        "//common:config",
+        "//common:heap_release",
+        "//frontend/collections:database_manager",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+cc_library(
     name = "environment",
     hdrs = [
         "environment.h",
     ],
     deps = [
+        ":memory_reclaimer",
         "//common:clock",
         "//frontend/collections:database_manager",
         "//frontend/collections:instance_manager",

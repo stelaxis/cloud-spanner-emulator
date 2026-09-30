@@ -128,6 +128,56 @@ TEST(VersionedCatalogTest, ExpiredSchemasThatCoverRetentionPeriodAreKept) {
   EXPECT_EQ(catalog.GetSchema(t0), catalog.GetSchema(absl::InfinitePast()));
 }
 
+TEST(VersionedCatalogTest, RemoveExpiredSchemasReturnsHowManyItRemoved) {
+  VersionedCatalog catalog;
+  absl::Time t0 = absl::Now();
+  absl::Time t1 = t0 + absl::Minutes(10);
+  absl::Time t2 = t0 + absl::Minutes(20);
+  absl::Time t3 = t0 + absl::Minutes(30);
+  for (absl::Time t : {t0, t1, t2, t3}) {
+    GOOGLESQL_EXPECT_OK(catalog.AddSchema(t, std::make_unique<const Schema>()));
+  }
+
+  // Reads from a second after t2 on need the schema created at t2 and later.
+  EXPECT_EQ(
+      catalog.RemoveExpiredSchemas(t2 + absl::Hours(1) + absl::Seconds(1)), 2);
+  EXPECT_THAT(catalog.SchemaTimestampsForTesting(),
+              testing::ElementsAre(absl::InfinitePast(), t2, t3));
+  EXPECT_EQ(
+      catalog.RemoveExpiredSchemas(t2 + absl::Hours(1) + absl::Seconds(1)), 0);
+}
+
+TEST(VersionedCatalogTest, LookupsTellWhetherTheirSchemaWasRemoved) {
+  VersionedCatalog catalog;
+  absl::Time t1 = absl::Now();
+  absl::Time t2 = t1 + absl::Minutes(10);
+  absl::Time t3 = t1 + absl::Minutes(20);
+  for (absl::Time t : {t1, t2, t3}) {
+    GOOGLESQL_EXPECT_OK(catalog.AddSchema(t, std::make_unique<const Schema>()));
+  }
+  bool removed = true;
+  std::shared_ptr<const Schema> at_t1 = catalog.GetSchemaShared(t1, &removed);
+  EXPECT_FALSE(removed);
+
+  EXPECT_EQ(catalog.RemoveExpiredSchemas(t3 + absl::Hours(1)), 2);
+  const Schema* first = catalog.GetSchema(absl::InfinitePast());
+  // Before the first removed schema, the first schema is the right one.
+  EXPECT_EQ(catalog.GetSchemaShared(t1 - absl::Seconds(1), &removed).get(),
+            first);
+  EXPECT_FALSE(removed);
+  // From it up to the next schema kept, a lookup gets the first schema, which
+  // was not in effect then.
+  for (absl::Time t : {t1, t2, t3 - absl::Microseconds(1)}) {
+    EXPECT_EQ(catalog.GetSchemaShared(t, &removed).get(), first);
+    EXPECT_TRUE(removed);
+  }
+  EXPECT_NE(catalog.GetSchemaShared(t3, &removed).get(), first);
+  EXPECT_FALSE(removed);
+
+  // A schema held elsewhere outlives its removal.
+  EXPECT_EQ(at_t1.use_count(), 1);
+}
+
 }  // namespace
 }  // namespace backend
 }  // namespace emulator

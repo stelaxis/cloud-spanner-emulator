@@ -237,6 +237,7 @@ absl::Status PartitionQuery(RequestContext* ctx,
   }
 
   // check query is partitionable.
+  GOOGLESQL_RETURN_IF_ERROR(txn->ValidateSchemaRetained());
   GOOGLESQL_ASSIGN_OR_RETURN(
       backend::Query query,
       QueryFromProto(request->sql(), request->params(), request->param_types(),

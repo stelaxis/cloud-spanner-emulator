@@ -63,7 +63,10 @@ class TestEnv {
   using SpannerStub = v1::Spanner::Stub;
 
  public:
-  TestEnv();
+  TestEnv() : TestEnv(absl::ZeroDuration()) {}
+  // Starts the server's clock `clock_offset` from the system clock. Behind it,
+  // a test can move the clock forward and still read without waiting.
+  explicit TestEnv(absl::Duration clock_offset);
   ~TestEnv();
 
   DatabaseAdminStub* database_admin_client() const {
@@ -105,6 +108,10 @@ class TestEnv {
 // can inherit from this class to run integration tests.
 class ServerTest : public testing::Test {
  public:
+  ServerTest() = default;
+  // See TestEnv(absl::Duration).
+  explicit ServerTest(absl::Duration clock_offset) : test_env_(clock_offset) {}
+
   TestEnv* test_env() { return &test_env_; }
 
  protected:

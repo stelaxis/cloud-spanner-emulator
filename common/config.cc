@@ -69,6 +69,20 @@ ABSL_FLAG(int, max_ephemeral_sessions, 256,
           "RESOURCE_EXHAUSTED. Copies do not count towards "
           "--override_max_databases_per_instance.");
 
+ABSL_FLAG(int, heap_release_interval_seconds, 10,
+          "Seconds between returns of free heap memory to the operating "
+          "system. Dropping a database or an instance, a schema change and "
+          "removing old schema versions free memory that the allocator would "
+          "otherwise keep; a background thread returns it at most once per "
+          "interval. Only glibc builds, such as the Linux image, return it. "
+          "0 disables it.");
+
+ABSL_FLAG(int, schema_version_gc_interval_seconds, 60,
+          "Seconds between sweeps that remove, from every database, the "
+          "schema versions no read can need any more: those superseded longer "
+          "than the database's version_retention_period ago. 0 disables the "
+          "sweep: the next schema change of a database still removes them.");
+
 namespace google {
 namespace spanner {
 namespace emulator {
@@ -118,6 +132,14 @@ int max_ephemeral_sessions() {
 
 void set_max_ephemeral_sessions(int max_sessions) {
   absl::SetFlag(&FLAGS_max_ephemeral_sessions, max_sessions);
+}
+
+absl::Duration heap_release_interval() {
+  return absl::Seconds(absl::GetFlag(FLAGS_heap_release_interval_seconds));
+}
+
+absl::Duration schema_version_gc_interval() {
+  return absl::Seconds(absl::GetFlag(FLAGS_schema_version_gc_interval_seconds));
 }
 
 }  // namespace config

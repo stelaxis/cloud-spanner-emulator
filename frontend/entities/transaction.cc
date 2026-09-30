@@ -176,6 +176,13 @@ const backend::Schema* Transaction::schema() const {
   }
 }
 
+absl::Status Transaction::ValidateSchemaRetained() const {
+  if (type_ == kReadOnly) {
+    return read_only()->ValidateSchemaRetained();
+  }
+  return absl::OkStatus();
+}
+
 backend::TransactionID Transaction::id() const {
   switch (type_) {
     case kReadOnly: {

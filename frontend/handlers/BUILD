@@ -525,6 +525,33 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "memory_release_test",
+    srcs = ["memory_release_test.cc"],
+    deps = [
+        "//backend/database",
+        "//common:heap_release",
+        "//frontend/collections:database_manager",
+        "//frontend/collections:session_manager",
+        "//frontend/converters:time",
+        "//frontend/entities:database",
+        "//frontend/server:memory_reclaimer",
+        "//tests/common:proto_matchers",
+        "//tests/common:test_env",
+        "@com_github_grpc_grpc//:grpc++",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
+        "@com_google_googleapis//google/spanner/admin/database/v1:database_cc_proto",
+        "@com_google_googleapis//google/spanner/admin/instance/v1:instance_cc_proto",
+        "@com_google_googleapis//google/spanner/v1:spanner_cc_grpc",
+        "@com_google_googlesql//googlesql/base/testing:status_matchers",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_protobuf//:cc_wkt_protos",
+    ],
+)
+
 cc_library(
     name = "transactions",
     srcs = ["transactions.cc"],

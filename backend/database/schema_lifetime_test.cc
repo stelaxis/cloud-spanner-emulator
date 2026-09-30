@@ -16,10 +16,11 @@
 
 // A schema someone still uses must survive its removal from the versioned
 // catalog. Each test holds a schema while newer schemas are published and the
-// catalog garbage-collects the old one, then uses it. A controlled clock makes
-// the collection deterministic: schema changes two hours apart expire every
-// schema older than the one-hour retention period. Run under AddressSanitizer
-// to catch a use of a freed schema.
+// catalog garbage-collects the old one, at a schema change or in a sweep
+// (Database::RemoveExpiredSchemas), then uses it. A controlled clock makes the
+// collection deterministic: schema changes two hours apart expire every schema
+// older than the one-hour retention period. Run under AddressSanitizer to
+// catch a use of a freed schema.
 
 #include <atomic>
 #include <cstdint>
@@ -33,8 +34,10 @@
 #include "googlesql/base/testing/status_matchers.h"
 #include "googlesql/public/value.h"
 #include "tests/common/proto_matchers.h"
+#include "absl/random/random.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
@@ -61,6 +64,10 @@ namespace backend {
 namespace {
 
 using ::googlesql_base::testing::StatusIs;
+using ::testing::HasSubstr;
+
+const ReadArg kReadAll{
+    .table = "T", .key_set = KeySet::All(), .columns = {"k", "v"}};
 
 class SchemaLifetimeTest : public testing::Test {
  protected:
@@ -103,6 +110,30 @@ class SchemaLifetimeTest : public testing::Test {
   std::unique_ptr<ReadWriteTransaction> BeginReadWrite() {
     return db_->CreateReadWriteTransaction(ReadWriteOptions(), RetryState())
         .value();
+  }
+
+  // Moves the clock on without a schema change.
+  void AdvanceClock(absl::Duration duration) {
+    now_micros_ += absl::ToInt64Microseconds(duration);
+  }
+
+  void ChangeSchema(const std::string& statement) {
+    int completed;
+    absl::Time commit_ts;
+    absl::Status backfill;
+    GOOGLESQL_ASSERT_OK(
+        db_->UpdateSchema(SchemaChangeOperation{.statements = {statement}},
+                          &completed, &commit_ts, &backfill));
+    GOOGLESQL_ASSERT_OK(backfill);
+  }
+
+  void InsertRow(int64_t k, int64_t v) {
+    auto txn = BeginReadWrite();
+    Mutation m;
+    m.AddWriteOp(MutationOpType::kInsert, "T", {"k", "v"},
+                 {{googlesql::values::Int64(k), googlesql::values::Int64(v)}});
+    GOOGLESQL_ASSERT_OK(txn->Write(m));
+    GOOGLESQL_ASSERT_OK(txn->Commit());
   }
 
   std::atomic<int64_t> now_micros_;
@@ -324,6 +355,151 @@ TEST_F(SchemaLifetimeTest, ReadOnlyCursorKeepsItsSchema) {
   EXPECT_TRUE(cursor->ColumnType(1)->IsInt64());
   EXPECT_EQ(cursor->ColumnValue(1).int64_value(), 10);
   EXPECT_FALSE(cursor->Next());
+}
+
+// A sweep removes the schema of a read-only transaction once no read can need
+// it any more. The transaction and its cursor keep it alive; the
+// transaction's reads then fail as too old.
+TEST_F(SchemaLifetimeTest, SweepLeavesAReadOnlyTransactionItsSchema) {
+  CreateDatabase();
+  InsertRow(1, 10);
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<ReadOnlyTransaction> ro,
+      db_->CreateReadOnlyTransaction(ReadOnlyOptions()));
+  std::unique_ptr<RowCursor> cursor;
+  GOOGLESQL_ASSERT_OK(ro->Read(kReadAll, &cursor));
+  const Schema* schema = ro->schema();
+  PublishSchema();  // The transaction's schema still covers the retention.
+  AdvanceClock(absl::Hours(2));
+  EXPECT_EQ(db_->RemoveExpiredSchemas(), 1);
+
+  EXPECT_NE(schema->FindTable("X1"), nullptr);
+  EXPECT_EQ(schema->FindTable("X2"), nullptr);
+  ASSERT_TRUE(cursor->Next());
+  EXPECT_EQ(cursor->ColumnName(1), "v");
+  EXPECT_EQ(cursor->ColumnValue(1).int64_value(), 10);
+  EXPECT_FALSE(cursor->Next());
+  EXPECT_THAT(ro->Read(kReadAll, &cursor),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("exceeded the maximum timestamp staleness")));
+  GOOGLESQL_EXPECT_OK(ro->ValidateSchemaRetained());
+}
+
+// A sweep removes the schema a query was analyzed against. Its rows can still
+// be read, and another query is still analyzed against it; that one fails as
+// too old when it reads.
+TEST_F(SchemaLifetimeTest, SweepLeavesAQueryItsSchema) {
+  CreateDatabase();
+  InsertRow(1, 10);
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<ReadOnlyTransaction> ro,
+      db_->CreateReadOnlyTransaction(ReadOnlyOptions()));
+  const QueryContext context{
+      .schema = ro->schema(), .reader = ro.get(), .is_read_only_txn = true};
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      QueryResult result, db_->query_engine()->ExecuteSql(
+                              Query{.sql = "SELECT k, v FROM T"}, context));
+  PublishSchema();
+  AdvanceClock(absl::Hours(2));
+  EXPECT_EQ(db_->RemoveExpiredSchemas(), 1);
+
+  ASSERT_TRUE(result.rows->Next());
+  EXPECT_EQ(result.rows->ColumnValue(1).int64_value(), 10);
+  EXPECT_FALSE(result.rows->Next());
+  EXPECT_THAT(db_->query_engine()->ExecuteSql(
+                  Query{.sql = "SELECT v FROM T WHERE k > 0"}, context),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("exceeded the maximum timestamp staleness")));
+}
+
+// Read-only transactions read at the edge of the retention period while the
+// clock moves on and sweeps, and schema changes, remove the schemas they read
+// at. Every read and query either works against its own schema or fails as too
+// old; a transaction whose schema was removed before it took one fails
+// ValidateSchemaRetained, as the frontend checks before a query.
+TEST_F(SchemaLifetimeTest, SweepRacesReadsAtTheRetentionEdge) {
+  CreateDatabase();
+  InsertRow(1, 10);
+  // Twenty schemas a minute apart, then the retention edge at the first one.
+  for (int i = 0; i < 20; ++i) {
+    AdvanceClock(absl::Minutes(1));
+    ChangeSchema(absl::StrCat("CREATE TABLE Y", i,
+                              " (k INT64 NOT NULL) PRIMARY KEY (k)"));
+  }
+  AdvanceClock(absl::Minutes(40));
+
+  std::atomic<bool> stop = false;
+  std::atomic<int> ok = 0, too_old = 0;
+  std::vector<std::thread> readers;
+  for (int r = 0; r < 4; ++r) {
+    readers.emplace_back([&] {
+      absl::BitGen gen;
+      for (int i = 0; !stop; ++i) {
+        const absl::Time edge = clock_.Now() - absl::Hours(1);
+        absl::StatusOr<std::unique_ptr<ReadOnlyTransaction>> ro =
+            db_->CreateReadOnlyTransaction(ReadOnlyOptions{
+                .bound = TimestampBound::kExactTimestamp,
+                .timestamp =
+                    edge + absl::Milliseconds(absl::Uniform(gen, -300, 300))});
+        GOOGLESQL_ASSERT_OK(ro);
+        absl::Status status;
+        if (i % 2 == 0) {
+          std::unique_ptr<RowCursor> cursor;
+          status = (*ro)->Read(kReadAll, &cursor);
+          while (status.ok() && cursor->Next()) {
+          }
+        } else {
+          status = (*ro)->ValidateSchemaRetained();
+          if (status.ok()) {
+            absl::StatusOr<QueryResult> result =
+                db_->query_engine()->ExecuteSql(
+                    Query{.sql = "SELECT k, v FROM T"},
+                    QueryContext{.schema = (*ro)->schema(),
+                                 .reader = ro->get(),
+                                 .is_read_only_txn = true});
+            status = result.status();
+            while (status.ok() && result->rows->Next()) {
+            }
+          }
+        }
+        if (status.ok()) {
+          ++ok;
+        } else if (status.code() == absl::StatusCode::kFailedPrecondition &&
+                   absl::StrContains(status.message(),
+                                     "maximum timestamp staleness")) {
+          ++too_old;
+        } else {
+          ADD_FAILURE() << status;
+        }
+      }
+    });
+  }
+  std::thread schema_changes([&] {
+    for (int i = 0; i < 10; ++i) {
+      ChangeSchema(absl::StrCat("CREATE TABLE Z", i,
+                                " (k INT64 NOT NULL) PRIMARY KEY (k)"));
+      absl::SleepFor(absl::Milliseconds(20));
+    }
+  });
+
+  // The edge crosses the twenty schemas in 100 ms steps, sweeping after each.
+  int removed = 0;
+  for (int step = 0; step < 20 * 600 + 10; ++step) {
+    AdvanceClock(absl::Milliseconds(100));
+    removed += db_->RemoveExpiredSchemas();
+  }
+  schema_changes.join();
+  stop = true;
+  for (std::thread& reader : readers) {
+    reader.join();
+  }
+
+  // Sweeps and schema changes removed X1 and Y0 to Y18. Left: the creation
+  // schema, Y19 (the newest at the edge) and the ten newer ones.
+  EXPECT_GT(removed, 0);
+  EXPECT_EQ(db_->SchemaTimestampsForTesting().size(), 12);
+  EXPECT_GT(ok, 0);
+  EXPECT_GT(too_old, 0);
 }
 
 }  // namespace

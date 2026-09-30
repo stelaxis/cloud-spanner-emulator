@@ -285,6 +285,7 @@ absl::Status ExecuteSql(RequestContext* ctx,
           GOOGLESQL_ASSIGN_OR_RETURN(absl::Time read_timestamp, txn->GetReadTimestamp());
           GOOGLESQL_RETURN_IF_ERROR(ValidateReadTimestampNotTooFarInFuture(
               read_timestamp, ctx->env()->clock()->Now()));
+          GOOGLESQL_RETURN_IF_ERROR(txn->ValidateSchemaRetained());
         }
 
         // Convert and execute provided SQL statement.
@@ -465,6 +466,7 @@ absl::Status ExecuteStreamingSql(
           GOOGLESQL_ASSIGN_OR_RETURN(absl::Time read_timestamp, txn->GetReadTimestamp());
           GOOGLESQL_RETURN_IF_ERROR(ValidateReadTimestampNotTooFarInFuture(
               read_timestamp, ctx->env()->clock()->Now()));
+          GOOGLESQL_RETURN_IF_ERROR(txn->ValidateSchemaRetained());
         }
         // Convert and execute provided SQL statement.
         GOOGLESQL_ASSIGN_OR_RETURN(

@@ -27,6 +27,7 @@
 
 #include "google/spanner/admin/database/v1/common.pb.h"
 #include "googlesql/public/types/type_factory.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/functional/bind_front.h"
 #include "absl/log/log.h"
@@ -59,6 +60,7 @@
 #include "backend/transaction/read_write_transaction.h"
 #include "common/clock.h"
 #include "common/errors.h"
+#include "common/heap_release.h"
 #include "googlesql/base/logging.h"
 #include "googlesql/base/status_macros.h"
 #include "absl/status/status.h"
@@ -360,6 +362,9 @@ absl::Status Database::UpdateSchema(
   if (schema_change_operation.statements.empty()) {
     return error::UpdateDatabaseMissingStatements();
   }
+  // Whether it succeeds or not, a schema change frees the schemas it built on
+  // the way, and the schema versions it expired.
+  absl::Cleanup release_heap = [] { RequestHeapRelease(); };
 
   // One schema change at a time, so that churners are reconciled with the
   // schemas in commit order.
@@ -437,6 +442,10 @@ const Schema* Database::GetLatestSchema() const {
 
 std::shared_ptr<const Schema> Database::GetLatestSchemaShared() const {
   return versioned_catalog_->GetLatestSchemaShared();
+}
+
+int Database::RemoveExpiredSchemas() {
+  return versioned_catalog_->RemoveExpiredSchemas(clock_->Now());
 }
 
 }  // namespace backend

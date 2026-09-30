@@ -67,7 +67,8 @@ absl::Status ReadFromClientReader(
 
 }  // namespace
 
-TestEnv::TestEnv() {
+TestEnv::TestEnv(absl::Duration clock_offset)
+    : clock_offset_micros_(absl::ToInt64Microseconds(clock_offset)) {
   // Set up gRPC server in a detached thread.
   server_thread_ = std::make_unique<std::thread>(&TestEnv::SetupServer, this);
   WaitForServerReady();
