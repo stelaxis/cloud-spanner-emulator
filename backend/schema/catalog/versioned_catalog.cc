@@ -147,7 +147,8 @@ int VersionedCatalog::RemoveExpiredSchemas(absl::Time timestamp, bool swept) {
   }
   if (swept && !removed.empty()) {
     // `it` is the schema kept after the removed ones. Extending the range to it
-    // also covers what schema changes removed since the previous sweep.
+    // also covers what schema changes removed since the previous sweep that
+    // removed any.
     if (swept_begin_ == swept_end_) swept_begin_ = oldest_removed;
     swept_end_ = it->first;
   }

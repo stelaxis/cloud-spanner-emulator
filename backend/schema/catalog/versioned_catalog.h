@@ -88,10 +88,11 @@ class VersionedCatalog {
   // retention period needs: all but the first schema, the newest one created
   // at or before that time and the ones after it. Returns how many it removed.
   // A removed schema is destroyed once nothing else holds it, never under the
-  // catalog's lock. With `swept`, the removal is a sweep's, and lookups at the
-  // times the removed schemas were in effect report it from then on, as do
-  // lookups at the times of the schemas a schema change removed since an
-  // earlier sweep removed any.
+  // catalog's lock. With `swept`, the removal is a sweep's: if it removes any,
+  // lookups at the times the removed schemas were in effect report it from
+  // then on, as do lookups at the times of the schemas a schema change removed
+  // since the previous sweep that removed any. A sweep that removes nothing
+  // changes no lookup.
   int RemoveExpiredSchemas(absl::Time timestamp, bool swept = false)
       ABSL_LOCKS_EXCLUDED(mu_);
 
@@ -132,10 +133,11 @@ class VersionedCatalog {
   // the creation of the oldest schema that the first sweep to remove any
   // removed, to the creation of the schema that the latest such sweep kept.
   // Schemas are removed oldest first, so no schema in effect in it is left:
-  // it also covers those a schema change removed between two sweeps, where a
-  // lookup could only return an older schema. That keeps it one range however
-  // often sweeps and schema changes alternate. Empty until a sweep removes a
-  // schema.
+  // it also covers those a schema change removed between two such sweeps,
+  // where a lookup could only return an older schema. That keeps it one range
+  // however often sweeps and schema changes alternate. Schemas a schema change
+  // removes before the first such sweep or after the latest stay outside it,
+  // as upstream. Empty until a sweep removes a schema.
   absl::Time swept_begin_ ABSL_GUARDED_BY(mu_) = absl::InfinitePast();
   absl::Time swept_end_ ABSL_GUARDED_BY(mu_) = absl::InfinitePast();
 };

@@ -346,7 +346,8 @@ class CatalogModel {
   }
 
   // Whether a lookup reports a sweep: a sweep removed the schema in effect, or
-  // a schema change did after one sweep removed schemas and before another.
+  // a schema change did after one sweep removed schemas and before another
+  // that did.
   bool Swept(absl::Time timestamp) const {
     const ModelSchema& schema = schemas_[InEffect(timestamp)];
     if (schema.removed_by == 0) return false;

@@ -120,9 +120,10 @@ build:ci --remote_download_minimal
 build:ci --experimental_remote_cache_eviction_retries=5
 # Every job fetches external repositories from their origins. GitHub has
 # answered a release download with 500 for longer than the default 8 attempts
-# wait (about 13 s): 12 attempts with waits capped at 30 s span about two
-# minutes. The connector does not retry a connection dropped mid-download; the
-# downloader retries restart those.
+# wait (10-16 s in all). With 12 attempts, each wait doubles from 0.1 s up to
+# the 30 s cap, then gets +/-25% jitter, so one wait can reach 37.5 s and all
+# of them add up to 83-139 s. The connector does not retry a connection
+# dropped mid-download; the downloader retries restart those.
 build:ci --http_connector_attempts=12
 build:ci --http_connector_retry_max_timeout=30s
 build:ci --experimental_repository_downloader_retries=3

@@ -80,17 +80,35 @@ from a schema that was not in effect then: a table not found, or
 `INFORMATION_SCHEMA` rows of the wrong time.
 
 Schema versions that a schema change removes keep upstream's behaviour: reads
-at their times are resolved against the older schema that is left, as
-upstream's conformance tests expect. The exception is a version that a schema
-change removes after a sweep has removed versions of the same database: once
-a later sweep removes versions too, reads at its time get the staleness error
-as well. Each database records the swept time as one range, from the oldest
-version that the first of its sweeps to remove any removed, to the version
-that the latest such sweep kept, so the record stays the same size however
-often sweeps and schema changes alternate. No version in effect in that range
-is left, so the older schema would be the wrong one there too. With
-`--schema_version_gc_interval_seconds=0` nothing is swept, so every read
-behaves as upstream's.
+at their times are resolved against the older schema that is left, the
+database's first, as upstream's conformance tests expect. The exception is
+time that sweeps have cleared. Each database records it as one range: from the
+oldest version that its first sweep to remove any removed, to the version that
+its latest such sweep kept. Versions are removed oldest first, so no version in
+effect anywhere in that range is left, including versions a schema change
+removed between two such sweeps; the record stays one range however often
+sweeps and schema changes alternate. Only read timestamps inside that range get
+the staleness error whatever the retention period.
+
+So two cases keep master's behaviour and are answered from the database's
+first schema:
+
+- **A version a schema change removed after the latest sweep that removed
+  any.** A later sweep brings its time into the range only if that sweep
+  removes a version itself; a sweep that removes nothing does not. (Versions a
+  schema change removed before the first such sweep stay outside the range.)
+- **A read-only transaction that fell back to the first schema before a sweep
+  brought its read timestamp into the range**, because a schema change had
+  removed the version in effect then. A transaction keeps the schema it took at
+  its first read or query, and whether that counted as swept, for its whole
+  life; the later sweep changes neither.
+
+For a read the retention period covers, either case needs the retention
+period to have been lengthened after the version was removed, and the second
+also a change of the retention period while the transaction is open: a
+removal only removes versions that the retention period in force then no
+longer covers. With `--schema_version_gc_interval_seconds=0` nothing is swept,
+so every read behaves as upstream's.
 
 ## What is not freed early
 
