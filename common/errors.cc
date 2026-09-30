@@ -863,7 +863,7 @@ absl::Status ReadTimestampPastVersionGCLimit(absl::Time timestamp) {
   return absl::Status(
       absl::StatusCode::kFailedPrecondition,
       absl::StrCat("Read-only transaction timestamp ",
-                   absl::FormatTime(timestamp),
+                   absl::FormatTime(timestamp, absl::UTCTimeZone()),
                    " has exceeded the maximum timestamp staleness"));
 }
 
@@ -871,7 +871,8 @@ absl::Status ReadTimestampTooFarInFuture(absl::Time timestamp) {
   return absl::Status(
       absl::StatusCode::kDeadlineExceeded,
       absl::StrCat(
-          "Read-only transaction timestamp ", absl::FormatTime(timestamp),
+          "Read-only transaction timestamp ",
+          absl::FormatTime(timestamp, absl::UTCTimeZone()),
           " is more than 1 hour in future. This request will execute for longer"
           " than the configured Cloud Spanner server deadline of 1 hour and"
           " will return with the DEADLINE_EXCEEDED error."));
@@ -2303,7 +2304,7 @@ absl::Status TableNotFoundAtTimestamp(absl::string_view table_name,
   return absl::Status(
       absl::StatusCode::kNotFound,
       absl::StrCat("Table '", table_name, "' is not found at timestamp: ",
-                   absl::FormatTime(timestamp), "."));
+                   absl::FormatTime(timestamp, absl::UTCTimeZone()), "."));
 }
 
 absl::Status IndexNotFound(absl::string_view index_name) {
@@ -2393,8 +2394,8 @@ absl::Status ColumnNotFoundAtTimestamp(absl::string_view table_name,
   return absl::Status(
       absl::StatusCode::kNotFound,
       absl::StrCat("Table '", table_name, "' does not have Column ",
-                   column_name, " at timestamp ", absl::FormatTime(timestamp),
-                   "."));
+                   column_name, " at timestamp ",
+                   absl::FormatTime(timestamp, absl::UTCTimeZone()), "."));
 }
 
 absl::Status MutationColumnAndValueSizeMismatch(int columns_size,
@@ -2460,7 +2461,7 @@ absl::Status CommitTimestampInFuture(absl::Time timestamp) {
   return absl::Status(
       absl::StatusCode::kFailedPrecondition,
       absl::StrCat("Cannot write timestamps in the future, found: ",
-                   absl::FormatTime(timestamp)));
+                   absl::FormatTime(timestamp, absl::UTCTimeZone())));
 }
 
 absl::Status CommitTimestampNotInFuture(absl::string_view column,
@@ -2471,7 +2472,7 @@ absl::Status CommitTimestampNotInFuture(absl::string_view column,
       absl::Substitute(
           "Setting allow_commit_timestamp option on column $0 is not allowed "
           "because it has a timestamp in the future at key: $1 $2",
-          column, key, absl::FormatTime(timestamp)));
+          column, key, absl::FormatTime(timestamp, absl::UTCTimeZone())));
 }
 
 absl::Status CannotReadPendingCommitTimestamp(absl::string_view entity_string) {
@@ -2514,15 +2515,17 @@ absl::Status StalenessMustBeNonNegative() {
 }
 
 absl::Status InvalidMinReadTimestamp(absl::Time min_read_timestamp) {
-  return absl::Status(absl::StatusCode::kInvalidArgument,
-                      absl::StrCat("Invalid min read timestamp: ",
-                                   absl::FormatTime(min_read_timestamp)));
+  return absl::Status(
+      absl::StatusCode::kInvalidArgument,
+      absl::StrCat("Invalid min read timestamp: ",
+                   absl::FormatTime(min_read_timestamp, absl::UTCTimeZone())));
 }
 
 absl::Status InvalidExactReadTimestamp(absl::Time exact_read_timestamp) {
   return absl::Status(absl::StatusCode::kInvalidArgument,
                       absl::StrCat("Invalid exact read timestamp: ",
-                                   absl::FormatTime(exact_read_timestamp)));
+                                   absl::FormatTime(exact_read_timestamp,
+                                                    absl::UTCTimeZone())));
 }
 
 absl::Status StrongReadOptionShouldBeTrue() {

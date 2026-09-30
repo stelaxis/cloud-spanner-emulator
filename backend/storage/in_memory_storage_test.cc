@@ -16,13 +16,39 @@
 
 #include "backend/storage/in_memory_storage.h"
 
+#include "absl/base/config.h"
+
+#if defined(ABSL_HAVE_ADDRESS_SANITIZER) || \
+    defined(ABSL_HAVE_THREAD_SANITIZER) || defined(ABSL_HAVE_MEMORY_SANITIZER)
+#define EMULATOR_SANITIZER_ALLOCATOR 1
+#if __has_include(<sanitizer/allocator_interface.h>)
+#include <sanitizer/allocator_interface.h>
+#else
+#include <cstddef>
+// GCC's sanitizer runtimes define it but do not install this header.
+extern "C" std::size_t __sanitizer_get_current_allocated_bytes(void);
+#endif
+#endif
+
+#if defined(__APPLE__)
+#include <CoreFoundation/CoreFoundation.h>
+#include <malloc/malloc.h>
+#elif defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
+#include <cstdint>
+#include <cstdlib>
 #include <memory>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "googlesql/base/testing/status_matchers.h"
 #include "tests/common/proto_matchers.h"
+#include "absl/time/civil_time.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "backend/datamodel/key_range.h"
@@ -138,6 +164,100 @@ TEST_F(InMemoryStorageTest, LookupByTimestamp) {
                               Key({Int64(1)}), {kColumnID}, &values),
               googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
   EXPECT_TRUE(values.empty());
+}
+
+// Sets TZ, or unsets it for the system's own zone, until destroyed.
+class ScopedTz {
+ public:
+  explicit ScopedTz(const char* tz) {
+    if (const char* previous = getenv("TZ"); previous != nullptr) {
+      previous_ = previous;
+    }
+    Set(tz);
+  }
+  ~ScopedTz() { Set(previous_.has_value() ? previous_->c_str() : nullptr); }
+
+ private:
+  static void Set(const char* tz) {
+    if (tz == nullptr) {
+      unsetenv("TZ");
+    } else {
+      setenv("TZ", tz, /*overwrite=*/1);
+    }
+#if defined(__APPLE__)
+    // CoreFoundation caches the system zone.
+    CFTimeZoneResetSystem();
+#endif
+  }
+
+  std::optional<std::string> previous_;
+};
+
+// Bytes allocated and not yet freed, where the platform reports them.
+std::optional<int64_t> LiveHeapBytes() {
+#if defined(EMULATOR_SANITIZER_ALLOCATOR)
+  // A sanitizer's malloc zone statistics count every allocation ever made.
+  return static_cast<int64_t>(__sanitizer_get_current_allocated_bytes());
+#elif defined(__APPLE__)
+  malloc_statistics_t stats;
+  malloc_zone_statistics(/*zone=*/nullptr, &stats);
+  return static_cast<int64_t>(stats.size_in_use);
+#elif defined(__GLIBC__)
+  struct mallinfo2 info = mallinfo2();
+  return static_cast<int64_t>(info.uordblks + info.hblkhd);
+#else
+  return std::nullopt;
+#endif
+}
+
+// A miss must not read the local time zone; see FormatLookupTime.
+TEST_F(InMemoryStorageTest, LookupMissFormatsTimeInUtc) {
+  ScopedTz tz("America/Argentina/Buenos_Aires");
+  absl::Time timestamp = absl::FromCivil(absl::CivilSecond(2026, 1, 2, 3, 4, 5),
+                                         absl::UTCTimeZone());
+  EXPECT_THAT(
+      storage_.Lookup(timestamp, kTableId0, Key({Int64(1)}), {}, nullptr),
+      googlesql_base::testing::StatusIs(
+          absl::StatusCode::kNotFound,
+          testing::HasSubstr("2026-01-02T03:04:05+00:00")));
+}
+
+// The leak FormatLookupTime avoids. This check reproduces it only on macOS
+// whose system zone is not UTC: only the system's own zone leaks, and only if
+// its name is too long to be stored without an allocation ("UTC", which
+// `bazel test` sets, is not). A pass on a UTC host or on Linux says nothing
+// about the leak.
+TEST_F(InMemoryStorageTest, LookupMissesKeepNoMemory) {
+  ScopedTz tz(nullptr);
+  absl::Time write_ts = absl::Now();
+  GOOGLESQL_EXPECT_OK(storage_.Write(write_ts, kTableId0, Key({Int64(1)}),
+                                     {kColumnID}, {String("value-1")}));
+  auto miss = [&](int times) {
+    std::vector<googlesql::Value> values;
+    for (int i = 0; i < times; ++i) {
+      // No such table, no such key, and a key that does not exist yet.
+      EXPECT_FALSE(
+          storage_.Lookup(write_ts, kTableId1, Key({Int64(1)}), {}, nullptr)
+              .ok());
+      EXPECT_FALSE(
+          storage_.Lookup(write_ts, kTableId0, Key({Int64(2)}), {}, nullptr)
+              .ok());
+      EXPECT_FALSE(storage_
+                       .Lookup(write_ts - absl::Nanoseconds(1), kTableId0,
+                               Key({Int64(1)}), {kColumnID}, &values)
+                       .ok());
+    }
+  };
+  // The allocator's caches settle during the first misses.
+  miss(10000);
+
+  std::optional<int64_t> before = LiveHeapBytes();
+  if (!before.has_value()) {
+    GTEST_SKIP() << "This platform does not report heap usage.";
+  }
+  miss(10000);
+  // Leaking a 64-byte name per miss would add about 2 MB.
+  EXPECT_LT(*LiveHeapBytes() - *before, 512 * 1024);
 }
 
 TEST_F(InMemoryStorageTest, ReadByTimestamp) {

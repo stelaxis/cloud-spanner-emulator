@@ -52,7 +52,8 @@ std::string ToFragmentIdString(int64_t record_sequence) {
 
 JSON CreateHeartbeatRecord(absl::Time timestamp) {
   JSON heartbeat_record;
-  heartbeat_record[kTimestamp] = absl::FormatTime(timestamp);
+  heartbeat_record[kTimestamp] =
+      absl::FormatTime(timestamp, absl::UTCTimeZone());
   return heartbeat_record;
 }
 
@@ -65,8 +66,10 @@ JSON CreateChildPartitionRecord(
   JSON child_partition_record;
   child_partition_record[kStartTimestamp] =
       initial_start_timestamp.has_value()
-          ? absl::FormatTime(initial_start_timestamp.value())
-          : absl::FormatTime(cursor->ColumnValue(0).ToTime());
+          ? absl::FormatTime(initial_start_timestamp.value(),
+                             absl::UTCTimeZone())
+          : absl::FormatTime(cursor->ColumnValue(0).ToTime(),
+                             absl::UTCTimeZone());
   child_partition_record[kRecordSequence] = ToFragmentIdString(record_sequence);
   // If a split event happens during partition query, one child partition record
   // can contain up to two partition tokens after split. If initial_start_time
@@ -116,7 +119,7 @@ JSON CreateDataChangeRecord(backend::RowCursor* cursor) {
   // due to the fixed shape of change stream internal data table.
   JSON data_change_record;
   data_change_record[kCommitTimestamp] =
-      absl::FormatTime(cursor->ColumnValue(1).ToTime());
+      absl::FormatTime(cursor->ColumnValue(1).ToTime(), absl::UTCTimeZone());
   // Swap the order of server transaction id and record sequence due to the
   // different table schema.
   data_change_record[kRecordSequence] = cursor->ColumnValue(3).string_value();

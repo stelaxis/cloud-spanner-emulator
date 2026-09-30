@@ -126,7 +126,8 @@ absl::Status ValidateTokenInRetentionWindow(
     // Although token is not expired, the user provided tvf start time is too
     // old.
     return error::InvalidChangeStreamTvfArgumentStartTimestampTooOld(
-        absl::FormatTime(gc_time), absl::FormatTime(tvf_start));
+        absl::FormatTime(gc_time, absl::UTCTimeZone()),
+        absl::FormatTime(tvf_start, absl::UTCTimeZone()));
   }
   return absl::OkStatus();
 }
@@ -202,7 +203,8 @@ absl::Status ChangeStreamsHandler::ExecuteInitialQuery(
         "FROM $0 "
         "WHERE '$1' >= start_time AND ( end_time IS NULL OR '$1' < end_time "
         ")  ORDER BY (partition_token)",
-        partition_table_, metadata().start_timestamp)};
+        partition_table_,
+        absl::FormatTime(metadata().start_timestamp, absl::UTCTimeZone()))};
     initial_query.change_stream_internal_lookup = metadata().change_stream_name;
     GOOGLESQL_ASSIGN_OR_RETURN(auto partition_results, txn->ExecuteSql(initial_query));
     // Initial query is guaranteed to return at least 1 child partition record.
@@ -281,8 +283,10 @@ absl::StatusOr<absl::Time> ChangeStreamsHandler::TryGetPartitionTokenEndTime(
             metadata().start_timestamp > end) {
           return error::
               InvalidChangeStreamTvfArgumentStartTimestampForPartition(
-                  absl::FormatTime(start), absl::FormatTime(end),
-                  absl::FormatTime(metadata().start_timestamp));
+                  absl::FormatTime(start, absl::UTCTimeZone()),
+                  absl::FormatTime(end, absl::UTCTimeZone()),
+                  absl::FormatTime(metadata().start_timestamp,
+                                   absl::UTCTimeZone()));
         }
         return absl::OkStatus();
       }));
@@ -305,8 +309,10 @@ backend::Query ChangeStreamsHandler::ConstructDataTablePartitionQuery(
       "WHERE( partition_token='$1' AND commit_timestamp >= '$2' AND "
       "commit_timestamp $3 '$4' ) ORDER BY partition_token, commit_timestamp, "
       "server_transaction_id,record_sequence",
-      metadata().data_table, metadata().partition_token.value(), start,
-      is_inclusive_read ? "<=" : "<", end)};
+      metadata().data_table, metadata().partition_token.value(),
+      absl::FormatTime(start, absl::UTCTimeZone()),
+      is_inclusive_read ? "<=" : "<",
+      absl::FormatTime(end, absl::UTCTimeZone()))};
   data_table_partition_query.change_stream_internal_lookup =
       metadata().change_stream_name;
   return data_table_partition_query;
