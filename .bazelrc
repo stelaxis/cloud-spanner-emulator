@@ -118,5 +118,13 @@ build:ci --compilation_mode=opt
 build:ci --remote_download_minimal
 # Re-run actions whose cached outputs were deleted by the bucket lifecycle.
 build:ci --experimental_remote_cache_eviction_retries=5
+# Every job fetches external repositories from their origins. GitHub has
+# answered a release download with 500 for longer than the default 8 attempts
+# wait (about 13 s): 12 attempts with waits capped at 30 s span about two
+# minutes. The connector does not retry a connection dropped mid-download; the
+# downloader retries restart those.
+build:ci --http_connector_attempts=12
+build:ci --http_connector_retry_max_timeout=30s
+build:ci --experimental_repository_downloader_retries=3
 build:ci --verbose_failures
 test:ci --test_output=errors
