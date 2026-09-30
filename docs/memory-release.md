@@ -13,8 +13,9 @@ needed it was done:
   schema next changed, so a database migrated one statement at a time and then
   left alone kept every version until it was dropped.
 
-The emulator now frees both in the background, from its memory reclaimer
-thread. No request waits for either.
+The emulator now frees both in the background, on its memory reclaimer
+thread; a request only asks for the work. A request can still wait briefly for
+a lock the reclaimer holds, as described below.
 
 ## Returning free heap memory
 
@@ -28,12 +29,15 @@ Ephemeral sessions' copies do not ask: they are made and freed often, and each
 is small. Their memory is returned with the next release asked for by
 something else.
 
-Every `--heap_release_interval_seconds` (default 10), counted from the end of
-its previous release, the reclaimer returns the free heap memory if anything
-asked for that since: one release however many requests. With glibc (the
-Linux image) that is `malloc_trim(0)`, which returns every free page of every
-arena; each release logs one line with its duration, the resident size before
-and after, and the heap in use. Elsewhere, such as the native macOS build, a
+Every `--heap_release_interval_seconds` (default 10) the reclaimer checks
+whether anything asked for a release since its last check, and if so returns
+the free heap memory: one release however many requests. Each interval is
+counted from the end of the previous check. Sweeps (below) run on the same
+thread, so a release can come later than one interval after it was asked for,
+by as long as a sweep in progress takes. With glibc (the Linux image) a
+release is `malloc_trim(0)`, which returns every free page of every arena;
+each release logs one line with its duration, the resident size before and
+after, and the heap in use. Elsewhere, such as the native macOS build, a
 release does nothing. `0` disables releases.
 
 A request only sets a flag. `malloc_trim` runs on the reclaimer's thread and
@@ -43,16 +47,20 @@ from that arena at that moment waits for it to finish.
 ## Expiring schema versions
 
 Every `--schema_version_gc_interval_seconds` (default 60), counted from the end
-of its previous sweep, the reclaimer removes from every database the schema
-versions no read can need any more, with the code a schema change uses: it
-keeps the database's first schema, the newest version created at or before now
-minus the retention period, and every version after it. `0` disables the
+of the previous sweep and of any release run right after it, the reclaimer
+removes from every database the schema versions no read can need any more,
+with the code a schema change uses: it keeps the database's first schema, the
+newest version created at or before now minus the retention period, and every
+version after it. `0` disables the
 sweep; the next schema change of a database still removes its expired
 versions, as upstream does.
 
 Anything that uses a schema owns it, so removing a version never frees a
 schema in use: a read-only transaction, its cursors and its queries keep the
-version they took until they are done.
+version they took until they are done. A sweep holds a database's
+schema-version lock while it removes that database's entries, and destroys the
+removed schemas only after releasing it; a request looking up that database's
+schema at that moment waits for the removal.
 
 A read-only transaction reading past the retention period fails, as before,
 with `FAILED_PRECONDITION` and the message `Read-only transaction timestamp
