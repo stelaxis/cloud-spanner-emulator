@@ -97,8 +97,13 @@ const Schema* ReadOnlyTransaction::schema() const {
 
 absl::Status ReadOnlyTransaction::ValidateSchemaRetained() const {
   SchemaShared();
-  absl::MutexLock lock(schema_mu_);
-  if (schema_removed_) {
+  bool schema_removed;
+  {
+    absl::MutexLock lock(schema_mu_);
+    schema_removed = schema_removed_;
+  }
+  if (schema_removed &&
+      clock_->Now() - read_timestamp_ >= version_retention_period_) {
     return error::ReadTimestampPastVersionGCLimit(read_timestamp_);
   }
   return absl::OkStatus();

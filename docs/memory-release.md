@@ -57,12 +57,15 @@ Reads inside the retention period are unchanged. A read-only transaction
 reading at a timestamp past the retention period fails, as before, with
 `FAILED_PRECONDITION` and the message `Read-only transaction timestamp <T> has
 exceeded the maximum timestamp staleness`. If the schema version at its read
-timestamp has been removed, by a sweep or by a schema change, `Read`,
+timestamp has also been removed, by a sweep or by a schema change, `Read`,
 `StreamingRead`, `ExecuteSql`, `ExecuteStreamingSql` and `PartitionQuery` now
 return that error before resolving the request against a schema. Before, they
-resolved it against the database's first schema, which could fail with a
-different error, such as a table not found, or answer an `INFORMATION_SCHEMA`
-query from the wrong schema.
+resolved it against an older schema, usually the database's first, which
+could fail with a different error, such as a table not found, or answer an
+`INFORMATION_SCHEMA` query from the wrong schema. A read inside the retention
+period can find its version removed only if the database's retention period
+was shortened and then lengthened again; it still uses the older schema, as
+upstream does and its conformance tests expect.
 
 ## What is not freed early
 

@@ -63,7 +63,9 @@ class ReadOnlyTransaction : public RowReader {
 
   // Fails as Read does for a read timestamp past the version retention period
   // if the schema at the read timestamp had been garbage-collected when this
-  // transaction first took its schema: schema() is then an older schema.
+  // transaction took its schema: schema() is then an older schema. Within the
+  // period (which a database can shorten and lengthen again), that older
+  // schema is used, as upstream does.
   absl::Status ValidateSchemaRetained() const ABSL_LOCKS_EXCLUDED(schema_mu_);
 
   // Returns the ID of this transaction.
