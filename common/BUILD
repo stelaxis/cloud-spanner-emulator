@@ -116,7 +116,7 @@ cc_library(
     srcs = ["heap_release.cc"],
     hdrs = ["heap_release.h"],
     deps = [
-        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:absl_log",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/time",
     ],

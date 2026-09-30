@@ -18,17 +18,16 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>  // Defines __GLIBC__ with glibc.
+
+#include "absl/log/absl_log.h"
+#include "absl/strings/str_format.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 
 #if defined(__GLIBC__)
 #include <malloc.h>
 #include <unistd.h>
-
-#include <cstdio>
-
-#include "absl/log/log.h"
-#include "absl/strings/str_format.h"
-#include "absl/time/clock.h"
-#include "absl/time/time.h"
 #endif
 
 namespace google {
