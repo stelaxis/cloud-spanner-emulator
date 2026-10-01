@@ -88,6 +88,19 @@ C++ files exceed 5 GiB per compiler, and two workers leave room for Bazel,
 linking and the OS on 16-GiB runners. Raising it needs CI peak-memory evidence.
 Local builds keep `--jobs=auto`.
 
+Every Bazel job fetches the external repositories from their origins (GitHub,
+the Bazel Central Registry, Maven, PyPI, the Go proxy). The `ci` config makes
+up to 12 attempts at a download that fails with a transient HTTP error
+(`--http_connector_attempts=12`). The waits between them double from 0.1 s up
+to a 30 s cap (`--http_connector_retry_max_timeout=30s`) and then get ±25 %
+jitter, so one wait can reach 37.5 s and all of them add up to 83–139 s; with
+Bazel's default of 8 attempts they add up to 10–16 s. It also restarts a
+download whose connection drops
+(`--experimental_repository_downloader_retries=3`). The handoff does not carry
+Bazel's repository cache: that would add roughly 0.8 GB, half of it JDKs, to an
+artifact every test shard downloads at about 16 MB/s, and the registry files
+would still come from the registry (no `MODULE.bazel.lock` is checked in).
+
 ### Remote cache
 
 Bazel caches action outputs and test results in a GCS bucket over its HTTP cache

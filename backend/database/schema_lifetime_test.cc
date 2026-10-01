@@ -502,6 +502,57 @@ TEST_F(SchemaLifetimeTest, SweepRacesReadsAtTheRetentionEdge) {
   EXPECT_GT(too_old, 0);
 }
 
+// A sweep, a schema change that removes a schema, another sweep; then the
+// retention period is lengthened to cover their times again. Where the sweeps
+// or the schema change between them removed the schema, only an older schema
+// is left, so reads fail as too old. Elsewhere reads use their own schema.
+TEST_F(SchemaLifetimeTest, SchemasRemovedBetweenSweepsReadAsSwept) {
+  auto newest = [this] { return db_->SchemaTimestampsForTesting().back(); };
+  CreateDatabase();
+  const absl::Time x1 = newest();
+  PublishSchema();
+  const absl::Time x2 = newest();
+  AdvanceClock(absl::Hours(2));
+  EXPECT_EQ(db_->RemoveExpiredSchemas(), 1);  // X1's.
+  PublishSchema();
+  const absl::Time x3 = newest();
+  PublishSchema();  // Removes X2's.
+  const absl::Time x4 = newest();
+  AdvanceClock(absl::Hours(2));
+  EXPECT_EQ(db_->RemoveExpiredSchemas(), 1);  // X3's.
+  AdvanceClock(absl::Minutes(1));
+  ChangeSchema(
+      "ALTER DATABASE `test-db` SET OPTIONS (version_retention_period = '1d')");
+  ASSERT_EQ(db_->SchemaTimestampsForTesting().size(), 3);
+
+  // Reads `table` in a read-only transaction at `timestamp`.
+  auto read = [this](absl::Time timestamp, const std::string& table) {
+    absl::StatusOr<std::unique_ptr<ReadOnlyTransaction>> ro =
+        db_->CreateReadOnlyTransaction(ReadOnlyOptions{
+            .bound = TimestampBound::kExactTimestamp, .timestamp = timestamp});
+    if (!ro.ok()) return ro.status();
+    std::unique_ptr<RowCursor> cursor;
+    absl::Status status = (*ro)->Read(
+        ReadArg{.table = table, .key_set = KeySet::All(), .columns = {"k"}},
+        &cursor);
+    while (status.ok() && cursor->Next()) {
+    }
+    return status;
+  };
+  const auto too_old =
+      StatusIs(absl::StatusCode::kFailedPrecondition,
+               HasSubstr("exceeded the maximum timestamp staleness"));
+  // Before X1, the database's first schema: T, but no X1 yet.
+  GOOGLESQL_EXPECT_OK(read(x1 - absl::Minutes(1), "T"));
+  EXPECT_THAT(read(x1 - absl::Minutes(1), "X1"),
+              StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(read(x1 + absl::Minutes(1), "X1"), too_old);
+  EXPECT_THAT(read(x2 + absl::Minutes(1), "X2"), too_old);
+  EXPECT_THAT(read(x3 + absl::Minutes(1), "X3"), too_old);
+  GOOGLESQL_EXPECT_OK(read(x4 + absl::Minutes(1), "X4"));
+  GOOGLESQL_EXPECT_OK(read(x4 + absl::Minutes(1), "X1"));
+}
+
 }  // namespace
 }  // namespace backend
 }  // namespace emulator

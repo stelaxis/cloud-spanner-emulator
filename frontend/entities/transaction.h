@@ -126,8 +126,10 @@ class Transaction {
 
   // For a read-only transaction, fails as reads past the version retention
   // period do if schema() is not the schema at the read timestamp, because a
-  // sweep removed that (ReadOnlyTransaction::ValidateSchemaRetained). Call it
-  // before using schema() to read.
+  // sweep removed that, or a schema change did between two sweeps that
+  // removed schemas, before the transaction took its schema
+  // (ReadOnlyTransaction::ValidateSchemaRetained). Call it before using
+  // schema() to read.
   absl::Status ValidateSchemaRetained() const;
 
   // Returns the engine used to execute queries against the database.

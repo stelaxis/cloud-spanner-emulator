@@ -139,9 +139,12 @@ class Database {
   std::shared_ptr<const Schema> GetLatestSchemaShared() const;
 
   // Removes the schema versions that no read can need any more, as a schema
-  // change does (VersionedCatalog::RemoveExpiredSchemas), as a sweep: reads at
-  // the times they were in effect then fail as too old, even if the retention
-  // period is lengthened later. Returns how many it removed.
+  // change does (VersionedCatalog::RemoveExpiredSchemas), as a sweep. If it
+  // removes any, reads that take their schema from then on fail as too old at
+  // the times those versions were in effect, even if the retention period is
+  // lengthened later, and so do reads at the times of versions a schema change
+  // removed since the previous sweep that removed any. A sweep that removes
+  // nothing covers no schema change's removals. Returns how many it removed.
   int RemoveExpiredSchemas();
 
   // The creation times of the schema versions this database keeps. For tests.

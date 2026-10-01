@@ -17,7 +17,6 @@
 #include "backend/schema/catalog/versioned_catalog.h"
 
 #include <cstdint>
-#include <iterator>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -104,9 +103,7 @@ std::shared_ptr<const Schema> VersionedCatalog::GetLatestSchemaShared() const {
 std::shared_ptr<const Schema> VersionedCatalog::GetSchemaShared(
     absl::Time timestamp, bool* swept) const {
   absl::MutexLock lock(mu_);
-  auto swept_itr = swept_.upper_bound(timestamp);
-  *swept =
-      swept_itr != swept_.begin() && timestamp < std::prev(swept_itr)->second;
+  *swept = swept_begin_ <= timestamp && timestamp < swept_end_;
   auto itr = schemas_.upper_bound(timestamp);
   itr--;
   return itr->second;
@@ -149,13 +146,11 @@ int VersionedCatalog::RemoveExpiredSchemas(absl::Time timestamp, bool swept) {
     it = schemas_.erase(it);
   }
   if (swept && !removed.empty()) {
-    // `it` is the schema kept after the removed ones.
-    auto previous = swept_.empty() ? swept_.end() : std::prev(swept_.end());
-    if (previous != swept_.end() && previous->second == oldest_removed) {
-      previous->second = it->first;
-    } else {
-      swept_[oldest_removed] = it->first;
-    }
+    // `it` is the schema kept after the removed ones. Extending the range to it
+    // also covers what schema changes removed since the previous sweep that
+    // removed any.
+    if (swept_begin_ == swept_end_) swept_begin_ = oldest_removed;
+    swept_end_ = it->first;
   }
   return removed.size();
 }
@@ -167,6 +162,13 @@ std::vector<absl::Time> VersionedCatalog::SchemaTimestampsForTesting() const {
     timestamps.push_back(timestamp);
   }
   return timestamps;
+}
+
+std::vector<std::pair<absl::Time, absl::Time>>
+VersionedCatalog::SweptRangesForTesting() const {
+  absl::MutexLock lock(mu_);
+  if (swept_begin_ == swept_end_) return {};
+  return {{swept_begin_, swept_end_}};
 }
 
 }  // namespace backend
